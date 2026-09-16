@@ -1,0 +1,77 @@
+name = "grid 1fr 2fr in 101px at 1.25x: fractional split in device pixels"
+
+html = "tests/visual/grid-fr/index.html"
+css = ["tests/visual/grid-fr/app.css"]
+
+[viewport]
+width = 250
+height = 125
+scale = 1.25
+
+[expect]
+pixels_sha256 = "3ffb9d11c9c5ed87cb87bbaf7def1b10a6902664d3e502471dc8fb6e43cc7e7d"
+
+[[expect.facts]]
+id = "grid"
+tag = "div"
+display = "grid"
+x = 0.0
+y = 0.0
+width = 126.25
+height = 75.0
+
+[[expect.facts]]
+id = "a"
+tag = "div"
+display = "block"
+x = 0.0
+y = 0.0
+width = 42.083332
+height = 37.5
+
+[[expect.facts]]
+id = "b"
+tag = "div"
+display = "block"
+x = 42.083332
+y = 0.0
+width = 84.166664
+height = 37.5
+
+[[expect.facts]]
+id = "c"
+tag = "div"
+display = "block"
+x = 0.0
+y = 37.5
+width = 42.083332
+height = 37.5
+
+[[expect.facts]]
+id = "d"
+tag = "div"
+display = "block"
+x = 42.083332
+y = 37.5
+width = 84.166664
+height = 37.5
+
+[[expect.pixel]]
+pos = [20, 18]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [62, 18]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [20, 56]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [62, 56]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [180, 100]
+color = "#FFFFFF"

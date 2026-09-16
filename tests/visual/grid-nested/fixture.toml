@@ -1,0 +1,85 @@
+name = "whole-tree dispatch: grid -> flex -> grid -> text in one pass"
+
+# The shape an island-based architecture cannot lay out: a grid container
+# whose flex item is itself a grid with inline text inside. All three
+# algorithms share one Taffy tree and one pass.
+
+html = "tests/visual/grid-nested/index.html"
+css = ["tests/visual/grid-nested/app.css"]
+
+[viewport]
+width = 260
+height = 120
+scale = 1.0
+
+[expect]
+pixels_sha256 = "bc9eebfe076c8e1f749c2da51b8bf1ef0e701d0969deb2406a48d2a78189857f"
+
+[[expect.facts]]
+id = "outer"
+tag = "div"
+display = "grid"
+x = 0.0
+y = 0.0
+width = 200.0
+height = 80.0
+
+[[expect.facts]]
+id = "midrow"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+width = 200.0
+height = 40.0
+
+[[expect.facts]]
+id = "innergrid"
+tag = "div"
+display = "grid"
+x = 0.0
+y = 0.0
+width = 100.0
+height = 40.0
+
+[[expect.facts]]
+id = "side"
+tag = "div"
+display = "block"
+x = 100.0
+y = 0.0
+width = 100.0
+height = 40.0
+
+[[expect.facts]]
+id = "deep"
+tag = "span"
+display = "inline"
+# Inline facts join every wrapped run; the words wrap inside the 60px
+# first track.
+text_runs = ["deep text"]
+
+[[expect.facts]]
+id = "bottom"
+tag = "div"
+display = "block"
+x = 0.0
+y = 40.0
+width = 100.0
+height = 40.0
+
+[[expect.pixel]]
+pos = [10, 10]
+color = "#7c3aed"
+
+[[expect.pixel]]
+pos = [150, 20]
+color = "#f97316"
+
+[[expect.pixel]]
+pos = [30, 60]
+color = "#14b8a6"
+
+[[expect.pixel]]
+pos = [220, 60]
+color = "#FFFFFF"

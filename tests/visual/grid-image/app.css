@@ -1,0 +1,14 @@
+body {
+  margin: 0;
+}
+.g {
+  display: grid;
+  width: 480px;
+  height: 200px;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 10px;
+}
+.t {
+  background-color: #fde68a;
+}

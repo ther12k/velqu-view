@@ -1,0 +1,77 @@
+name = "grid 1fr 2fr in 101px at 1x: exact fractional split"
+
+html = "tests/visual/grid-fr/index.html"
+css = ["tests/visual/grid-fr/app.css"]
+
+[viewport]
+width = 200
+height = 100
+scale = 1.0
+
+[expect]
+pixels_sha256 = "c9f81b2f7149f8242a93882f8d3e63006cacb7202a2f25ce0b9be36c57fc73bd"
+
+[[expect.facts]]
+id = "grid"
+tag = "div"
+display = "grid"
+x = 0.0
+y = 0.0
+width = 101.0
+height = 60.0
+
+[[expect.facts]]
+id = "a"
+tag = "div"
+display = "block"
+x = 0.0
+y = 0.0
+width = 33.666668
+height = 30.0
+
+[[expect.facts]]
+id = "b"
+tag = "div"
+display = "block"
+x = 33.666668
+y = 0.0
+width = 67.333336
+height = 30.0
+
+[[expect.facts]]
+id = "c"
+tag = "div"
+display = "block"
+x = 0.0
+y = 30.0
+width = 33.666668
+height = 30.0
+
+[[expect.facts]]
+id = "d"
+tag = "div"
+display = "block"
+x = 33.666668
+y = 30.0
+width = 67.333336
+height = 30.0
+
+[[expect.pixel]]
+pos = [16, 15]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [50, 15]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [16, 45]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [50, 45]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [150, 80]
+color = "#FFFFFF"

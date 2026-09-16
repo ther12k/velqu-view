@@ -1,0 +1,71 @@
+name = "grid auto track sized by a replaced image's intrinsic 320x180"
+
+# The auto column must size from the image's intrinsic width (320px); the
+# 1fr text column absorbs the remaining 150px (480 - 320 - 10 gap). The
+# asset is JPEG: the second M2c decode format, proven in CI.
+
+html = "tests/visual/grid-image/index.html"
+css = ["tests/visual/grid-image/app.css"]
+
+[viewport]
+width = 520
+height = 220
+scale = 1.0
+
+[assets."photo.jpg"]
+format = "jpeg"
+width = 320
+height = 180
+color = "#6366f1"
+
+[expect]
+pixels_sha256 = "27ec7eb1c1ea71b886a4dbef8c3f1fea37474f1292c2acce5d76d7a259445093"
+
+[[expect.facts]]
+id = "grid"
+tag = "div"
+display = "grid"
+x = 0.0
+y = 0.0
+width = 480.0
+height = 200.0
+
+[[expect.facts]]
+id = "pic"
+tag = "img"
+display = "block"
+x = 0.0
+y = 0.0
+width = 320.0
+height = 180.0
+
+# align-items: start: the text div is content-sized, not stretched.
+[[expect.facts]]
+id = "text"
+tag = "div"
+display = "block"
+x = 330.0
+y = 0.0
+width = 150.0
+
+[[expect.pixel]]
+pos = [100, 50]
+color = "#6366f1"
+
+[[expect.pixel]]
+pos = [310, 170]
+color = "#6366f1"
+
+[[expect.pixel]]
+pos = [400, 50]
+color = "#fde68a"
+
+# Below the content-sized text div: page background again.
+[[expect.pixel]]
+pos = [470, 190]
+color = "#FFFFFF"
+
+# The 10px column gap: page background between image and text.
+[[expect.pixel]]
+pos = [325, 10]
+color = "#FFFFFF"

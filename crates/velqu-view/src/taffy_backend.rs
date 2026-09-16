@@ -134,8 +134,14 @@ fn project<'a>(
         node.replaced.is_some() || node.tag == "img",
     );
 
+    // A grid container with only inline content still needs its tracks:
+    // the inline content becomes an anonymous grid item (M2c). Flex
+    // containers with only words keep the M2b leaf measurement (equivalent
+    // geometry, byte-identical with the M2b fixtures).
+    let words_container = node.style.display == Display::Grid && !node.words.is_empty();
+
     // Leaves: no block children — the box's own words (possibly none).
-    if node.children.is_empty() {
+    if node.children.is_empty() && !words_container {
         let id = taffy.new_leaf(style).expect("new leaf");
         leaf_sources.insert(id, node);
         return MirrorNode {
