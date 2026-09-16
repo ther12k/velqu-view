@@ -19,17 +19,20 @@
 //! **M3 (shipped):** the v0 utility synthesizer — `compile_utilities`
 //! maps Tailwind v3-compatible classes to plain CSS (the "Tailwind build"
 //! stage of utilities → CSS → profile check → renderer), with
-//! deterministic diagnostics for everything outside the profile.
+//! deterministic diagnostics for everything outside the profile — plus
+//! this checker: `check_css` classifies parsed declarations and at-rules
+//! with source lines, driving the `velqu-css-check` CLI.
 //!
 //! **Deferred beyond M3:** real compiled-Tailwind ingestion (consuming a
-//! `tailwindcss` build output), source locations, and the `velqu css
-//! check` CLI built on this model.
+//! `tailwindcss` build output).
 
 use std::fmt;
 
+mod check;
 mod compile;
 mod palette;
 
+pub use check::{CheckItem, CheckKind, CheckSummary, check_css, summarize};
 pub use compile::{TailwindBuild, UtilityDiagnostic, compile_utilities};
 
 /// How a CSS concept relates to the profile.

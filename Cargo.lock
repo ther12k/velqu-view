@@ -2010,6 +2010,9 @@ dependencies = [
 [[package]]
 name = "velqu-tailwind"
 version = "0.1.0"
+dependencies = [
+ "cssparser",
+]
 
 [[package]]
 name = "velqu-view"
