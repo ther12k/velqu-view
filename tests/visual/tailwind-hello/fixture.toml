@@ -14,7 +14,10 @@ height = 200
 scale = 1.0
 
 [expect]
-pixels_sha256 = "e19aaf727184fe5888ede6ba23b22a4336590b1555ff3341cb833cccf319a5d7"
+# Migration (M3 review fixes): corners now paint rounded — `rounded-lg`
+# clips the card's corners, so the old corner pixel shows page background.
+# Facts unchanged; only the corner raster moved.
+pixels_sha256 = "47a43958068ea753ff324a4bf2e23b524bc93cd1183dd670a1574188c4942da4"
 
 [[expect.facts]]
 id = "card"
@@ -41,9 +44,16 @@ text_runs = ["Rendered by the v0 utility", "pipeline."]
 pos = [340, 10]
 color = "#f1f5f9"
 
-# The card's 1px border is Tailwind's default gray-200.
+# The extreme corner pixel is now OUTSIDE the rounded-lg (8px) shape:
+# page background.
 [[expect.pixel]]
 pos = [16, 16]
+color = "#f1f5f9"
+
+# Straight-zone border pixel (below the corner arc): the card's 1px
+# gray-200 border.
+[[expect.pixel]]
+pos = [16, 60]
 color = "#e5e7eb"
 
 # Card interior: white.

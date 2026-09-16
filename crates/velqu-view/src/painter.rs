@@ -67,6 +67,24 @@ pub(crate) fn paint_document(
                 ctx.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
                 ctx.items += 1;
             }
+            DisplayItem::RoundedFill {
+                rect,
+                radius,
+                color,
+            } => {
+                ctx.fill_rounded(rect, *radius, *color);
+                ctx.items += 1;
+            }
+            DisplayItem::RoundedBorder {
+                outer,
+                inner,
+                radius,
+                inner_radii,
+                color,
+            } => {
+                ctx.fill_rounded_ring(outer, *radius, inner, inner_radii, *color);
+                ctx.items += 1;
+            }
             DisplayItem::TextRun {
                 x,
                 y,
@@ -88,7 +106,8 @@ pub(crate) fn paint_document(
                 );
                 ctx.items += 1;
             }
-            DisplayItem::PushClip(rect) => ctx.push_clip(*rect),
+            DisplayItem::PushClip(rect) => ctx.push_clip(*rect, 0.0),
+            DisplayItem::PushClipRounded { rect, radius } => ctx.push_clip(*rect, *radius),
             DisplayItem::PopClip => ctx.pop_clip(),
             DisplayItem::DrawImage { rect, image } => {
                 ctx.draw_image(rect, image);
@@ -114,13 +133,22 @@ struct PaintCtx<'a> {
     rgba: &'a mut [u8],
     glyphs: usize,
     items: usize,
-    /// Clip stack: the innermost (last) entry bounds every pixel. Balanced
-    /// push/pop emission keeps restore semantics correct for nested scopes.
-    clip: Vec<Rect>,
+    /// Clip stack: every active scope bounds every pixel (a pixel must be
+    /// inside all of them; balanced push/pop emission keeps the stack
+    /// correct for nesting).
+    clip: Vec<ClipShape>,
     /// Current translation (accumulated scroll transforms, ADR 0008) plus
     /// the saved offsets of enclosing scopes.
     offset: (f32, f32),
     offset_stack: Vec<(f32, f32)>,
+}
+
+/// One active clip scope: a rectangle in device pixels, optionally with
+/// rounded corners.
+#[derive(Debug, Clone, Copy)]
+struct ClipShape {
+    rect: Rect,
+    radius: f32,
 }
 
 impl PaintCtx<'_> {
@@ -140,22 +168,19 @@ impl PaintCtx<'_> {
         }
     }
 
-    /// Intersects the pushed rect with the running clip and scopes it.
-    /// Clip rects live in the space of the scope they are pushed in
-    /// (scroll containers clip in parent space), so the current
-    /// translation applies.
-    fn push_clip(&mut self, rect: Rect) {
-        let placed = Rect {
-            x: rect.x + self.offset.0,
-            y: rect.y + self.offset.1,
-            w: rect.w,
-            h: rect.h,
-        };
-        let clipped = match self.clip.last() {
-            None => placed,
-            Some(outer) => intersect(*outer, placed),
-        };
-        self.clip.push(clipped);
+    /// Pushes a clip scope. Clip shapes live in the space of the scope
+    /// they are pushed in (scroll containers clip in parent space), so the
+    /// current translation applies.
+    fn push_clip(&mut self, rect: Rect, radius: f32) {
+        self.clip.push(ClipShape {
+            rect: Rect {
+                x: rect.x + self.offset.0,
+                y: rect.y + self.offset.1,
+                w: rect.w,
+                h: rect.h,
+            },
+            radius: radius.max(0.0),
+        });
     }
 
     /// Ends the innermost clip scope, restoring the enclosing one. M2c
@@ -165,14 +190,7 @@ impl PaintCtx<'_> {
     }
 
     fn clip_contains(&self, x: i64, y: i64) -> bool {
-        match self.clip.last() {
-            None => true,
-            Some(clip) => {
-                let cx = clip.x as i64;
-                let cy = clip.y as i64;
-                x >= cx && x < cx + clip.w as i64 && y >= cy && y < cy + clip.h as i64
-            }
-        }
+        self.clip.iter().all(|shape| shape_contains(shape, x, y))
     }
 
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
@@ -203,6 +221,83 @@ impl PaintCtx<'_> {
         for py in y0..y1 {
             for px in x0..x1 {
                 if self.clip_contains(px as i64, py as i64) {
+                    self.blend_pixel(px as usize, py as usize, color);
+                }
+            }
+        }
+    }
+
+    /// Fills a rounded rectangle: same edge snapping as `fill_rect`, with
+    /// per-pixel shape coverage (pixel **center** inside the rounded
+    /// bounds). No anti-aliasing — coverage is a strict in/out test, so
+    /// results are deterministic.
+    fn fill_rounded(&mut self, rect: &Rect, radius: f32, color: Color) {
+        let placed = Rect {
+            x: rect.x + self.offset.0,
+            y: rect.y + self.offset.1,
+            w: rect.w,
+            h: rect.h,
+        };
+        let x0 = placed.x.round().max(0.0) as i64;
+        let y0 = placed.y.round().max(0.0) as i64;
+        let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
+        let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if !self.clip_contains(px, py) {
+                    continue;
+                }
+                let cx = px as f32 + 0.5;
+                let cy = py as f32 + 0.5;
+                if point_in_rounded_rect(cx, cy, &placed, radius) {
+                    self.blend_pixel(px as usize, py as usize, color);
+                }
+            }
+        }
+    }
+
+    /// Fills a rounded border ring: pixels inside the outer rounded shape
+    /// and outside the inner one. Inner corner radii are the outer radius
+    /// minus the adjacent border widths (clamped at 0), so uneven borders
+    /// keep a sensible ring.
+    fn fill_rounded_ring(
+        &mut self,
+        outer: &Rect,
+        radius: f32,
+        inner: &Rect,
+        inner_radii: &[f32; 4],
+        color: Color,
+    ) {
+        let placed_outer = Rect {
+            x: outer.x + self.offset.0,
+            y: outer.y + self.offset.1,
+            w: outer.w,
+            h: outer.h,
+        };
+        let placed_inner = Rect {
+            x: inner.x + self.offset.0,
+            y: inner.y + self.offset.1,
+            w: inner.w,
+            h: inner.h,
+        };
+        let x0 = placed_outer.x.round().max(0.0) as i64;
+        let y0 = placed_outer.y.round().max(0.0) as i64;
+        let x1 = (placed_outer.x + placed_outer.w)
+            .round()
+            .clamp(0.0, self.width as f32) as i64;
+        let y1 = (placed_outer.y + placed_outer.h)
+            .round()
+            .clamp(0.0, self.height as f32) as i64;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if !self.clip_contains(px, py) {
+                    continue;
+                }
+                let cx = px as f32 + 0.5;
+                let cy = py as f32 + 0.5;
+                let in_outer = point_in_rounded_rect(cx, cy, &placed_outer, radius);
+                let in_inner = point_in_rounded_rect4(cx, cy, &placed_inner, inner_radii);
+                if in_outer && !in_inner {
                     self.blend_pixel(px as usize, py as usize, color);
                 }
             }
@@ -296,17 +391,82 @@ struct TextRunPlacement<'a> {
     color: Color,
 }
 
-fn intersect(a: Rect, b: Rect) -> Rect {
-    let x = a.x.max(b.x);
-    let y = a.y.max(b.y);
-    let right = (a.x + a.w).min(b.x + b.w);
-    let bottom = (a.y + a.h).min(b.y + b.h);
-    Rect {
-        x,
-        y,
-        w: (right - x).max(0.0),
-        h: (bottom - y).max(0.0),
+/// Does the pixel (x, y) sit inside every part of the clip shape? Square
+/// shapes use the integer half-open test; rounded shapes test the pixel
+/// **center** against the rounded bounds.
+fn shape_contains(shape: &ClipShape, x: i64, y: i64) -> bool {
+    let cx = shape.rect.x as i64;
+    let cy = shape.rect.y as i64;
+    let in_rect =
+        x >= cx && x < cx + shape.rect.w as i64 && y >= cy && y < cy + shape.rect.h as i64;
+    if !in_rect {
+        return false;
     }
+    if shape.radius <= 0.0 {
+        return true;
+    }
+    point_in_rounded_rect(x as f32 + 0.5, y as f32 + 0.5, &shape.rect, shape.radius)
+}
+
+/// Strict inside-test for a uniform-radius rounded rectangle (corner order
+/// irrelevant — all four are the same). Deterministic pure f32 math.
+fn point_in_rounded_rect(x: f32, y: f32, rect: &Rect, radius: f32) -> bool {
+    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.x + rect.w;
+    let y1 = rect.y + rect.h;
+    if r <= 0.0 {
+        return x >= x0 && x < x1 && y >= y0 && y < y1;
+    }
+    // Distance from the nearest corner-circle center, 0 inside the
+    // straight zones.
+    let dx = (x0 + r - x).max(x - (x1 - r)).max(0.0);
+    let dy = (y0 + r - y).max(y - (y1 - r)).max(0.0);
+    dx * dx + dy * dy <= r * r
+}
+
+/// Strict inside-test for a rounded rectangle with per-corner radii
+/// (`tl, tr, br, bl`) — used for the inner edge of rounded borders, where
+/// uneven border widths make corners shrink by different amounts.
+fn point_in_rounded_rect4(x: f32, y: f32, rect: &Rect, radii: &[f32; 4]) -> bool {
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.x + rect.w;
+    let y1 = rect.y + rect.h;
+    if x < x0 || x > x1 || y < y0 || y > y1 {
+        return false;
+    }
+    let half = rect.w.min(rect.h) / 2.0;
+    let clamp = |r: f32| r.clamp(0.0, half);
+    let (r_tl, r_tr, r_br, r_bl) = (
+        clamp(radii[0]),
+        clamp(radii[1]),
+        clamp(radii[2]),
+        clamp(radii[3]),
+    );
+    // Corner zones: circle tests against the adjacent corner's center.
+    if x < x0 + r_tl && y < y0 + r_tl {
+        let dx = x0 + r_tl - x;
+        let dy = y0 + r_tl - y;
+        return dx * dx + dy * dy <= r_tl * r_tl;
+    }
+    if x > x1 - r_tr && y < y0 + r_tr {
+        let dx = x - (x1 - r_tr);
+        let dy = y0 + r_tr - y;
+        return dx * dx + dy * dy <= r_tr * r_tr;
+    }
+    if x > x1 - r_br && y > y1 - r_br {
+        let dx = x - (x1 - r_br);
+        let dy = y - (y1 - r_br);
+        return dx * dx + dy * dy <= r_br * r_br;
+    }
+    if x < x0 + r_bl && y > y1 - r_bl {
+        let dx = x0 + r_bl - x;
+        let dy = y - (y1 - r_bl);
+        return dx * dx + dy * dy <= r_bl * r_bl;
+    }
+    true
 }
 
 /// Coverage-to-alpha scaling that stays exact at the ends (0, 255).

@@ -1,0 +1,88 @@
+name = "rounded corners: fill, border ring, and rounded overflow clip"
+
+# Renderer-level radius painting (M3 review fix), all in-profile CSS:
+# - disc: radius 40 = h/2 (stadium). Corner pixels fall outside the shape.
+# - ring: 4px border with radius 14; the hole stays unpainted.
+# - clip: overflow hidden with radius 16 cuts the square child's corners.
+
+html = "tests/visual/rounded/index.html"
+
+css = ["tests/visual/rounded/app.css"]
+
+[viewport]
+width = 340
+height = 100
+scale = 1.0
+
+[expect]
+pixels_sha256 = "f75db35ad8c9744932c6b006e6a49389d6035b629d2f3439ce52a2467aaa5f20"
+
+[[expect.facts]]
+id = "disc"
+tag = "div"
+display = "block"
+x = 10.0
+y = 10.0
+width = 120.0
+height = 80.0
+
+[[expect.facts]]
+id = "ring"
+tag = "div"
+display = "block"
+x = 150.0
+y = 10.0
+width = 78.0
+height = 78.0
+
+[[expect.facts]]
+id = "clip"
+tag = "div"
+display = "block"
+x = 248.0
+y = 10.0
+width = 70.0
+height = 70.0
+
+# Disc: extreme corner outside the 40px shape (pixel center (10.5,10.5)
+# is ~55.9 from the nearest corner circle); the center and the in-shape
+# near-corner are teal.
+[[expect.pixel]]
+pos = [10, 10]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [50, 50]
+color = "#14b8a6"
+
+[[expect.pixel]]
+pos = [45, 45]
+color = "#14b8a6"
+
+# Ring: top straight-zone band is teal; the hole is unpainted; the ring's
+# own extreme corner is cut (page background).
+[[expect.pixel]]
+pos = [185, 12]
+color = "#14b8a6"
+
+[[expect.pixel]]
+pos = [185, 40]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [151, 11]
+color = "#FFFFFF"
+
+# Rounded clip: the square child's corner is clipped away (white); its
+# straight zones still paint red.
+[[expect.pixel]]
+pos = [248, 10]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [258, 30]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [283, 45]
+color = "#ef4444"

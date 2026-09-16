@@ -461,7 +461,7 @@ pub(crate) fn layout_document(
     );
 
     let mut list = DisplayList::default();
-    emit_display_list(&root, &mut list);
+    emit_display_list(&root, &mut list, viewport.scale_factor());
     // The document-level scroller translates the whole frame; the viewport
     // is its scrollport, so no root clip scope is needed.
     if document_offset_clamped != (0.0, 0.0) {
@@ -484,22 +484,33 @@ pub(crate) fn layout_document(
 /// Emits paint-ready items: backgrounds, borders, text, with
 /// `overflow: hidden`/`clip` boxes scoping their descendants via clip
 /// items. Layout owns geometry; the display list owns paint ordering and
-/// clipping; the painter executes.
-pub(crate) fn emit_display_list(node: &BoxNode, list: &mut DisplayList) {
-    emit_box(node, list, None);
+/// clipping; the painter executes. `scale` converts logical style values
+/// (border-radius) into the device-pixel metric space.
+pub(crate) fn emit_display_list(node: &BoxNode, list: &mut DisplayList, scale: f32) {
+    emit_box(node, list, None, scale);
 }
 
-fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
+fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, scale: f32) {
     let style = &node.style;
     let _ = parent_clip;
+    // `border_radius` is authored in logical px; layout runs in device px.
+    let radius = style.border_radius * scale;
 
     // Own chrome (background, border): the painter applies the current
     // clip stack, which at this point is the ancestors' clips.
     if style.background_color.a > 0 {
-        list.items.push(DisplayItem::FillRect {
-            rect: node.padding_box,
-            color: style.background_color,
-        });
+        if radius > 0.0 {
+            list.items.push(DisplayItem::RoundedFill {
+                rect: node.padding_box,
+                radius,
+                color: style.background_color,
+            });
+        } else {
+            list.items.push(DisplayItem::FillRect {
+                rect: node.padding_box,
+                color: style.background_color,
+            });
+        }
     }
     if style.border_style_solid {
         // Border widths derive from the laid-out boxes so they always
@@ -512,48 +523,68 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
             bottom: node.border_box.y + node.border_box.h
                 - (node.padding_box.y + node.padding_box.h),
         };
-        let bb = node.border_box;
         let bc = style.border_color;
-        for (rect, width) in [
-            (
-                Rect {
-                    x: bb.x,
-                    y: bb.y,
-                    w: bb.w,
-                    h: b.top,
-                },
-                b.top,
-            ),
-            (
-                Rect {
-                    x: bb.x,
-                    y: bb.y + bb.h - b.bottom,
-                    w: bb.w,
-                    h: b.bottom,
-                },
-                b.bottom,
-            ),
-            (
-                Rect {
-                    x: bb.x,
-                    y: bb.y + b.top,
-                    w: b.left,
-                    h: (bb.h - b.top - b.bottom).max(0.0),
-                },
-                b.left,
-            ),
-            (
-                Rect {
-                    x: bb.x + bb.w - b.right,
-                    y: bb.y + b.top,
-                    w: b.right,
-                    h: (bb.h - b.top - b.bottom).max(0.0),
-                },
-                b.right,
-            ),
-        ] {
-            if width > 0.0 {
-                list.items.push(DisplayItem::FillRect { rect, color: bc });
+        if radius > 0.0 {
+            // Rounded ring: each inner corner radius shrinks by the border
+            // widths adjacent to that corner.
+            let inner_radii = [
+                (radius - b.top.max(b.left)).max(0.0),
+                (radius - b.top.max(b.right)).max(0.0),
+                (radius - b.bottom.max(b.right)).max(0.0),
+                (radius - b.bottom.max(b.left)).max(0.0),
+            ];
+            if b.top > 0.0 || b.right > 0.0 || b.bottom > 0.0 || b.left > 0.0 {
+                list.items.push(DisplayItem::RoundedBorder {
+                    outer: node.border_box,
+                    inner: node.padding_box,
+                    radius,
+                    inner_radii,
+                    color: bc,
+                });
+            }
+        } else {
+            let bb = node.border_box;
+            for (rect, width) in [
+                (
+                    Rect {
+                        x: bb.x,
+                        y: bb.y,
+                        w: bb.w,
+                        h: b.top,
+                    },
+                    b.top,
+                ),
+                (
+                    Rect {
+                        x: bb.x,
+                        y: bb.y + bb.h - b.bottom,
+                        w: bb.w,
+                        h: b.bottom,
+                    },
+                    b.bottom,
+                ),
+                (
+                    Rect {
+                        x: bb.x,
+                        y: bb.y + b.top,
+                        w: b.left,
+                        h: (bb.h - b.top - b.bottom).max(0.0),
+                    },
+                    b.left,
+                ),
+                (
+                    Rect {
+                        x: bb.x + bb.w - b.right,
+                        y: bb.y + b.top,
+                        w: b.right,
+                        h: (bb.h - b.top - b.bottom).max(0.0),
+                    },
+                    b.right,
+                ),
+            ] {
+                if width > 0.0 {
+                    list.items.push(DisplayItem::FillRect { rect, color: bc });
+                }
             }
         }
     }
@@ -598,23 +629,37 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
     match style.overflow_y {
         crate::style::Overflow::Visible => {
             for child in &node.children {
-                emit_box(child, list, parent_clip);
+                emit_box(child, list, parent_clip, scale);
             }
         }
         crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
-            list.items.push(DisplayItem::PushClip(node.padding_box));
+            if radius > 0.0 {
+                list.items.push(DisplayItem::PushClipRounded {
+                    rect: node.padding_box,
+                    radius,
+                });
+            } else {
+                list.items.push(DisplayItem::PushClip(node.padding_box));
+            }
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box));
+                emit_box(child, list, Some(node.padding_box), scale);
             }
             list.items.push(DisplayItem::PopClip);
         }
         crate::style::Overflow::Auto | crate::style::Overflow::Scroll => {
-            list.items.push(DisplayItem::PushClip(node.padding_box));
+            if radius > 0.0 {
+                list.items.push(DisplayItem::PushClipRounded {
+                    rect: node.padding_box,
+                    radius,
+                });
+            } else {
+                list.items.push(DisplayItem::PushClip(node.padding_box));
+            }
             let (ox, oy) = node.applied_scroll;
             list.items
                 .push(DisplayItem::PushTransform { x: -ox, y: -oy });
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box));
+                emit_box(child, list, Some(node.padding_box), scale);
             }
             list.items.push(DisplayItem::PopTransform);
             list.items.push(DisplayItem::PopClip);

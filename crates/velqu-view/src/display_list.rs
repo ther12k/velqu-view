@@ -44,12 +44,35 @@ pub(crate) enum DisplayItem {
     /// Constrains all items until the matching [`DisplayItem::PopClip`] to
     /// this rectangle (intersected with any enclosing clip).
     PushClip(Rect),
+    /// [`DisplayItem::PushClip`] with rounded corners (M3: `overflow`
+    /// clipping on a box that also has `border-radius`). Pixel coverage
+    /// follows the rounded shape; the rect still intersects enclosing
+    /// clips.
+    PushClipRounded { rect: Rect, radius: f32 },
     /// Ends the innermost clip scope.
     PopClip,
     /// Blits a decoded image into `rect` (nearest-neighbor, `object-fit:
     /// fill`). The pixels travel with the item so the painter stays
     /// stateless beyond its font store.
     DrawImage { rect: Rect, image: Rc<DecodedImage> },
+    /// Filled rectangle with rounded corners (M3: `background-color` +
+    /// `border-radius`). The rect edges are the shape's bounds; coverage
+    /// is a deterministic per-pixel test, no anti-aliasing.
+    RoundedFill {
+        rect: Rect,
+        radius: f32,
+        color: Color,
+    },
+    /// A border ring with rounded corners (M3): pixels inside `outer`
+    /// (corner `radius`) and outside `inner` (per-corner `inner_radii`,
+    /// order top-left, top-right, bottom-right, bottom-left) paint.
+    RoundedBorder {
+        outer: Rect,
+        inner: Rect,
+        radius: f32,
+        inner_radii: [f32; 4],
+        color: Color,
+    },
     /// Translates all items until the matching [`DisplayItem::PopTransform`]
     /// by `(x, y)` device px (M2c scrolling: the negated scroll offset).
     /// Scopes nest; clips pushed inside a transform scope are positioned in
