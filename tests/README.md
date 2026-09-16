@@ -46,4 +46,7 @@ color = "#EF4444"
   (regenerate by setting `pixels_sha256 = "PENDING"` and running the suite).
 - M2 adds `layout_facts` (expected geometry) to this schema.
 - M2c adds image facts (replaced elements size by intrinsic ratio; broken
-  images keep a 300×150 footprint and paint nothing).
+  images keep a 300×150 footprint and paint nothing), per-node
+  `scroll_width`/`scroll_height`, and a `[scroll]` table of programmatic
+  offsets (empty key = document scroller, otherwise an element `id`);
+  facts stay unscrolled — only the raster moves.

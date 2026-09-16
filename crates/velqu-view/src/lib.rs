@@ -25,12 +25,13 @@
 //!
 //! # Milestone status
 //!
-//! * **M1 (current):** `load_html`/`load_css` retain document source and feed a
-//!   deterministic *paint probe* scene; `render` rasterizes it offscreen with
-//!   no window required.
-//! * **M2 (next):** HTML parsing, style cascade, and block/flex/grid layout
-//!   replace the probe scene. The API shape below is intended to survive that
-//!   swap unchanged.
+//! * **M1–M2b (done):** document/stylesheet sources with identity, cascade,
+//!   box tree, Taffy-backed block/flex layout, deterministic text, display
+//!   list, and pixel-hash fixtures (`docs/decisions/0005`–`0007`).
+//! * **M2c (current):** bounded image decoding + `<img>` as a replaced
+//!   element, the frozen grid profile, and paint-side scrolling
+//!   ([ADR 0008](docs/decisions/0008-m2c-images-grid-scroll.md)). The API
+//!   shape below keeps absorbing each milestone without breaking change.
 //!
 //! # Example
 //!

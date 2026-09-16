@@ -31,8 +31,8 @@ native lightweight application UI
 | M1.1 | API/resource hardening: source identity, viewport invariants, host-side assets, MSRV/licenses ([ADR 0004](docs/decisions/0004-m11-api-resource-hardening.md)) | **done** |
 | M2a | HTML parsing, cascade, block layout, text, display list, layout facts | **done** |
 | M2b | Taffy whole-tree backend, flex profile, display-list clipping, overflow | **done** |
-| M2c | grid, images/assets, scroll | next |
-| M3 | Tailwind pipeline + compatibility profile fixtures | |
+| M2c | bounded image decoding, replaced elements, grid profile, paint-side scrolling ([ADR 0008](docs/decisions/0008-m2c-images-grid-scroll.md)) | **done** |
+| M3 | Tailwind pipeline + compatibility profile fixtures | next |
 | M4 | input gate (pointer/keyboard/focus/text/selection/IME) | |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) | |
 | M6 | VelquView Lab inspector + reload | |
