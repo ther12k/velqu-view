@@ -72,6 +72,12 @@ impl From<VelquError> for ShellError {
     }
 }
 
+impl From<velqu_view::InvalidViewport> for ShellError {
+    fn from(err: velqu_view::InvalidViewport) -> Self {
+        ShellError::new(format!("render failed: {err}"))
+    }
+}
+
 /// Window configuration for [`run`].
 #[derive(Debug, Clone)]
 pub struct ShellConfig {
@@ -230,9 +236,9 @@ impl ShellApp<'_> {
         };
         let scale = window.scale_factor() as f32;
 
-        let FrameResult { frame, .. } =
-            self.view
-                .render(Viewport::new(width.get(), height.get(), scale))?;
+        let FrameResult { frame, .. } = self.view.render(
+            Viewport::try_new(width.get(), height.get(), scale).map_err(ShellError::from)?,
+        )?;
 
         let surface = self
             .surface

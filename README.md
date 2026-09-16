@@ -28,6 +28,7 @@ native lightweight application UI
 |---|---|---|
 | M0 | workspace, CI, fixtures, decision log, evidence format | **done** |
 | M1 | native window, rectangle/text paint, resize/DPI, frame capture | **done** |
+| M1.1 | API/resource hardening: source identity, viewport invariants, host-side assets, MSRV/licenses ([ADR 0004](docs/decisions/0004-m11-api-resource-hardening.md)) | **done** |
 | M2 | HTML parsing, cascade, block/flex/grid layout, scrolling | next |
 | M3 | Tailwind pipeline + compatibility profile fixtures | |
 | M4 | input gate (pointer/keyboard/focus/text/selection/IME) | |
@@ -98,5 +99,6 @@ lives in [`docs/evidence/`](docs/evidence/).
 
 ## Licensing
 
-Code: MIT OR Apache-2.0 (provisional). Bundled fonts are DejaVu
+Code: `MIT OR Apache-2.0` at your option — see [LICENSE-MIT](LICENSE-MIT)
+and [LICENSE-APACHE](LICENSE-APACHE). Bundled fonts are DejaVu
 (`crates/velqu-view/assets/fonts/LICENSE-dejavu.txt`).

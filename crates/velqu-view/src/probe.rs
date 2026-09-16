@@ -39,7 +39,11 @@ pub(crate) const SWATCH_Y: f32 = 132.0;
 pub(crate) const SWATCH_X0: f32 = 32.0;
 
 /// Builds the probe scene for the given document sources and viewport.
-pub(crate) fn build(html: &str, css: &[String], viewport: Viewport) -> Scene {
+pub(crate) fn build(
+    document: &crate::DocumentSource,
+    stylesheets: &[crate::StylesheetSource],
+    viewport: Viewport,
+) -> Scene {
     let mut scene = Scene::new(palette::BACKGROUND);
 
     // Viewport frame (inset outline) — proves logical geometry scales with DPI.
@@ -102,7 +106,9 @@ pub(crate) fn build(html: &str, css: &[String], viewport: Viewport) -> Scene {
     // Status lines: viewport/DPI and loaded document facts.
     let status = format!(
         "viewport {}x{} px @ {:.2}x scale",
-        viewport.width, viewport.height, viewport.scale_factor
+        viewport.width(),
+        viewport.height(),
+        viewport.scale_factor()
     );
     scene.push(Item::Text {
         x: 32.0,
@@ -113,12 +119,12 @@ pub(crate) fn build(html: &str, css: &[String], viewport: Viewport) -> Scene {
         weight: FontWeight::Regular,
     });
 
-    let css_bytes: usize = css.iter().map(|s| s.len()).sum();
+    let css_bytes: usize = stylesheets.iter().map(|sheet| sheet.css.len()).sum();
     let doc = format!(
         "document html {} B / css {} B in {} sheet(s)",
-        html.len(),
+        document.html.len(),
         css_bytes,
-        css.len()
+        stylesheets.len()
     );
     scene.push(Item::Text {
         x: 32.0,
@@ -135,15 +141,24 @@ pub(crate) fn build(html: &str, css: &[String], viewport: Viewport) -> Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DocumentSource, StylesheetSource};
 
-    fn probe_items(html: &str, css: &[&str], vp: Viewport) -> Vec<Item> {
-        let owned: Vec<String> = css.iter().map(|s| s.to_string()).collect();
-        build(html, &owned, vp).items
+    fn vp(w: u32, h: u32, scale: f32) -> Viewport {
+        Viewport::try_new(w, h, scale).unwrap()
+    }
+
+    fn probe_items(html: &str, css: &[&str], viewport: Viewport) -> Vec<Item> {
+        let sheets: Vec<StylesheetSource> = css
+            .iter()
+            .enumerate()
+            .map(|(i, css)| StylesheetSource::new(format!("t{i}.css"), *css))
+            .collect();
+        build(&DocumentSource::new("index.html", html), &sheets, viewport).items
     }
 
     #[test]
     fn scene_shape_is_stable() {
-        let items = probe_items("<html></html>", &[], Viewport::new(800, 600, 1.0));
+        let items = probe_items("<html></html>", &[], vp(800, 600, 1.0));
         // outline + title + subtitle + accent + 5 swatches + label + 2 status lines.
         assert_eq!(items.len(), 12);
         assert!(items.iter().any(|i| matches!(i, Item::RectOutline { .. })));
@@ -158,7 +173,7 @@ mod tests {
 
     #[test]
     fn swatch_layout_math() {
-        let items = probe_items("<html></html>", &[], Viewport::new(800, 600, 1.0));
+        let items = probe_items("<html></html>", &[], vp(800, 600, 1.0));
         let swatches: Vec<&Item> = items
             .iter()
             .filter(|i| matches!(i, Item::Rect { y, h, .. } if *y == SWATCH_Y && *h == SWATCH_SIZE))

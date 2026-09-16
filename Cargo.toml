@@ -11,7 +11,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# Edition 2024 needs 1.85; fontdue 0.9.4 additionally requires stable
+# `integer_sign_cast` (1.87). Verified: `cargo +1.87.0 check` passes,
+# 1.85 fails inside fontdue. Keep in sync with the CI `msrv` lane.
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ther12k/velqu-view"
 publish = false

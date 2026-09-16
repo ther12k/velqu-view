@@ -1,0 +1,7 @@
+# Pinned development toolchain — matches the toolchain used for committed
+# evidence, keeping local builds reproducible. The MSRV (1.85, from
+# Cargo.toml rust-version) is verified separately in CI; the `msrv` job
+# overrides this file via RUSTUP_TOOLCHAIN.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

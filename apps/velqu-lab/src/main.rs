@@ -125,12 +125,43 @@ fn parse_size(value: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
-/// Loads `index.html` plus every `*.css` in `app_dir` (sorted by name).
+/// The lab's host-side asset resolver: maps renderer asset requests onto
+/// the app directory. This is where filesystem access lives — the renderer
+/// itself never touches the disk (ADR 0004).
+struct DirAssets {
+    root: PathBuf,
+}
+
+impl velqu_view::AssetResolver for DirAssets {
+    fn resolve(&self, request: velqu_view::AssetRequest<'_>) -> Option<velqu_view::Asset> {
+        let rel = request.path.trim_start_matches("./");
+        // Stay inside the app directory: reject traversal and absolute refs.
+        if rel.starts_with('/') || rel.split(['/', '\\']).any(|segment| segment == "..") {
+            return None;
+        }
+        let path = self.root.join(rel);
+        let bytes = std::fs::read(&path).ok()?;
+        Some(velqu_view::Asset {
+            id: velqu_view::SourceId::new(rel),
+            bytes,
+        })
+    }
+}
+
+/// Loads `index.html` plus every `*.css` in `app_dir` (sorted by name),
+/// with source identity taken from the file names and a host asset
+/// resolver installed over the app directory.
 fn load_app(view: &mut VelquView, app_dir: &Path) -> Result<(), String> {
     let index = app_dir.join("index.html");
     let html = std::fs::read_to_string(&index)
         .map_err(|e| format!("cannot read {}: {e}", index.display()))?;
-    view.load_html(&html).map_err(|e| e.to_string())?;
+    let base = app_dir.to_string_lossy().into_owned();
+    let document =
+        velqu_view::DocumentSource::new(index.to_string_lossy().into_owned(), html).with_base(base);
+    view.load_document(document).map_err(|e| e.to_string())?;
+    view.set_asset_resolver(std::rc::Rc::new(DirAssets {
+        root: app_dir.to_owned(),
+    }));
 
     let mut css_files: Vec<PathBuf> = match std::fs::read_dir(app_dir) {
         Ok(entries) => entries
@@ -143,7 +174,8 @@ fn load_app(view: &mut VelquView, app_dir: &Path) -> Result<(), String> {
     for css_file in css_files {
         let css = std::fs::read_to_string(&css_file)
             .map_err(|e| format!("cannot read {}: {e}", css_file.display()))?;
-        view.load_css(&css).map_err(|e| e.to_string())?;
+        let sheet = velqu_view::StylesheetSource::new(css_file.to_string_lossy().into_owned(), css);
+        view.load_stylesheet(sheet).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -157,11 +189,12 @@ fn human_bytes(n: usize) -> String {
 }
 
 fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
-    let viewport = Viewport::new(
+    let viewport = Viewport::try_new(
         args.size.0 * args.scale as u32,
         args.size.1 * args.scale as u32,
         args.scale,
-    );
+    )
+    .map_err(|e| e.to_string())?;
     let mut hashes: Vec<String> = Vec::new();
     let mut durations: Vec<Duration> = Vec::new();
     let mut first: Option<velqu_view::FrameResult> = None;
@@ -181,11 +214,15 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
         "app: {} (html {}, css {} sheet(s))",
         args.app_dir.display(),
         human_bytes(view.html().map(str::len).unwrap_or(0)),
-        view.css().len()
+        view.stylesheets().len()
     );
     println!(
         "viewport: {}x{} px @ {:.2}x (logical {}x{})",
-        viewport.width, viewport.height, viewport.scale_factor, args.size.0, args.size.1
+        viewport.width(),
+        viewport.height(),
+        viewport.scale_factor(),
+        args.size.0,
+        args.size.1
     );
     println!(
         "frame 1: {} items, {} glyphs",

@@ -33,11 +33,11 @@ this file maps it onto what exists in the repository today.
 
 | Crate | Owns | Does not own |
 |---|---|---|
-| `velqu-view` | public renderer API, scene model, M1 CPU painter, bundled fonts, `Frame`/capture | windows, events, HTML semantics (M2) |
+| `velqu-view` | public renderer API, scene model, M1 CPU painter, bundled fonts, `Frame`/capture, source identity, viewport validation, asset-resolution seam | windows, events, HTML semantics (M2), any I/O |
 | `velqu-shell` | native window, event loop, DPI/resize, frame presentation | rendering decisions, document state |
 | `velqu-reactive` | frozen vx-* syntax surface, static validation | any runtime (M5) |
-| `velqu-tailwind` | CSS Profile v0 manifest, classification | CSS parsing/engine work (M3) |
-| `velqu-lab` (app) | loading local app dirs, window preview, headless fixture capture | — |
+| `velqu-tailwind` | CSS Profile v0 manifest, concept-level classification (declaration/at-rule, three tiers) | CSS parsing/engine work (M3) |
+| `velqu-lab` (app) | loading local app dirs (with source identity + directory asset resolver), window preview, headless fixture capture | — |
 
 Dependency direction: `velqu-lab → velqu-shell → velqu-view`.
 `velqu-reactive` and `velqu-tailwind` are leaves; nothing depends on
@@ -46,21 +46,28 @@ windowing or GPU crates except `velqu-shell`.
 ## M1 paint pipeline (what runs today)
 
 ```
-VelquView::load_html / load_css      sources retained + validated
+VelquView::load_document / load_stylesheet      sources carry identity (SourceId);
+(from load_html/load_css conveniences)           stylesheets upsert by id (hot-reload
+                                                 primitive, ADR 0004)
         ↓
-probe scene (src/probe.rs)           explicit debug scene: rects, outline,
-                                     text in two weights, viewport/DPI status,
-                                     document size echo
+probe scene (src/probe.rs)                       explicit debug scene: rects, outline,
+                                                 text in two weights, viewport/DPI status,
+                                                 document size echo
         ↓
-painter (src/painter.rs)             CPU raster into an RGBA8 buffer;
-                                     logical→device = round(v * scale);
-                                     solid rects, fontdue glyphs (scalar path)
+painter (src/painter.rs)                         CPU raster into an RGBA8 buffer;
+                                                 logical→device = round(v * scale);
+                                                 solid rects, fontdue glyphs (scalar path);
+                                                 fallible, pixel-bounded allocation
         ↓
-Frame                                 pixels + sha256 + PNG encode
+Frame                                             pixels + sha256 + PNG encode
         ↓
-velqu-shell                           winit window; softbuffer blit
-                                      (native-endian 0x00RRGGBB)
+velqu-shell                                       winit window; softbuffer blit
+                                                  (native-endian 0x00RRGGBB)
 ```
+
+`Viewport` is validated at construction (`try_new`: non-zero dimensions,
+finite positive scale, `width*height <= MAX_PIXELS`), so layout and paint
+consume a target whose invariants cannot be violated.
 
 Rendering is fully offscreen and deterministic: identical state + viewport
 produce identical bytes. A window is only one possible sink for a `Frame`.
@@ -98,9 +105,13 @@ directly — Rust applies state-driven changes:
 QuickJS expression → reactive state → Rust binding engine → Velqu DOM → layout/paint
 ```
 
-Host capabilities: core VelquView has no ambient external I/O. A future
-`AppHost` trait (`supports` / `request`) will broker network, filesystem,
-clipboard, dialogs, etc. Not stabilized until after the renderer POC.
+Host capabilities: core VelquView has no ambient external I/O — this already
+applies to assets: documents declare an opaque `base`, and relative
+references resolve through a host-installed `AssetResolver`
+(`velqu-lab` installs a directory-scoped one; the default resolves
+nothing). A future broader `AppHost` trait (`supports` / `request`) will
+broker network, filesystem, clipboard, dialogs, etc. Not stabilized until
+after the renderer POC.
 
 ## Non-goals (enforced)
 

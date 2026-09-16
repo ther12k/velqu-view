@@ -80,15 +80,16 @@ fn run_fixture(dir: &Path) {
         view.load_css(&css).expect("fixture css loads");
     }
 
-    let viewport = Viewport::new(
+    let viewport = Viewport::try_new(
         fixture.viewport.width,
         fixture.viewport.height,
         fixture.viewport.scale,
-    );
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
     let result = view.render(viewport).expect("fixture renders");
 
-    assert_eq!(result.frame.width(), viewport.width, "frame width");
-    assert_eq!(result.frame.height(), viewport.height, "frame height");
+    assert_eq!(result.frame.width(), viewport.width(), "frame width");
+    assert_eq!(result.frame.height(), viewport.height(), "frame height");
 
     let actual_hash = result.frame.sha256_hex();
     match fixture.expect.pixels_sha256.as_deref() {
@@ -155,11 +156,12 @@ fn fixtures_are_deterministic_across_instances() {
                 view.load_css(&css).unwrap();
             }
         }
-        let viewport = Viewport::new(
+        let viewport = Viewport::try_new(
             fixture.viewport.width,
             fixture.viewport.height,
             fixture.viewport.scale,
-        );
+        )
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
         let a = views[0].render(viewport).unwrap();
         let b = views[1].render(viewport).unwrap();
         assert_eq!(

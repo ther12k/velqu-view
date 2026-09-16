@@ -13,7 +13,7 @@ jobs:
     name: fmt, clippy, test, build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,3 +39,24 @@ jobs:
 
       - name: Build release
         run: cargo build --workspace --release --locked
+
+  msrv:
+    name: MSRV (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.87"] # workspace rust-version; keep in sync with Cargo.toml
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `cargo check` compiles all targets without linking, so the X11/Wayland
+      # dev packages are not needed on this lane.
+      - name: Check (MSRV)
+        run: cargo check --workspace --all-targets --locked

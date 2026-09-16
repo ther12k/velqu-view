@@ -22,15 +22,31 @@ const LINE_HEIGHT_FACTOR: f32 = 1.5;
 /// Paints `scene` into a frame for `viewport`.
 ///
 /// Returns the frame, the number of items painted, and the number of glyphs
-/// composited (reported through [`crate::RenderStats`]).
+/// composited (reported through [`crate::RenderStats`]). Frame allocation is
+/// fallible: the buffer is reserved with `try_reserve_exact` so an exhausted
+/// allocator surfaces as [`crate::VelquError::FrameAllocationFailed`] instead
+/// of aborting the process.
 pub(crate) fn paint(
     scene: &Scene,
     viewport: Viewport,
     fonts: &mut FontStore,
-) -> (Frame, usize, usize) {
-    let width = viewport.width as usize;
-    let height = viewport.height as usize;
-    let mut rgba = vec![0u8; width * height * 4];
+) -> Result<(Frame, usize, usize), crate::VelquError> {
+    // u64 math: the viewport was validated against MAX_PIXELS at
+    // construction, but this stays safe on 32-bit targets too.
+    let byte_count = u64::from(viewport.width()) * u64::from(viewport.height()) * 4;
+    let byte_count =
+        usize::try_from(byte_count).map_err(|_| crate::VelquError::FrameAllocationFailed {
+            width: viewport.width(),
+            height: viewport.height(),
+        })?;
+    let mut rgba: Vec<u8> = Vec::new();
+    rgba.try_reserve_exact(byte_count)
+        .map_err(|_| crate::VelquError::FrameAllocationFailed {
+            width: viewport.width(),
+            height: viewport.height(),
+        })?;
+    rgba.resize(byte_count, 0);
+
     let bg = scene.background;
     for px in rgba.chunks_exact_mut(4) {
         px[0] = bg.r;
@@ -40,9 +56,9 @@ pub(crate) fn paint(
     }
 
     let mut ctx = PaintCtx {
-        width: viewport.width,
-        height: viewport.height,
-        scale: viewport.scale_factor,
+        width: viewport.width(),
+        height: viewport.height(),
+        scale: viewport.scale_factor(),
         rgba: &mut rgba,
         glyphs: 0,
     };
@@ -93,11 +109,11 @@ pub(crate) fn paint(
     }
 
     let glyphs = ctx.glyphs;
-    (
-        Frame::from_parts(viewport.width, viewport.height, rgba),
+    Ok((
+        Frame::from_parts(viewport.width(), viewport.height(), rgba),
         items,
         glyphs,
-    )
+    ))
 }
 
 struct PaintCtx<'a> {
@@ -215,6 +231,10 @@ mod tests {
     use super::*;
     use crate::scene::Item;
 
+    fn vp(w: u32, h: u32, scale: f32) -> Viewport {
+        Viewport::try_new(w, h, scale).unwrap()
+    }
+
     #[test]
     fn fill_rect_snaps_to_device_pixels() {
         let scene = Scene {
@@ -227,11 +247,8 @@ mod tests {
                 color: Color::WHITE,
             }],
         };
-        let (frame, items, glyphs) = paint(
-            &scene,
-            Viewport::new(64, 64, 1.0),
-            &mut FontStore::bundled(),
-        );
+        let (frame, items, glyphs) =
+            paint(&scene, vp(64, 64, 1.0), &mut FontStore::bundled()).unwrap();
         assert_eq!((items, glyphs), (1, 0));
         // round(10.3)=10 .. round(30.7)=31.
         assert_eq!(frame.pixel(10, 10), Some(Color::WHITE));
@@ -252,11 +269,7 @@ mod tests {
                 color: Color::WHITE,
             }],
         };
-        let (frame, _, _) = paint(
-            &scene,
-            Viewport::new(64, 64, 1.0),
-            &mut FontStore::bundled(),
-        );
+        let (frame, _, _) = paint(&scene, vp(64, 64, 1.0), &mut FontStore::bundled()).unwrap();
         assert_eq!(frame.pixel(0, 0), Some(Color::WHITE));
         assert_eq!(frame.pixel(63, 63), Some(Color::WHITE));
     }
@@ -275,12 +288,24 @@ mod tests {
             }],
         };
         let mut fonts = FontStore::bundled();
-        let (small, _, g1) = paint(&text_scene(12.0), Viewport::new(200, 80, 1.0), &mut fonts);
-        let (large, _, g2) = paint(&text_scene(12.0), Viewport::new(400, 160, 2.0), &mut fonts);
+        let (small, _, g1) = paint(&text_scene(12.0), vp(200, 80, 1.0), &mut fonts).unwrap();
+        let (large, _, g2) = paint(&text_scene(12.0), vp(400, 160, 2.0), &mut fonts).unwrap();
         assert_eq!(g1, g2, "same glyph count at any DPI");
         let ink = |f: &Frame| f.pixels().chunks_exact(4).filter(|p| p[0] > 0).count();
         let small_ink = ink(&small);
         let large_ink = ink(&large);
         assert!(large_ink > small_ink * 3, "2x DPI covers ~4x the pixels");
+    }
+
+    #[test]
+    fn pixel_buffer_is_fully_initialized() {
+        // The fallible-allocation path must still produce a fully painted
+        // background (resize zero-fills; the fill loop must cover it).
+        let scene = Scene::new(Color::from_rgb8(0x11, 0x22, 0x33));
+        let (frame, _, _) = paint(&scene, vp(37, 23, 1.0), &mut FontStore::bundled()).unwrap();
+        assert_eq!(frame.pixels().len(), 37 * 23 * 4);
+        for px in frame.pixels().chunks_exact(4) {
+            assert_eq!(px, [0x11, 0x22, 0x33, 0xff]);
+        }
     }
 }
