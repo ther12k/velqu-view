@@ -66,6 +66,7 @@ mod probe;
 mod scene;
 mod source;
 mod style;
+mod text;
 mod viewport;
 
 use std::fmt;
