@@ -114,12 +114,26 @@ pub(crate) enum AlignSelf {
 
 /// M2b overflow: visible | hidden | clip. Clipping executes in the
 /// display list/painter; layout only switches containment.
+///
+/// M2c adds `auto`/`scroll`: the box becomes a **scroll container**. In the
+/// Velqu profile they behave identically (no scrollbar gutter modeling);
+/// scrolling is paint-side (`PushTransform`), and layout geometry stays the
+/// unscrolled truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Overflow {
     #[default]
     Visible,
     Hidden,
     Clip,
+    Auto,
+    Scroll,
+}
+
+impl Overflow {
+    /// Does this value make the box a scroll container?
+    pub(crate) fn is_scroll_container(self) -> bool {
+        matches!(self, Overflow::Auto | Overflow::Scroll)
+    }
 }
 
 /// M2c grid profile (ADR 0008): one track sizing function.
@@ -1003,18 +1017,24 @@ fn apply_declaration(
                 style.overflow_x = Overflow::Clip;
                 style.overflow_y = Overflow::Clip;
             }
+            "auto" | "scroll" => {
+                style.overflow_x = Overflow::Auto;
+                style.overflow_y = Overflow::Auto;
+            }
             _ => diagnostics.push(unsupported("overflow value")),
         },
         "overflow-x" => match declaration.value.as_str() {
             "visible" => style.overflow_x = Overflow::Visible,
             "hidden" => style.overflow_x = Overflow::Hidden,
             "clip" => style.overflow_x = Overflow::Clip,
+            "auto" | "scroll" => style.overflow_x = Overflow::Auto,
             _ => diagnostics.push(unsupported("overflow value")),
         },
         "overflow-y" => match declaration.value.as_str() {
             "visible" => style.overflow_y = Overflow::Visible,
             "hidden" => style.overflow_y = Overflow::Hidden,
             "clip" => style.overflow_y = Overflow::Clip,
+            "auto" | "scroll" => style.overflow_y = Overflow::Auto,
             _ => diagnostics.push(unsupported("overflow value")),
         },
         "grid-template-columns" | "grid-template-rows" => {

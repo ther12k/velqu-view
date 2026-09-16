@@ -47,8 +47,14 @@ use crate::viewport::Viewport;
 /// sibling margin collapsing now applies via Taffy's block algorithm).
 const PAGE_ROOT_TAGS: [&str; 2] = ["html", "body"];
 
-/// Lays out the box tree with Taffy, then positions inline content.
-pub(crate) fn layout_box_tree(root: &mut BoxNode, viewport: Viewport, fonts: &mut FontStore) {
+/// Lays out the box tree with Taffy, derives scroll extents from the laid-out
+/// geometry, and applies clamped runtime scroll offsets to scroll containers.
+pub(crate) fn layout_box_tree(
+    root: &mut BoxNode,
+    viewport: Viewport,
+    fonts: &mut FontStore,
+    scroll_offsets: &crate::layout::ScrollOffsets,
+) {
     let scale = viewport.scale_factor();
     let mut taffy = TaffyTree::new();
     // One rounding owner: Velqu rounds at raster; Taffy stays unrounded.
@@ -105,9 +111,55 @@ pub(crate) fn layout_box_tree(root: &mut BoxNode, viewport: Viewport, fonts: &mu
         )
         .expect("taffy layout succeeds for a well-formed projection");
 
-    // Write back geometry, then position inline content.
+    // Write back geometry, then position inline content. Scroll extents and
+    // offset application run on the laid-out geometry only — scrolling never
+    // re-runs Taffy (ADR 0008).
     write_back(root, &mirror, &taffy);
     layout_inline_content(root, fonts, scale);
+    compute_scroll_extents(root);
+    apply_scroll_offsets(root, scroll_offsets);
+}
+
+/// Derives each scroll container's content extent from laid-out child
+/// geometry (direct children's border boxes — descendants are contained by
+/// their parents' boxes unless clipped, a documented M2c simplification).
+fn compute_scroll_extents(node: &mut BoxNode) {
+    for child in &mut node.children {
+        compute_scroll_extents(child);
+    }
+    let scrollable =
+        node.style.overflow_y.is_scroll_container() || node.style.overflow_x.is_scroll_container();
+    if !scrollable {
+        return;
+    }
+    let mut right = node.padding_box.x + node.padding_box.w;
+    let mut bottom = node.padding_box.y + node.padding_box.h;
+    for child in &node.children {
+        right = right.max(child.border_box.x + child.border_box.w);
+        bottom = bottom.max(child.border_box.y + child.border_box.h);
+    }
+    node.scroll = Some(crate::layout::ScrollExtent {
+        width: right - node.padding_box.x,
+        height: bottom - node.padding_box.y,
+    });
+}
+
+/// Applies requested offsets to scroll containers by element `id`, clamped
+/// centrally. Unknown ids and non-scroll-container ids match nothing and are
+/// ignored (the offset simply never applies).
+fn apply_scroll_offsets(node: &mut BoxNode, scroll_offsets: &crate::layout::ScrollOffsets) {
+    if let (Some(scroll), Some(element_id)) = (&node.scroll, &node.element_id) {
+        if let Some((_, raw)) = scroll_offsets.iter().find(|(key, _)| key == element_id) {
+            node.applied_scroll = crate::layout::clamp_scroll_offset(
+                *raw,
+                (scroll.width, scroll.height),
+                (node.padding_box.w, node.padding_box.h),
+            );
+        }
+    }
+    for child in &mut node.children {
+        apply_scroll_offsets(child, scroll_offsets);
+    }
 }
 
 // -- projection ---------------------------------------------------------------
@@ -438,6 +490,10 @@ fn map_overflow(overflow: Overflow) -> taffy::style::Overflow {
         // `clip` behaves like `hidden` for Taffy's layout containment; the
         // difference (no scrolling ever) is a paint-side concern here.
         Overflow::Hidden | Overflow::Clip => taffy::style::Overflow::Hidden,
+        // Scroll containers scroll paint-side (PushTransform). Taffy's
+        // `Scroll` would model scrollbar-gutter/scrollable-overflow behavior
+        // Velqu does not expose; `Hidden` keeps geometry identical to M2b.
+        Overflow::Auto | Overflow::Scroll => taffy::style::Overflow::Hidden,
     }
 }
 

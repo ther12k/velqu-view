@@ -40,6 +40,12 @@ pub struct LayoutFacts {
     /// One entry per box whose element carries `data-vv-test`, in document
     /// order.
     pub nodes: Vec<LayoutNodeFact>,
+    /// Document-level scrollable extent (device px): `max(page content,
+    /// viewport)` per axis. The viewport is the scrollport for the
+    /// document-level scroller (`set_scroll_offset(None, ..)`).
+    pub document_scroll_width: f32,
+    /// Document-level scrollable height, in device pixels.
+    pub document_scroll_height: f32,
 }
 
 /// Current layout facts schema.
@@ -81,6 +87,11 @@ pub struct LayoutNodeFact {
     pub margin: [f32; 4],
     /// Laid-out line texts in order.
     pub text_runs: Vec<String>,
+    /// Scrollable content extent; `Some` only for scroll containers
+    /// (`overflow: auto`/`scroll`). Additive LayoutFacts v1 field.
+    pub scroll_width: Option<f32>,
+    /// Scrollable content height, in device pixels.
+    pub scroll_height: Option<f32>,
 }
 
 /// One wrap unit with its own style.
@@ -111,6 +122,9 @@ pub(crate) struct BoxNode {
     #[allow(dead_code)] // identity retained for future invalidation work
     pub node: NodeId,
     pub fixture_id: Option<String>,
+    /// The element's `id` attribute, if any — the runtime scroll-target
+    /// identity (ADR 0008). Test fixtures keep using `data-vv-test`.
+    pub element_id: Option<String>,
     pub tag: String,
     pub style: ComputedStyle,
     pub children: Vec<BoxNode>,
@@ -131,6 +145,22 @@ pub(crate) struct BoxNode {
     /// layout leaf measured by intrinsic size (ADR 0008) — it is never
     /// flattened into inline words.
     pub replaced: Option<std::rc::Rc<DecodedImage>>,
+    /// Scrollable content extent for scroll containers (`overflow: auto`/
+    /// `scroll`): content width/height measured from the padding box. Set
+    /// after layout; `None` for non-scroll boxes.
+    pub scroll: Option<ScrollExtent>,
+    /// The clamped scroll offset this box is painted with (unscrolled
+    /// layout geometry is never mutated by scrolling). `(0.0, 0.0)` unless
+    /// a runtime offset targets this container.
+    pub applied_scroll: (f32, f32),
+}
+
+/// Scrollable content extent of a scroll container, in device px. Always at
+/// least the scrollport (padding box) size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ScrollExtent {
+    pub width: f32,
+    pub height: f32,
 }
 
 /// One laid-out line (runs positioned relative to the content box).
@@ -211,6 +241,7 @@ pub(crate) fn build_boxes(
     let mut box_node = BoxNode {
         node: root,
         fixture_id: dom.fixture_id(root).map(str::to_owned),
+        element_id: dom.attribute(root, "id").map(str::to_owned),
         tag: dom.tag_name(root).unwrap_or("?").to_owned(),
         style: style.clone(),
         children: Vec::new(),
@@ -222,6 +253,8 @@ pub(crate) fn build_boxes(
         words: Vec::new(),
         text_origin: None,
         replaced,
+        scroll: None,
+        applied_scroll: (0.0, 0.0),
     };
 
     let mut pending_space_before = false;
@@ -342,8 +375,51 @@ fn collect_inline_words(
     }
 }
 
-/// Lays out the document inside `viewport` and returns the root box plus
-/// its display list.
+/// The complete output of one layout pass: the canonical box tree (layout
+/// truth), the paint-ready display list, and the document-level scroll
+/// state derived from it.
+#[derive(Debug)]
+pub(crate) struct LaidOutDocument {
+    pub root: BoxNode,
+    pub display_list: DisplayList,
+    /// Document scrollable extent (device px): `max(page content,
+    /// viewport)` per axis; the scrollport is the viewport itself.
+    pub document_scroll: ScrollExtent,
+    /// Clamped document-level scroll offset (the empty scroll key).
+    /// Consumed by the display-list emission in the next M2c commit.
+    #[allow(dead_code)]
+    pub root_offset: (f32, f32),
+}
+
+/// Runtime scroll offsets, keyed by scroll target: the empty key is the
+/// document-level scroller, any other key is an element `id`. Values are
+/// raw (unclamped) requests; clamping happens centrally at apply time.
+pub(crate) type ScrollOffsets = Vec<(String, (f32, f32))>;
+
+/// Clamps a raw scroll request to `0 <= offset <= extent - scrollport`,
+/// per axis. The single place scrolling math happens (ADR 0008) — painters
+/// consume clamped offsets and never compensate.
+pub(crate) fn clamp_scroll_offset(
+    raw: (f32, f32),
+    extent: (f32, f32),
+    scrollport: (f32, f32),
+) -> (f32, f32) {
+    let max_x = (extent.0 - scrollport.0).max(0.0);
+    let max_y = (extent.1 - scrollport.1).max(0.0);
+    (raw.0.clamp(0.0, max_x), raw.1.clamp(0.0, max_y))
+}
+
+/// Counts every box in the laid-out tree (instrumentation, ADR 0008).
+pub(crate) fn count_box_tree(root: &BoxNode) -> usize {
+    let mut count = 1;
+    for child in &root.children {
+        count += count_box_tree(child);
+    }
+    count
+}
+
+/// Lays out the document inside `viewport` and returns the root box, its
+/// display list, and the document scroll state.
 ///
 /// The box tree is built here (Velqu-canonical), then laid out by the
 /// private Taffy backend (ADR 0007), then lowered to a display list.
@@ -353,7 +429,8 @@ pub(crate) fn layout_document(
     cascade: &mut crate::style::Cascade<'_>,
     fonts: &mut FontStore,
     images: &ImageStore,
-) -> Option<(BoxNode, DisplayList)> {
+    scroll_offsets: &ScrollOffsets,
+) -> Option<LaidOutDocument> {
     // The layout root: <body> if present, else <html>, else the document.
     let mut root_element = None;
     dom.walk_from(dom.document(), |id, _node| {
@@ -366,11 +443,37 @@ pub(crate) fn layout_document(
     let styles = compute_all_styles(dom, root_element, cascade);
     let mut root = build_boxes(dom, root_element, &styles, images)?;
 
-    crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts);
+    crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts, scroll_offsets);
+
+    // Scroll extents are derived from laid-out geometry only — no second
+    // Taffy pass, and offsets never alter the geometry (ADR 0008).
+    let document_extent_w = root.border_box.x + root.border_box.w;
+    let document_extent_h = root.border_box.y + root.border_box.h;
+    let document_scroll = ScrollExtent {
+        width: document_extent_w.max(viewport.width() as f32),
+        height: document_extent_h.max(viewport.height() as f32),
+    };
+    let document_offset = scroll_offsets
+        .iter()
+        .find(|(key, _)| key.is_empty())
+        .map(|(_, raw)| *raw)
+        .unwrap_or((0.0, 0.0));
+    let document_offset_clamped = clamp_scroll_offset(
+        document_offset,
+        (document_scroll.width, document_scroll.height),
+        (viewport.width() as f32, viewport.height() as f32),
+    );
 
     let mut list = DisplayList::default();
     emit_display_list(&root, &mut list);
-    Some((root, list))
+    Some(LaidOutDocument {
+        root,
+        display_list: list,
+        document_scroll,
+        // The clamped root offset rides on the output; emission wraps the
+        // frame in it.
+        root_offset: document_offset_clamped,
+    })
 }
 
 /// Emits paint-ready items: backgrounds, borders, text, with
@@ -483,14 +586,19 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
         }
     }
 
-    // Children, scoped by this box's clip when it clips overflow.
+    // Children, scoped by this box's clip when it clips overflow. Scroll
+    // containers clip too (M2c); their `PushTransform` scope is emitted in
+    // the next commit alongside the painter's transform stack.
     match style.overflow_y {
         crate::style::Overflow::Visible => {
             for child in &node.children {
                 emit_box(child, list, parent_clip);
             }
         }
-        crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
+        crate::style::Overflow::Hidden
+        | crate::style::Overflow::Clip
+        | crate::style::Overflow::Auto
+        | crate::style::Overflow::Scroll => {
             list.items.push(DisplayItem::PushClip(node.padding_box));
             for child in &node.children {
                 emit_box(child, list, Some(node.padding_box));
@@ -518,6 +626,10 @@ pub(crate) fn collect_facts(
     facts.viewport_width = viewport.width();
     facts.viewport_height = viewport.height();
     facts.scale = viewport.scale_factor();
+    facts.document_scroll_width =
+        (root.border_box.x + root.border_box.w).max(viewport.width() as f32);
+    facts.document_scroll_height =
+        (root.border_box.y + root.border_box.h).max(viewport.height() as f32);
     facts.nodes.clear();
     walk_facts(dom, root, &mut facts.nodes);
 }
@@ -563,6 +675,8 @@ fn walk_facts(dom: &Dom, node: &BoxNode, out: &mut Vec<LayoutNodeFact>) {
                 node.margin.left,
             ],
             text_runs: node.lines.iter().map(runs_text).collect(),
+            scroll_width: node.scroll.map(|s| s.width),
+            scroll_height: node.scroll.map(|s| s.height),
         });
     }
     // Inline elements flattened into runs: emit a fact with the union of
@@ -615,6 +729,8 @@ fn walk_facts(dom: &Dom, node: &BoxNode, out: &mut Vec<LayoutNodeFact>) {
                 border: [0.0; 4],
                 margin: [0.0; 4],
                 text_runs: vec![texts.join(" ")],
+                scroll_width: None,
+                scroll_height: None,
             });
         }
     }
@@ -658,7 +774,7 @@ mod tests {
     use crate::source::StylesheetSource;
 
     fn facts_for(html: &str, css: &str, width: u32, height: u32) -> LayoutFacts {
-        facts_with_images(html, css, width, height, &ImageStore::new())
+        facts_with(html, css, width, height, &ImageStore::new(), &Vec::new())
     }
 
     fn facts_with_images(
@@ -667,6 +783,17 @@ mod tests {
         width: u32,
         height: u32,
         images: &ImageStore,
+    ) -> LayoutFacts {
+        facts_with(html, css, width, height, images, &Vec::new())
+    }
+
+    fn facts_with(
+        html: &str,
+        css: &str,
+        width: u32,
+        height: u32,
+        images: &ImageStore,
+        scroll_offsets: &ScrollOffsets,
     ) -> LayoutFacts {
         let dom = crate::html::parse(html);
         let ua_sheet = StylesheetSource::new("velqu:ua", "");
@@ -677,15 +804,25 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &author_sheets);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(width, height, 1.0).unwrap();
-        let (root, _) = layout_document(&dom, viewport, &mut cascade, &mut fonts, images).unwrap();
+        let laid = layout_document(
+            &dom,
+            viewport,
+            &mut cascade,
+            &mut fonts,
+            images,
+            scroll_offsets,
+        )
+        .unwrap();
         let mut facts = LayoutFacts {
             schema_version: 0,
             viewport_width: 0,
             viewport_height: 0,
             scale: 0.0,
             nodes: Vec::new(),
+            document_scroll_width: laid.document_scroll.width,
+            document_scroll_height: laid.document_scroll.height,
         };
-        collect_facts(&dom, &root, viewport, &mut facts);
+        collect_facts(&dom, &laid.root, viewport, &mut facts);
         facts
     }
 
@@ -784,8 +921,16 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &[]);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 400, 1.0).unwrap();
-        let (root, list) =
-            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
+        let laid = layout_document(
+            &dom,
+            viewport,
+            &mut cascade,
+            &mut fonts,
+            &ImageStore::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        let (root, list) = (&laid.root, &laid.display_list);
         // The text run's color equals the outer div's color.
         let runs = list.text_runs();
         assert!(!runs.is_empty());
@@ -797,8 +942,10 @@ mod tests {
             viewport_height: 0,
             scale: 0.0,
             nodes: Vec::new(),
+            document_scroll_width: 400.0,
+            document_scroll_height: 400.0,
         };
-        collect_facts(&dom, &root, viewport, &mut facts);
+        collect_facts(&dom, root, viewport, &mut facts);
         assert_eq!(fact(&facts, "inner").text_runs, ["hi"]);
     }
 
@@ -828,8 +975,16 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &[]);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 200, 1.0).unwrap();
-        let (_, list) =
-            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
+        let laid = layout_document(
+            &dom,
+            viewport,
+            &mut cascade,
+            &mut fonts,
+            &ImageStore::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        let list = &laid.display_list;
         let run = &list.text_runs()[0];
         let run_width =
             crate::text::measure_run(&mut fonts, "hi", 16, crate::font::FontWeight::Regular);
@@ -932,16 +1087,26 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &sheets);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 300, 1.0).unwrap();
-        let (root, list) =
-            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
+        let laid = layout_document(
+            &dom,
+            viewport,
+            &mut cascade,
+            &mut fonts,
+            &ImageStore::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        let (root, list) = (&laid.root, &laid.display_list);
         let mut facts = LayoutFacts {
             schema_version: 0,
             viewport_width: 0,
             viewport_height: 0,
             scale: 0.0,
             nodes: Vec::new(),
+            document_scroll_width: 400.0,
+            document_scroll_height: 400.0,
         };
-        collect_facts(&dom, &root, viewport, &mut facts);
+        collect_facts(&dom, root, viewport, &mut facts);
         // Layout truth: the child is fully sized and positioned.
         let big = fact(&facts, "big");
         assert_eq!(big.width, 200.0);
@@ -1021,6 +1186,101 @@ mod tests {
         assert_eq!(pic.height, 30.0);
         assert_eq!(grow.width, 160.0);
         assert_eq!(grow.x, pic.x + pic.width);
+    }
+
+    #[test]
+    fn scroll_container_reports_extents_from_layout_truth() {
+        let facts = facts_for(
+            "<body><div data-vv-test=pane class=pane>\
+             <div data-vv-test=big class=big></div>\
+             </div></body>",
+            "body { margin: 0 } .pane { overflow: auto; width: 100px; height: 40px } \
+             .big { width: 300px; height: 80px }",
+            400,
+            300,
+        );
+        let pane = fact(&facts, "pane");
+        let big = fact(&facts, "big");
+        // Extents come from the unclipped child geometry; the child itself
+        // keeps full layout truth.
+        assert_eq!(pane.scroll_width, Some(300.0));
+        assert_eq!(pane.scroll_height, Some(80.0));
+        assert_eq!((big.width, big.height), (300.0, 80.0));
+        // A non-scroll container reports no scroll fields.
+        assert_eq!(big.scroll_width, None);
+        assert_eq!(big.scroll_height, None);
+        // Content smaller than the scrollport: extent = scrollport.
+        let facts = facts_for(
+            "<body><div data-vv-test=pane class=pane>\
+             <div data-vv-test=small class=small></div>\
+             </div></body>",
+            "body { margin: 0 } .pane { overflow: scroll; width: 100px; height: 40px } \
+             .small { width: 30px; height: 10px }",
+            400,
+            300,
+        );
+        let pane = fact(&facts, "pane");
+        assert_eq!(pane.scroll_width, Some(100.0));
+        assert_eq!(pane.scroll_height, Some(40.0));
+    }
+
+    #[test]
+    fn scroll_offsets_clamp_and_never_move_layout_truth() {
+        let html = "<body><div data-vv-test=pane id=pane class=pane>\
+             <div data-vv-test=big class=big></div>\
+             </div></body>";
+        let css = "body { margin: 0 } .pane { overflow: auto; width: 100px; height: 40px } \
+             .big { width: 300px; height: 80px }";
+        let scrolled = facts_with(
+            html,
+            css,
+            400,
+            300,
+            &ImageStore::new(),
+            &vec![("pane".to_owned(), (500.0, -25.0))],
+        );
+        let big = fact(&scrolled, "big");
+        // Geometry is scroll-state-independent: identical with and without
+        // the offset, over- and under-flowing requests alike.
+        assert_eq!((big.x, big.y), (0.0, 0.0));
+        assert_eq!(big.width, 300.0);
+        let plain = facts_for(html, css, 400, 300);
+        assert_eq!(plain.nodes, scrolled.nodes);
+
+        // The clamped offset is applied to the box tree (extent 300x80,
+        // scrollport 100x40 → max (200, 40); negative clamps to 0).
+        let dom = crate::html::parse(html);
+        let ua_sheet = StylesheetSource::new("velqu:ua", "");
+        let ua_parsed = crate::css::parse(&ua_sheet, 0);
+        let author_sheet = StylesheetSource::new("test.css", css);
+        let author_parsed = crate::css::parse(&author_sheet, 0);
+        let sheets = [author_parsed];
+        let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &sheets);
+        let mut fonts = FontStore::bundled();
+        let viewport = Viewport::try_new(400, 300, 1.0).unwrap();
+        let laid = layout_document(
+            &dom,
+            viewport,
+            &mut cascade,
+            &mut fonts,
+            &ImageStore::new(),
+            &vec![("pane".to_owned(), (500.0, -25.0))],
+        )
+        .unwrap();
+        let pane = &laid.root.children[0];
+        // x 500 clamps to the max (200); y −25 clamps to the min (0).
+        assert_eq!(pane.applied_scroll, (200.0, 0.0));
+        // No offset requested: zero.
+        let plain = layout_document(
+            &dom,
+            viewport,
+            &mut crate::style::Cascade::new(&ua_parsed.rules, &sheets),
+            &mut fonts,
+            &ImageStore::new(),
+            &Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(plain.root.children[0].applied_scroll, (0.0, 0.0));
     }
 
     #[test]

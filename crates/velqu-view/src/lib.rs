@@ -127,6 +127,15 @@ pub enum VelquError {
         /// Frame height that was being allocated.
         height: u32,
     },
+    /// A scroll offset passed to [`VelquView::set_scroll_offset`] was not a
+    /// finite number. Negative values are allowed (clamped centrally);
+    /// NaN/infinite offsets are rejected.
+    InvalidScrollOffset {
+        /// The rejected x value.
+        x: f32,
+        /// The rejected y value.
+        y: f32,
+    },
 }
 
 impl fmt::Display for VelquError {
@@ -144,6 +153,9 @@ impl fmt::Display for VelquError {
             VelquError::InvalidViewport(invalid) => write!(f, "{invalid}"),
             VelquError::FrameAllocationFailed { width, height } => {
                 write!(f, "cannot allocate {width}x{height} frame buffer")
+            }
+            VelquError::InvalidScrollOffset { x, y } => {
+                write!(f, "scroll offset must be finite, got ({x}, {y})")
             }
         }
     }
@@ -255,6 +267,21 @@ pub struct RenderStats {
     pub glyphs: usize,
 }
 
+/// Layout instrumentation (ADR 0008): enough to *see* whether whole-tree
+/// projection or mutation-driven relayouts get expensive in later
+/// milestones, before anyone optimizes anything.
+#[derive(Debug, Clone, Copy)]
+pub struct LayoutStats {
+    /// Layout passes run by this instance (every render and facts call is
+    /// one pass).
+    pub passes: u64,
+    /// Boxes laid out by the most recent pass.
+    pub nodes_last_pass: usize,
+    /// Wall time of the most recent pass. Indicative only — never part of
+    /// pixel output or facts.
+    pub duration_last_pass: std::time::Duration,
+}
+
 /// The result of [`VelquView::render`]: the frame plus paint metadata.
 #[derive(Debug, Clone)]
 pub struct FrameResult {
@@ -292,6 +319,13 @@ pub struct VelquView {
     /// Deterministic image diagnostics from the last prepare pass, in
     /// document order.
     image_diagnostics: Vec<String>,
+    /// Runtime scroll offsets (ADR 0008): target key → raw (unclamped)
+    /// offset. The empty key is the document-level scroller.
+    scroll_offsets: layout::ScrollOffsets,
+    // Layout instrumentation (ADR 0008).
+    layout_passes: u64,
+    layout_nodes_last: usize,
+    layout_duration_last: std::time::Duration,
 }
 
 impl Default for VelquView {
@@ -329,6 +363,10 @@ impl VelquView {
             images: ImageStore::new(),
             image_limits: ImageLimits::default(),
             image_diagnostics: Vec::new(),
+            scroll_offsets: Vec::new(),
+            layout_passes: 0,
+            layout_nodes_last: 0,
+            layout_duration_last: std::time::Duration::ZERO,
         }
     }
 
@@ -563,13 +601,8 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        let Some((_root_box, display_list)) = layout::layout_document(
-            &self.dom,
-            viewport,
-            &mut cascade,
-            &mut self.fonts,
-            &self.images,
-        ) else {
+        let laid_out = self.run_layout(viewport, &mut cascade);
+        let Some(laid) = laid_out else {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
             let background = document_background(&parsed_author);
@@ -592,7 +625,7 @@ impl VelquView {
 
         let background = document_background(&parsed_author);
         let (frame, items, glyphs) =
-            painter::paint_document(&display_list, background, viewport, &mut self.fonts)?;
+            painter::paint_document(&laid.display_list, background, viewport, &mut self.fonts)?;
         Ok(FrameResult {
             frame,
             stats: RenderStats {
@@ -602,6 +635,31 @@ impl VelquView {
                 glyphs,
             },
         })
+    }
+
+    /// Shared cascade+layout pass behind [`VelquView::render`] and
+    /// [`VelquView::layout_facts`]; records layout instrumentation.
+    fn run_layout(
+        &mut self,
+        viewport: Viewport,
+        cascade: &mut style::Cascade<'_>,
+    ) -> Option<layout::LaidOutDocument> {
+        let started = std::time::Instant::now();
+        let laid = layout::layout_document(
+            &self.dom,
+            viewport,
+            cascade,
+            &mut self.fonts,
+            &self.images,
+            &self.scroll_offsets,
+        );
+        self.layout_passes += 1;
+        self.layout_duration_last = started.elapsed();
+        self.layout_nodes_last = laid
+            .as_ref()
+            .map(|laid| layout::count_box_tree(&laid.root))
+            .unwrap_or(0);
+        laid
     }
 
     /// Lays the current document out and returns fixture-facing facts.
@@ -623,16 +681,15 @@ impl VelquView {
             parsed_author.push(parsed);
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        let mut fonts = font::FontStore::bundled();
-        let Some((root, _)) =
-            layout::layout_document(&self.dom, viewport, &mut cascade, &mut fonts, &self.images)
-        else {
+        let Some(laid) = self.run_layout(viewport, &mut cascade) else {
             return Ok(LayoutFacts {
                 schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
                 viewport_width: viewport.width(),
                 viewport_height: viewport.height(),
                 scale: viewport.scale_factor(),
                 nodes: Vec::new(),
+                document_scroll_width: viewport.width() as f32,
+                document_scroll_height: viewport.height() as f32,
             });
         };
         let mut facts = LayoutFacts {
@@ -641,9 +698,57 @@ impl VelquView {
             viewport_height: viewport.height(),
             scale: viewport.scale_factor(),
             nodes: Vec::new(),
+            document_scroll_width: laid.document_scroll.width,
+            document_scroll_height: laid.document_scroll.height,
         };
-        layout::collect_facts(&self.dom, &root, viewport, &mut facts);
+        layout::collect_facts(&self.dom, &laid.root, viewport, &mut facts);
         Ok(facts)
+    }
+
+    /// Sets the scroll offset of a scroll container (ADR 0008).
+    ///
+    /// `None` targets the document-level scroller (the viewport);
+    /// `Some(id)` targets the element with HTML `id="id"` that is a scroll
+    /// container (`overflow: auto`/`scroll`). Offsets are **clamped
+    /// centrally** at apply time to `0..=extent - scrollport`, so over- and
+    /// under-flowing requests are safe. Scroll position is runtime
+    /// presentation state: layout facts report unscrolled geometry, and
+    /// scrolling never triggers a new layout pass.
+    ///
+    /// Unknown targets are accepted and simply never apply — matching the
+    /// clamping philosophy that offsets are requests, not commands.
+    pub fn set_scroll_offset(
+        &mut self,
+        target: Option<&str>,
+        x: f32,
+        y: f32,
+    ) -> Result<(), VelquError> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(VelquError::InvalidScrollOffset { x, y });
+        }
+        let key = target.unwrap_or("").to_owned();
+        let entry = (key, (x.max(0.0), y.max(0.0)));
+        match self
+            .scroll_offsets
+            .iter_mut()
+            .find(|(existing, _)| *existing == entry.0)
+        {
+            Some(slot) => slot.1 = entry.1,
+            None => self.scroll_offsets.push(entry),
+        }
+        Ok(())
+    }
+
+    /// Layout instrumentation (ADR 0008): how many layout passes this
+    /// instance has run, how many boxes the last pass laid out, and how
+    /// long the last pass took. Passes and node counts are deterministic;
+    /// the duration is indicative only and never enters pixel output.
+    pub fn layout_stats(&self) -> LayoutStats {
+        LayoutStats {
+            passes: self.layout_passes,
+            nodes_last_pass: self.layout_nodes_last,
+            duration_last_pass: self.layout_duration_last,
+        }
     }
 }
 
@@ -1081,5 +1186,54 @@ mod tests {
             view.image_diagnostics(),
             ["image \"pic.png\": image data is corrupt or truncated"]
         );
+    }
+
+    #[test]
+    fn scroll_offset_is_runtime_state_without_new_layout() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div style=\"height: 300px; background-color: #ef4444\"></div>\
+             <div style=\"height: 300px; background-color: #3b82f6\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        let facts_before = view.layout_facts(vp).unwrap();
+        let passes_after_layout = view.layout_stats().passes;
+        assert_eq!(facts_before.document_scroll_height, 600.0);
+
+        // Scrolling is a state change only: no layout pass runs, and the
+        // facts (unscrolled layout truth) are identical afterwards.
+        view.set_scroll_offset(None, 0.0, 350.0).unwrap();
+        assert_eq!(view.layout_stats().passes, passes_after_layout);
+        let facts_after = view.layout_facts(vp).unwrap();
+        assert_eq!(facts_before, facts_after);
+
+        // Clamping is central: over-scroll requests are accepted and clamped
+        // at apply time; non-finite offsets are rejected outright.
+        view.set_scroll_offset(None, 0.0, 100_000.0).unwrap();
+        view.set_scroll_offset(Some("missing-pane"), 10.0, 10.0)
+            .unwrap();
+        assert!(matches!(
+            view.set_scroll_offset(None, f32::NAN, 0.0),
+            Err(VelquError::InvalidScrollOffset { .. })
+        ));
+    }
+
+    #[test]
+    fn layout_stats_count_passes_and_boxes() {
+        let mut view = tiny_view();
+        assert_eq!(view.layout_stats().passes, 0);
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.layout_facts(vp).unwrap();
+        let after_one = view.layout_stats();
+        assert_eq!(after_one.passes, 1);
+        assert!(after_one.nodes_last_pass > 0, "boxes were laid out");
+        view.render(vp).unwrap();
+        assert_eq!(view.layout_stats().passes, 2);
+        // Durations are indicative only; just sanity-check they're recorded
+        // (any Duration, including zero on fast machines, is valid).
+        let _ = after_one.duration_last_pass;
     }
 }

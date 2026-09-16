@@ -129,6 +129,11 @@ struct FactExpect {
     margin: Option<[f32; 4]>,
     #[serde(default)]
     text_runs: Option<Vec<String>>,
+    /// Scroll-container extents (M2c); omitted for non-scroll boxes.
+    #[serde(default)]
+    scroll_width: Option<f32>,
+    #[serde(default)]
+    scroll_height: Option<f32>,
 }
 
 fn workspace_root() -> &'static Path {
@@ -238,6 +243,8 @@ fn run_fixture(dir: &Path) {
             border,
             margin,
             text_runs,
+            scroll_width,
+            scroll_height,
         } = expected;
         assert_eq!(Some(&actual.tag), tag.as_ref(), "{id}: tag");
         assert_eq!(Some(&actual.display), display.as_ref(), "{id}: display");
@@ -260,6 +267,12 @@ fn run_fixture(dir: &Path) {
         }
         if let Some(expected) = text_runs {
             assert_eq!(&actual.text_runs, expected, "{id}: text_runs");
+        }
+        if let Some(expected) = scroll_width {
+            assert_eq!(actual.scroll_width, Some(*expected), "{id}: scroll_width");
+        }
+        if let Some(expected) = scroll_height {
+            assert_eq!(actual.scroll_height, Some(*expected), "{id}: scroll_height");
         }
     }
 

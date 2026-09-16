@@ -56,7 +56,7 @@ pub(crate) fn paint_document(
         rgba: &mut rgba,
         glyphs: 0,
         items: 0,
-        clip: None,
+        clip: Vec::new(),
     };
 
     for item in &list.items {
@@ -110,28 +110,29 @@ struct PaintCtx<'a> {
     rgba: &'a mut [u8],
     glyphs: usize,
     items: usize,
-    /// Innermost active clip, or `None` (whole surface).
-    clip: Option<Rect>,
+    /// Clip stack: the innermost (last) entry bounds every pixel. Balanced
+    /// push/pop emission keeps restore semantics correct for nested scopes.
+    clip: Vec<Rect>,
 }
 
 impl PaintCtx<'_> {
-    /// Intersects the pushed rect with the running clip.
+    /// Intersects the pushed rect with the running clip and scopes it.
     fn push_clip(&mut self, rect: Rect) {
-        let clipped = match self.clip {
+        let clipped = match self.clip.last() {
             None => rect,
-            Some(outer) => intersect(outer, rect),
+            Some(outer) => intersect(*outer, rect),
         };
-        self.clip = Some(clipped);
+        self.clip.push(clipped);
     }
 
-    /// Ends the innermost clip scope. M2b emission is balanced; a stray
-    /// PopClip is a harmless no-op.
+    /// Ends the innermost clip scope, restoring the enclosing one. M2c
+    /// emission is balanced; a stray PopClip is a harmless no-op.
     fn pop_clip(&mut self) {
-        self.clip = None;
+        self.clip.pop();
     }
 
     fn clip_contains(&self, x: i64, y: i64) -> bool {
-        match self.clip {
+        match self.clip.last() {
             None => true,
             Some(clip) => {
                 let cx = clip.x as i64;
