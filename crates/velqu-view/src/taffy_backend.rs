@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use taffy::geometry::{Point as TaffyPoint, Rect as TaffyRect};
 use taffy::style::{
-    BoxSizing, CheapCloneStr, Dimension as TaffyDimension, GridAutoFlow as TaffyGridFlow,
+    CheapCloneStr, Dimension as TaffyDimension, GridAutoFlow as TaffyGridFlow,
     GridPlacement as TaffyPlacement, GridTemplateComponent, GridTemplateRepetition,
     LengthPercentage, LengthPercentageAuto, MaxTrackSizingFunction, MinTrackSizingFunction,
     RepetitionCount, TrackSizingFunction,
@@ -36,8 +36,8 @@ use crate::display_list::Rect;
 use crate::font::FontStore;
 use crate::layout::{BoxNode, LaidLine, RunBox, TextOrigin};
 use crate::style::{
-    AlignItems, AlignSelf, ComputedStyle, Display, GridAutoFlow, GridLine, GridTrack, GridTrackMax,
-    GridTrackMin, JustifyContent, Length, LineHeight, Overflow, Sides, TextAlign,
+    AlignItems, AlignSelf, BoxSizing, ComputedStyle, Display, GridAutoFlow, GridLine, GridTrack,
+    GridTrackMax, GridTrackMin, JustifyContent, Length, LineHeight, Overflow, Sides, TextAlign,
 };
 use crate::viewport::Viewport;
 
@@ -275,7 +275,12 @@ fn map_style(
 
     TaffyStyle {
         display,
-        box_sizing: BoxSizing::ContentBox,
+        box_sizing: match style.box_sizing {
+            BoxSizing::ContentBox => taffy::style::BoxSizing::ContentBox,
+            // M3: the Tailwind preflight sets border-box document-wide via
+            // its generated `*` rule.
+            BoxSizing::BorderBox => taffy::style::BoxSizing::BorderBox,
+        },
         item_is_replaced: is_replaced,
         overflow: TaffyPoint {
             x: map_overflow(style.overflow_x),

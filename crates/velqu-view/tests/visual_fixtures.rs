@@ -37,6 +37,10 @@ struct Fixture {
     /// facts stay unscrolled, only the raster moves.
     #[serde(default)]
     scroll: BTreeMap<String, [f32; 2]>,
+    /// Compile Tailwind utility classes into a generated stylesheet
+    /// (ADR 0009). The document then needs no CSS files at all.
+    #[serde(default)]
+    tailwind: bool,
 }
 
 #[derive(Deserialize)]
@@ -161,6 +165,9 @@ fn load_fixture(dir: &Path) -> Fixture {
 
 fn build_view(fixture: &Fixture) -> VelquView {
     let mut view = VelquView::new();
+    if fixture.tailwind {
+        view.enable_tailwind();
+    }
     let html_path = workspace_root().join(&fixture.html);
     let html = std::fs::read_to_string(&html_path)
         .unwrap_or_else(|e| panic!("{}: {e}", html_path.display()));

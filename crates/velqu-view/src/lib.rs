@@ -22,16 +22,17 @@
 //! offending source. Relative asset references resolve through a
 //! host-installed [`AssetResolver`] — the core performs no I/O of its own
 //! (ADR 0004). `load_html`/`load_css` remain as auto-id conveniences.
-//!
 //! # Milestone status
 //!
-//! * **M1–M2b (done):** document/stylesheet sources with identity, cascade,
-//!   box tree, Taffy-backed block/flex layout, deterministic text, display
-//!   list, and pixel-hash fixtures (`docs/decisions/0005`–`0007`).
-//! * **M2c (current):** bounded image decoding + `<img>` as a replaced
-//!   element, the frozen grid profile, and paint-side scrolling
-//!   ([ADR 0008](docs/decisions/0008-m2c-images-grid-scroll.md)). The API
-//!   shape below keeps absorbing each milestone without breaking change.
+//! * **M1–M2c (done):** document/stylesheet sources with identity, cascade,
+//!   box tree, Taffy-backed block/flex/grid layout, deterministic text and
+//!   images, display list, paint-side scrolling, and pixel-hash fixtures
+//!   (`docs/decisions/0005`–`0008`).
+//! * **M3 (current, phase 1 complete):** the Tailwind-compatible utility
+//!   pipeline ([ADR 0009](docs/decisions/0009-m3-tailwind-pipeline.md)) —
+//!   `enable_tailwind()` compiles the document's utility classes into a
+//!   generated stylesheet, so plain HTML with Tailwind classes renders with
+//!   no CSS files, no node, and no network.
 //!
 //! # Example
 //!
@@ -327,6 +328,12 @@ pub struct VelquView {
     layout_passes: u64,
     layout_nodes_last: usize,
     layout_duration_last: std::time::Duration,
+    /// Tailwind utility pipeline (ADR 0009): when enabled, the `class`
+    /// attributes of the loaded document are compiled into a generated
+    /// stylesheet appended after the author sheets in cascade order.
+    tailwind_enabled: bool,
+    tailwind_css: Option<String>,
+    tailwind_diagnostics_list: Vec<String>,
 }
 
 impl Default for VelquView {
@@ -368,6 +375,9 @@ impl VelquView {
             layout_passes: 0,
             layout_nodes_last: 0,
             layout_duration_last: std::time::Duration::ZERO,
+            tailwind_enabled: false,
+            tailwind_css: None,
+            tailwind_diagnostics_list: Vec::new(),
         }
     }
 
@@ -405,6 +415,69 @@ impl VelquView {
     /// the only place its failure is reported.
     pub fn image_diagnostics(&self) -> Vec<String> {
         self.image_diagnostics.clone()
+    }
+
+    /// Enables the Tailwind utility pipeline (ADR 0009): the document's
+    /// `class` attributes are compiled by [`velqu_tailwind`] into a
+    /// generated stylesheet that participates in the cascade after every
+    /// author sheet (utilities beat element styles; inline styles and later
+    /// sheets still win as CSS specifies). Unsupported classes are reported
+    /// through [`VelquView::tailwind_diagnostics`] — never dropped
+    /// silently.
+    pub fn enable_tailwind(&mut self) {
+        self.tailwind_enabled = true;
+        self.rebuild_tailwind();
+    }
+
+    /// Whether the Tailwind utility pipeline is enabled.
+    pub fn tailwind_enabled(&self) -> bool {
+        self.tailwind_enabled
+    }
+
+    /// Deterministic diagnostics for utility classes the pipeline could not
+    /// compile, in first-use order (ADR 0009).
+    pub fn tailwind_diagnostics(&self) -> Vec<String> {
+        self.tailwind_diagnostics_list.clone()
+    }
+
+    /// Re-compiles the utility classes of the loaded document. Runs on
+    /// [`VelquView::enable_tailwind`] and on every document load while
+    /// enabled; output is a deterministic function of the class list.
+    fn rebuild_tailwind(&mut self) {
+        self.tailwind_css = None;
+        self.tailwind_diagnostics_list.clear();
+        if !self.tailwind_enabled {
+            return;
+        }
+        let mut classes: Vec<String> = Vec::new();
+        self.dom.walk(|_id, node| {
+            if let dom::NodeData::Element { attrs, .. } = &node.data {
+                if let Some(class_attr) = attrs
+                    .iter()
+                    .find(|a| a.name == "class")
+                    .map(|a| a.value.clone())
+                {
+                    for class in class_attr.split_ascii_whitespace() {
+                        if !classes.iter().any(|existing| existing == class) {
+                            classes.push(class.to_owned());
+                        }
+                    }
+                }
+            }
+        });
+        if classes.is_empty() {
+            return;
+        }
+        let refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let build = velqu_tailwind::compile_utilities(&refs);
+        self.tailwind_diagnostics_list = build
+            .diagnostics
+            .iter()
+            .map(|d| format!("class {:?}: {}", d.class, d.message))
+            .collect();
+        if build.rules > 0 {
+            self.tailwind_css = Some(build.css);
+        }
     }
 
     /// Resolves and decodes every `<img src>` reference once per document:
@@ -488,6 +561,8 @@ impl VelquView {
         // Image identity is per-document, like the DOM: a new document
         // invalidates every decoded asset.
         self.images.clear();
+        // Utility classes are per-document too: recompile when enabled.
+        self.rebuild_tailwind();
         Ok(())
     }
 
@@ -594,11 +669,17 @@ impl VelquView {
         let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
-        let mut parsed_author = Vec::with_capacity(self.parsed_css.len());
+        let mut parsed_author = Vec::with_capacity(self.parsed_css.len() + 1);
         for sheet in &self.stylesheets {
             let parsed = css::parse(sheet, order);
             order += parsed.rules.len() as u32;
             parsed_author.push(parsed);
+        }
+        // The generated utility sheet participates last: utilities outrank
+        // element rules, lose to inline styles (ADR 0009).
+        if let Some(text) = &self.tailwind_css {
+            let source = StylesheetSource::new("velqu:tailwind", text.clone());
+            parsed_author.push(css::parse(&source, order));
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
@@ -675,11 +756,15 @@ impl VelquView {
         let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
-        let mut parsed_author = Vec::with_capacity(self.parsed_css.len());
+        let mut parsed_author = Vec::with_capacity(self.parsed_css.len() + 1);
         for sheet in &self.stylesheets {
             let parsed = css::parse(sheet, order);
             order += parsed.rules.len() as u32;
             parsed_author.push(parsed);
+        }
+        if let Some(text) = &self.tailwind_css {
+            let source = StylesheetSource::new("velqu:tailwind", text.clone());
+            parsed_author.push(css::parse(&source, order));
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
         let Some(laid) = self.run_layout(viewport, &mut cascade) else {
@@ -1187,6 +1272,73 @@ mod tests {
             view.image_diagnostics(),
             ["image \"pic.png\": image data is corrupt or truncated"]
         );
+    }
+
+    // -- M3 Tailwind utility pipeline (ADR 0009) --------------------------
+
+    #[test]
+    fn tailwind_utilities_reach_layout_and_paint() {
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=card class=\"bg-rose-600 w-64 h-20 p-4\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(320, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        let card = fact_of(&facts, "card");
+        // w-64 = 16rem = 256px; h-20 = 80px; classes compose.
+        assert_eq!((card.width, card.height), (256.0, 80.0));
+        assert!(view.tailwind_diagnostics().is_empty());
+        let result = view.render(vp).unwrap();
+        let rose = Color::from_hex("#e11d48").unwrap();
+        assert_eq!(result.frame.pixel(10, 10), Some(rose), "bg-rose-600 paints");
+    }
+
+    #[test]
+    fn tailwind_utilities_lose_to_inline_but_beat_element_rules() {
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <style>div { width: 100px }</style>\
+             <div data-vv-test=a class=\"w-32 h-8\"></div>\
+             <div data-vv-test=b class=\"w-32 h-8\" style=\"width: 40px\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(320, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        // The utility (class specificity) beats the element rule…
+        assert_eq!(fact_of(&facts, "a").width, 128.0);
+        // …and an inline style beats the utility, as CSS specifies.
+        assert_eq!(fact_of(&facts, "b").width, 40.0);
+    }
+
+    #[test]
+    fn tailwind_is_opt_in_and_reports_unsupported_classes() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=a class=\"w-64 h-8 shadow-md hover:flex\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(400, 200, 1.0).unwrap();
+        // Without opt-in, utilities do nothing and produce no diagnostics.
+        let facts = view.layout_facts(vp).unwrap();
+        assert_eq!(fact_of(&facts, "a").width, 400.0, "block fills the body");
+        assert!(view.tailwind_diagnostics().is_empty());
+
+        view.enable_tailwind();
+        let facts = view.layout_facts(vp).unwrap();
+        assert_eq!(fact_of(&facts, "a").width, 256.0, "w-64 now applies");
+        let diagnostics = view.tailwind_diagnostics();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics[0].starts_with("class \"shadow-md\":"));
+        assert!(diagnostics[1].starts_with("class \"hover:flex\":"));
     }
 
     #[test]

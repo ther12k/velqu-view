@@ -50,3 +50,5 @@ color = "#EF4444"
   `scroll_width`/`scroll_height`, and a `[scroll]` table of programmatic
   offsets (empty key = document scroller, otherwise an element `id`);
   facts stay unscrolled — only the raster moves.
+- M3 adds `tailwind = true`: utility classes compile into a generated
+  stylesheet, so a fixture needs no `css` files at all (ADR 0009).

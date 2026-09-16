@@ -205,6 +205,16 @@ pub(crate) enum GridAutoFlow {
     Column,
 }
 
+/// Which box `width`/`height` size (M3): content box (the CSS default and
+/// the M2a–M2c renderer behavior) or border box (Tailwind's preflight
+/// default, used by the utility pipeline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+}
+
 /// Text alignment in the M2a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextAlign {
@@ -323,6 +333,9 @@ pub(crate) struct ComputedStyle {
     /// value space as `align_items` (start/center/end/stretch).
     pub justify_items: AlignItems,
     pub justify_self: AlignSelf,
+    /// M3: which box `width`/`height` size (Tailwind preflight sets
+    /// border-box document-wide via the generated utility sheet).
+    pub box_sizing: BoxSizing,
 }
 
 impl ComputedStyle {
@@ -368,6 +381,7 @@ impl ComputedStyle {
             grid_auto_flow: GridAutoFlow::Row,
             justify_items: AlignItems::Stretch,
             justify_self: AlignSelf::Auto,
+            box_sizing: BoxSizing::ContentBox,
         }
     }
 }
@@ -1102,6 +1116,11 @@ fn apply_declaration(
                 ));
             }
             _ => diagnostics.push(unsupported("justify-self value")),
+        },
+        "box-sizing" => match declaration.value.as_str() {
+            "content-box" => style.box_sizing = BoxSizing::ContentBox,
+            "border-box" => style.box_sizing = BoxSizing::BorderBox,
+            _ => diagnostics.push(unsupported("box-sizing value")),
         },
         _ => diagnostics.push(skip(format!(
             "property {:?} is outside the M2b profile",

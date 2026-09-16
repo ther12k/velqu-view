@@ -1,0 +1,56 @@
+name = "tailwind utilities-only document: no CSS files, pipeline compiles everything"
+
+# No `css` table at all: every style comes from utility classes compiled by
+# the v0 pipeline (ADR 0009). Pins border-box sizing (w-64 = 256 border box
+# including p-4), palette colors, typography, borders, and radius.
+
+html = "tests/visual/tailwind-hello/index.html"
+
+tailwind = true
+
+[viewport]
+width = 360
+height = 200
+scale = 1.0
+
+[expect]
+pixels_sha256 = "e19aaf727184fe5888ede6ba23b22a4336590b1555ff3341cb833cccf319a5d7"
+
+[[expect.facts]]
+id = "card"
+tag = "div"
+display = "block"
+x = 16.0
+y = 16.0
+width = 256.0
+
+[[expect.facts]]
+id = "title"
+tag = "h1"
+display = "block"
+text_runs = ["Hello Tailwind"]
+
+[[expect.facts]]
+id = "sub"
+tag = "p"
+display = "block"
+text_runs = ["Rendered by the v0 utility", "pipeline."]
+
+# Page background behind and around the card.
+[[expect.pixel]]
+pos = [340, 10]
+color = "#f1f5f9"
+
+# The card's 1px border is Tailwind's default gray-200.
+[[expect.pixel]]
+pos = [16, 16]
+color = "#e5e7eb"
+
+# Card interior: white.
+[[expect.pixel]]
+pos = [100, 60]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [200, 150]
+color = "#FFFFFF"

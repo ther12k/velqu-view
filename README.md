@@ -32,8 +32,8 @@ native lightweight application UI
 | M2a | HTML parsing, cascade, block layout, text, display list, layout facts | **done** |
 | M2b | Taffy whole-tree backend, flex profile, display-list clipping, overflow | **done** |
 | M2c | bounded image decoding, replaced elements, grid profile, paint-side scrolling ([ADR 0008](docs/decisions/0008-m2c-images-grid-scroll.md)) | **done** |
-| M3 | Tailwind pipeline + compatibility profile fixtures | next |
-| M4 | input gate (pointer/keyboard/focus/text/selection/IME) | |
+| M3 | Tailwind-compatible utility pipeline, diagnostics, dashboard demo ([ADR 0009](docs/decisions/0009-m3-tailwind-pipeline.md)) — **phase 1 complete: renders HTML with Tailwind** | **done** |
+| M4 | input gate (pointer/keyboard/focus/text/selection/IME) | next |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) | |
 | M6 | VelquView Lab inspector + reload | |
 | M7 | reference Tailwind dashboard | |

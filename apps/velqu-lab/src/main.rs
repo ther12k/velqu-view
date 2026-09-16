@@ -27,6 +27,7 @@ struct Args {
     out: Option<PathBuf>,
     frames: u32,
     exit_after: Option<Duration>,
+    tailwind: bool,
 }
 
 const USAGE: &str = "\
@@ -40,6 +41,7 @@ ARGS:
 
 OPTIONS:
     --headless         Render offscreen; no window (fixtures, CI)
+    --tailwind         Compile Tailwind utility classes into CSS (ADR 0009)
     --size WxH         Logical viewport size (default 1024x640)
     --scale F          DPI scale factor (default 1.0)
     --frames N         Headless: render N frames and verify determinism (default 1)
@@ -57,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
         out: None,
         frames: 1,
         exit_after: None,
+        tailwind: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut argv = std::env::args().skip(1);
@@ -68,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--headless" => args.headless = true,
             "--window" => args.headless = false,
+            "--tailwind" => args.tailwind = true,
             "--size" => {
                 let value = argv.next().ok_or("--size requires WxH")?;
                 args.size = parse_size(&value)?;
@@ -229,6 +233,16 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
     for message in view.image_diagnostics() {
         println!("image diagnostic: {message}");
     }
+    if view.tailwind_enabled() {
+        let diagnostics = view.tailwind_diagnostics();
+        if diagnostics.is_empty() {
+            println!("tailwind: all utility classes compiled");
+        } else {
+            for message in diagnostics {
+                println!("tailwind diagnostic: {message}");
+            }
+        }
+    }
     println!("sha256: {}", hashes[0]);
     if args.frames > 1 {
         println!("determinism: {identical}/{} frames identical", args.frames);
@@ -284,6 +298,9 @@ fn main() -> ExitCode {
     };
 
     let mut view = VelquView::new();
+    if args.tailwind {
+        view.enable_tailwind();
+    }
     if let Err(message) = load_app(&mut view, &args.app_dir) {
         eprintln!("velqu-lab: {message}");
         return ExitCode::from(2);
