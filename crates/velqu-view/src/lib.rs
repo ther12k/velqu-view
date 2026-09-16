@@ -57,7 +57,9 @@
 //! ```
 
 mod color;
+mod dom;
 mod font;
+mod html;
 mod painter;
 mod probe;
 mod scene;
@@ -265,6 +267,8 @@ pub struct FrameResult {
 /// crate) is what puts frames into a native window.
 pub struct VelquView {
     document: Option<DocumentSource>,
+    /// Parsed DOM of the loaded document (rebuilt on every load).
+    dom: dom::Dom,
     stylesheets: Vec<StylesheetSource>,
     next_auto_sheet: u32,
     frame_index: u64,
@@ -297,6 +301,7 @@ impl VelquView {
     pub fn new() -> Self {
         Self {
             document: None,
+            dom: dom::Dom::empty(),
             stylesheets: Vec::new(),
             next_auto_sheet: 0,
             frame_index: 0,
@@ -341,6 +346,7 @@ impl VelquView {
                 kind: SourceKind::Html,
             });
         }
+        self.dom = html::parse(&source.html);
         self.document = Some(source);
         Ok(())
     }

@@ -31,6 +31,7 @@ velqu-shell = { path = "crates/velqu-shell" }
 # rasterize differently on other architectures, breaking fixture hashes).
 fontdue = { version = "0.9", default-features = false, features = ["std"] }
 png = "0.17"
+html5ever = "0.40"
 winit = "0.30"
 softbuffer = "0.4"
 
