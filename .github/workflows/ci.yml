@@ -5,21 +5,32 @@ on:
     branches: [main]
   pull_request:
 
+# CI never needs write access: it builds and tests only.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# Actions are pinned to full-length commit SHAs (immutable references) with
+# the version tag recorded in a comment for humans.
 jobs:
   check:
     name: fmt, clippy, test, build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      # dtolnay/rust-toolchain (stable channel)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Install windowing system dependencies
         run: |
@@ -48,13 +59,18 @@ jobs:
       matrix:
         rust: ["1.87"] # workspace rust-version; keep in sync with Cargo.toml
     steps:
-      - uses: actions/checkout@v7
+      # actions/checkout v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@master
+      # dtolnay/rust-toolchain (pinned version)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: ${{ matrix.rust }}
 
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       # `cargo check` compiles all targets without linking, so the X11/Wayland
       # dev packages are not needed on this lane.
