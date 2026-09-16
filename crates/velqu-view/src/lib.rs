@@ -85,6 +85,7 @@ pub use source::{
 };
 pub use viewport::{InvalidViewport, InvalidViewportReason, MAX_PIXELS, Viewport};
 
+use crate::image::ImageStore;
 use font::FontStore;
 
 /// Which document source an error refers to.
@@ -284,6 +285,13 @@ pub struct VelquView {
     fonts: FontStore,
     assets: SharedAssetResolver,
     custom_assets: bool,
+    /// Decoded `<img>` assets for the current document (ADR 0008), keyed by
+    /// the `src` reference as written. Cleared when the document changes.
+    images: ImageStore,
+    image_limits: ImageLimits,
+    /// Deterministic image diagnostics from the last prepare pass, in
+    /// document order.
+    image_diagnostics: Vec<String>,
 }
 
 impl Default for VelquView {
@@ -318,6 +326,9 @@ impl VelquView {
             fonts: FontStore::bundled(),
             assets: Rc::new(NullAssetResolver),
             custom_assets: false,
+            images: ImageStore::new(),
+            image_limits: ImageLimits::default(),
+            image_diagnostics: Vec::new(),
         }
     }
 
@@ -334,11 +345,88 @@ impl VelquView {
     /// Resolves one relative asset reference through the installed resolver,
     /// using the loaded document's base.
     ///
-    /// This is the seam M2 image loading will call; exposed now so the
+    /// This is the seam `<img src>` loading uses internally; exposed so the
     /// host-boundary contract is testable without a renderer.
     pub fn resolve_asset(&self, path: &str) -> Option<Asset> {
         let base = self.document.as_ref().and_then(|doc| doc.base.as_deref());
         self.assets.resolve(AssetRequest { base, path })
+    }
+
+    /// Replaces the image decode limits (ADR 0008). The decoded-image cache
+    /// is cleared: limits are decode decisions, and a cached success/failure
+    /// under old limits must not survive them.
+    pub fn set_image_limits(&mut self, limits: ImageLimits) {
+        self.image_limits = limits;
+        self.images.clear();
+    }
+
+    /// Deterministic diagnostics about `<img>` assets from the last render
+    /// or layout pass, in document order (ADR 0008). A broken or missing
+    /// image still lays out — at the default object size — so this list is
+    /// the only place its failure is reported.
+    pub fn image_diagnostics(&self) -> Vec<String> {
+        self.image_diagnostics.clone()
+    }
+
+    /// Resolves and decodes every `<img src>` reference once per document:
+    /// requests flow out through the installed resolver with the document's
+    /// base, decode is bounded by the image limits, and outcomes (success
+    /// and failure) are cached per `src` so later frames never re-decode.
+    fn prepare_images(&mut self) {
+        self.image_diagnostics.clear();
+        let mut srcs: Vec<String> = Vec::new();
+        self.dom.walk(|_id, node| {
+            if let dom::NodeData::Element { name, attrs, .. } = &node.data {
+                if name == "img" {
+                    if let Some(src) = attrs
+                        .iter()
+                        .find(|a| a.name == "src")
+                        .map(|a| a.value.clone())
+                    {
+                        if !srcs.contains(&src) {
+                            srcs.push(src);
+                        }
+                    }
+                }
+            }
+        });
+        let base = self.document.as_ref().and_then(|doc| doc.base.clone());
+        for src in &srcs {
+            // Cached outcomes are re-reported (failures) or skipped
+            // (successes) so diagnostics stay deterministic per frame.
+            let cached_failure = match self.images.get(src) {
+                Some(crate::image::ImageEntry::Failed(failure)) => Some(failure.clone()),
+                _ => None,
+            };
+            if let Some(failure) = cached_failure {
+                let message = failure.message();
+                self.image_diagnostics
+                    .push(format!("image {src:?}: {message}"));
+                continue;
+            }
+            if self.images.get(src).is_some() {
+                continue; // cached success from an earlier frame
+            }
+            let request = AssetRequest {
+                base: base.as_deref(),
+                path: src,
+            };
+            match self.assets.resolve(request) {
+                None => {
+                    self.images.mark_missing(src);
+                    let message = crate::image::ImageFailure::Missing.message();
+                    self.image_diagnostics
+                        .push(format!("image {src:?}: {message}"));
+                }
+                Some(asset) => {
+                    if let Some(failure) = self.images.load(src, &asset.bytes, &self.image_limits) {
+                        let message = failure.message();
+                        self.image_diagnostics
+                            .push(format!("image {src:?}: {message}"));
+                    }
+                }
+            }
+        }
     }
 
     /// Loads (replaces) the HTML document source.
@@ -358,6 +446,9 @@ impl VelquView {
         }
         self.dom = html::parse(&source.html);
         self.document = Some(source);
+        // Image identity is per-document, like the DOM: a new document
+        // invalidates every decoded asset.
+        self.images.clear();
         Ok(())
     }
 
@@ -457,6 +548,7 @@ impl VelquView {
             return Err(VelquError::DocumentNotLoaded);
         }
         self.frame_index += 1;
+        self.prepare_images();
 
         // UA defaults (M2a baseline: body margin, heading sizes, hidden
         // head elements) then author sheets, in order.
@@ -471,9 +563,13 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        let Some((_root_box, display_list)) =
-            layout::layout_document(&self.dom, viewport, &mut cascade, &mut self.fonts)
-        else {
+        let Some((_root_box, display_list)) = layout::layout_document(
+            &self.dom,
+            viewport,
+            &mut cascade,
+            &mut self.fonts,
+            &self.images,
+        ) else {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
             let background = document_background(&parsed_author);
@@ -516,6 +612,7 @@ impl VelquView {
         if self.document.is_none() {
             return Err(VelquError::DocumentNotLoaded);
         }
+        self.prepare_images();
         let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
@@ -528,7 +625,7 @@ impl VelquView {
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
         let mut fonts = font::FontStore::bundled();
         let Some((root, _)) =
-            layout::layout_document(&self.dom, viewport, &mut cascade, &mut fonts)
+            layout::layout_document(&self.dom, viewport, &mut cascade, &mut fonts, &self.images)
         else {
             return Ok(LayoutFacts {
                 schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
@@ -832,5 +929,157 @@ mod tests {
             seen: RefCell::new(Vec::new()),
         }));
         assert!(format!("{:?}", view).contains("custom_asset_resolver: true"));
+    }
+
+    // -- M2c images (ADR 0008) -------------------------------------------
+
+    /// Serves a deterministic 40×20 red PNG to every request, recording it.
+    struct ImageRecordingResolver {
+        seen: RefCell<Vec<(Option<String>, String)>>,
+        bytes: Vec<u8>,
+    }
+
+    impl AssetResolver for ImageRecordingResolver {
+        fn resolve(&self, request: AssetRequest<'_>) -> Option<Asset> {
+            self.seen
+                .borrow_mut()
+                .push((request.base.map(str::to_owned), request.path.to_owned()));
+            Some(Asset {
+                id: SourceId::new(request.path),
+                bytes: self.bytes.clone(),
+            })
+        }
+    }
+
+    fn red_png() -> Vec<u8> {
+        crate::image::test_png(40, 20, [0xef, 0x44, 0x44, 0xff])
+    }
+
+    fn img_view(resolver: ImageRecordingResolver) -> VelquView {
+        let mut view = VelquView::new();
+        view.load_document(
+            DocumentSource::new(
+                "apps/demo/index.html",
+                "<html><body><img data-vv-test=logo src=img/logo.png></body></html>",
+            )
+            .with_base("apps/demo"),
+        )
+        .unwrap();
+        view.set_asset_resolver(Rc::new(resolver));
+        view
+    }
+
+    fn fact_of<'a>(facts: &'a LayoutFacts, id: &str) -> &'a LayoutNodeFact {
+        facts
+            .nodes
+            .iter()
+            .find(|n| n.fixture_id == id)
+            .unwrap_or_else(|| panic!("no fact for {id}"))
+    }
+
+    #[test]
+    fn img_resolves_through_the_host_and_lays_out_intrinsically() {
+        let resolver = ImageRecordingResolver {
+            seen: RefCell::new(Vec::new()),
+            bytes: red_png(),
+        };
+        let mut view = img_view(resolver);
+        let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        let logo = fact_of(&facts, "logo");
+        assert_eq!((logo.width, logo.height), (40.0, 20.0), "intrinsic size");
+        assert!(view.image_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn img_requests_carry_the_document_base() {
+        let resolver = ImageRecordingResolver {
+            seen: RefCell::new(Vec::new()),
+            bytes: red_png(),
+        };
+        let mut view = VelquView::new();
+        view.load_document(
+            DocumentSource::new(
+                "apps/demo/index.html",
+                "<html><body><img src=img/logo.png></body></html>",
+            )
+            .with_base("apps/demo"),
+        )
+        .unwrap();
+        let r = Rc::new(resolver);
+        view.set_asset_resolver(r.clone());
+        let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+        view.layout_facts(vp).unwrap();
+        assert_eq!(
+            r.seen.borrow().as_slice(),
+            [(Some("apps/demo".into()), "img/logo.png".into())]
+        );
+    }
+
+    #[test]
+    fn missing_image_is_broken_with_a_deterministic_diagnostic() {
+        let mut view = VelquView::new(); // null host: resolves nothing
+        view.load_html("<html><body><img data-vv-test=i src=pic.png></body></html>")
+            .unwrap();
+        let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        let i = fact_of(&facts, "i");
+        assert_eq!(
+            (i.width, i.height),
+            (300.0, 150.0),
+            "broken image keeps the default object size"
+        );
+        assert_eq!(
+            view.image_diagnostics(),
+            ["image \"pic.png\": not provided by the host asset resolver"]
+        );
+        // Repeated frames do not duplicate the diagnostic or re-resolve.
+        view.render(vp).unwrap();
+        assert_eq!(view.image_diagnostics().len(), 1);
+    }
+
+    #[test]
+    fn image_limits_bound_decode_and_diagnose() {
+        let bytes = red_png();
+        let mut view = VelquView::new();
+        view.load_html("<html><body><img data-vv-test=i src=pic.png></body></html>")
+            .unwrap();
+        view.set_asset_resolver(Rc::new(ImageRecordingResolver {
+            seen: RefCell::new(Vec::new()),
+            bytes: bytes.clone(),
+        }));
+        // Width cap below the intrinsic 40px: decode refuses, image breaks.
+        view.set_image_limits(ImageLimits::try_new(bytes.len(), 10, 4096, 1 << 20).unwrap());
+        let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        assert_eq!(
+            (fact_of(&facts, "i").width, fact_of(&facts, "i").height),
+            (300.0, 150.0)
+        );
+        assert_eq!(
+            view.image_diagnostics(),
+            ["image \"pic.png\": declared dimensions exceed the image size limits"]
+        );
+    }
+
+    #[test]
+    fn corrupt_image_bytes_are_diagnosed_as_decode_failures() {
+        let mut view = VelquView::new();
+        view.load_html("<html><body><img src=pic.png></body></html>")
+            .unwrap();
+        view.set_asset_resolver(Rc::new(ImageRecordingResolver {
+            seen: RefCell::new(Vec::new()),
+            bytes: {
+                let mut bytes = red_png();
+                bytes.truncate(20); // valid magic, broken body
+                bytes
+            },
+        }));
+        let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+        view.layout_facts(vp).unwrap();
+        assert_eq!(
+            view.image_diagnostics(),
+            ["image \"pic.png\": image data is corrupt or truncated"]
+        );
     }
 }

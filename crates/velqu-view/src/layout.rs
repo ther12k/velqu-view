@@ -19,6 +19,7 @@ use crate::color::Color;
 use crate::display_list::{DisplayItem, DisplayList, Rect};
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::font::FontStore;
+use crate::image::{DecodedImage, ImageStore};
 use crate::style::{ComputedStyle, Display};
 use crate::viewport::Viewport;
 
@@ -126,6 +127,10 @@ pub(crate) struct BoxNode {
     pub words: Vec<Word>,
     /// Set by the backend when words live in an anonymous child.
     pub text_origin: Option<TextOrigin>,
+    /// Replaced content (M2c): decoded `<img>` pixels. A replaced box is a
+    /// layout leaf measured by intrinsic size (ADR 0008) — it is never
+    /// flattened into inline words.
+    pub replaced: Option<std::rc::Rc<DecodedImage>>,
 }
 
 /// One laid-out line (runs positioned relative to the content box).
@@ -183,12 +188,26 @@ fn walk_styles(
 }
 
 /// Builds the box tree under `root` (display:none subtrees are skipped;
-/// inline subtrees flatten into words).
-pub(crate) fn build_boxes(dom: &Dom, root: NodeId, styles: &StyleMap) -> Option<BoxNode> {
+/// inline subtrees flatten into words; `<img>` becomes a replaced leaf).
+pub(crate) fn build_boxes(
+    dom: &Dom,
+    root: NodeId,
+    styles: &StyleMap,
+    images: &ImageStore,
+) -> Option<BoxNode> {
     let style = styles.get(&root)?.clone();
     if style.display == Display::None {
         return None;
     }
+    // `<img>` carries decoded pixels from the per-document image store; a
+    // missing or failed decode leaves `None` (broken-image behavior).
+    let replaced = (dom.tag_name(root) == Some("img"))
+        .then(|| dom.attribute(root, "src"))
+        .flatten()
+        .and_then(|src| match images.get(src) {
+            Some(crate::image::ImageEntry::Loaded(image)) => Some(std::rc::Rc::clone(image)),
+            _ => None,
+        });
     let mut box_node = BoxNode {
         node: root,
         fixture_id: dom.fixture_id(root).map(str::to_owned),
@@ -202,19 +221,27 @@ pub(crate) fn build_boxes(dom: &Dom, root: NodeId, styles: &StyleMap) -> Option<
         margin: crate::style::Sides::default(),
         words: Vec::new(),
         text_origin: None,
+        replaced,
     };
 
     let mut pending_space_before = false;
     for &child in &dom.node(root).children {
         match &dom.node(child).data {
             NodeData::Element { .. } => {
-                match styles
+                let display = styles
                     .get(&child)
                     .map(|s| s.display)
-                    .unwrap_or(Display::Inline)
-                {
+                    .unwrap_or(Display::Inline);
+                match display {
                     Display::Block | Display::Flex => {
-                        if let Some(child_box) = build_boxes(dom, child, styles) {
+                        if let Some(child_box) = build_boxes(dom, child, styles, images) {
+                            box_node.children.push(child_box);
+                        }
+                    }
+                    // A replaced element never flattens into inline words:
+                    // it is a real box even where display is inline.
+                    Display::Inline if dom.tag_name(child) == Some("img") => {
+                        if let Some(child_box) = build_boxes(dom, child, styles, images) {
                             box_node.children.push(child_box);
                         }
                     }
@@ -325,6 +352,7 @@ pub(crate) fn layout_document(
     viewport: Viewport,
     cascade: &mut crate::style::Cascade<'_>,
     fonts: &mut FontStore,
+    images: &ImageStore,
 ) -> Option<(BoxNode, DisplayList)> {
     // The layout root: <body> if present, else <html>, else the document.
     let mut root_element = None;
@@ -336,7 +364,7 @@ pub(crate) fn layout_document(
     let root_element = root_element.unwrap_or_else(|| dom.document());
 
     let styles = compute_all_styles(dom, root_element, cascade);
-    let mut root = build_boxes(dom, root_element, &styles)?;
+    let mut root = build_boxes(dom, root_element, &styles, images)?;
 
     crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts);
 
@@ -619,6 +647,16 @@ mod tests {
     use crate::source::StylesheetSource;
 
     fn facts_for(html: &str, css: &str, width: u32, height: u32) -> LayoutFacts {
+        facts_with_images(html, css, width, height, &ImageStore::new())
+    }
+
+    fn facts_with_images(
+        html: &str,
+        css: &str,
+        width: u32,
+        height: u32,
+        images: &ImageStore,
+    ) -> LayoutFacts {
         let dom = crate::html::parse(html);
         let ua_sheet = StylesheetSource::new("velqu:ua", "");
         let ua_parsed = crate::css::parse(&ua_sheet, 0);
@@ -628,7 +666,7 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &author_sheets);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(width, height, 1.0).unwrap();
-        let (root, _) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
+        let (root, _) = layout_document(&dom, viewport, &mut cascade, &mut fonts, images).unwrap();
         let mut facts = LayoutFacts {
             schema_version: 0,
             viewport_width: 0,
@@ -735,7 +773,8 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &[]);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 400, 1.0).unwrap();
-        let (root, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
+        let (root, list) =
+            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
         // The text run's color equals the outer div's color.
         let runs = list.text_runs();
         assert!(!runs.is_empty());
@@ -778,7 +817,8 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &[]);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 200, 1.0).unwrap();
-        let (_, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
+        let (_, list) =
+            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
         let run = &list.text_runs()[0];
         let run_width =
             crate::text::measure_run(&mut fonts, "hi", 16, crate::font::FontWeight::Regular);
@@ -881,7 +921,8 @@ mod tests {
         let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &sheets);
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 300, 1.0).unwrap();
-        let (root, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
+        let (root, list) =
+            layout_document(&dom, viewport, &mut cascade, &mut fonts, &ImageStore::new()).unwrap();
         let mut facts = LayoutFacts {
             schema_version: 0,
             viewport_width: 0,
@@ -900,5 +941,74 @@ mod tests {
             .iter()
             .any(|item| matches!(item, crate::display_list::DisplayItem::PushClip(_)));
         assert!(has_clip, "overflow:hidden emits PushClip");
+    }
+
+    /// A 40×20 decoded image in the store, plus the raw bytes for tests
+    /// that exercise the decode path.
+    fn test_images() -> ImageStore {
+        let mut images = ImageStore::new();
+        images.load(
+            "pic.png",
+            &crate::image::test_png(40, 20, [0xef, 0x44, 0x44, 0xff]),
+            &crate::image::ImageLimits::default(),
+        );
+        images
+    }
+
+    #[test]
+    fn image_intrinsics_drive_replaced_sizing() {
+        let facts = facts_with_images(
+            "<body>\
+             <img data-vv-test=a src=pic.png>\
+             <img data-vv-test=b src=pic.png style=\"width: 60px\">\
+             <img data-vv-test=c src=pic.png style=\"height: 10px\">\
+             <img data-vv-test=d src=pic.png style=\"width: 30px; height: 50px\">\
+             <img data-vv-test=e src=missing.png>\
+             </body>",
+            "body { margin: 0 }",
+            500,
+            400,
+            &test_images(),
+        );
+        let a = fact(&facts, "a");
+        let b = fact(&facts, "b");
+        let c = fact(&facts, "c");
+        let d = fact(&facts, "d");
+        let e = fact(&facts, "e");
+        // No CSS size: intrinsic dimensions.
+        assert_eq!((a.width, a.height), (40.0, 20.0));
+        // One dimension auto: the intrinsic ratio is preserved.
+        assert_eq!((b.width, b.height), (60.0, 30.0));
+        assert_eq!((c.width, c.height), (20.0, 10.0));
+        // Both dimensions specified: CSS wins outright.
+        assert_eq!((d.width, d.height), (30.0, 50.0));
+        // Broken/missing asset: deterministic default object size.
+        assert_eq!((e.width, e.height), (300.0, 150.0));
+    }
+
+    #[test]
+    fn image_participates_in_flex_by_intrinsic_size() {
+        let facts = facts_with_images(
+            "<body><div data-vv-test=row class=row>\
+             <img data-vv-test=pic src=pic.png>\
+             <div data-vv-test=grow class=grow></div>\
+             </div></body>",
+            "body { margin: 0 } .row { display: flex; width: 200px; height: 30px } \
+             .grow { flex-grow: 1 }",
+            400,
+            300,
+            &test_images(),
+        );
+        let pic = fact(&facts, "pic");
+        let grow = fact(&facts, "grow");
+        // Main axis: the image keeps its intrinsic width (flex-basis from
+        // content; no grow of its own) and the sibling absorbs the rest.
+        // Cross axis: default align-items:stretch fills the line height —
+        // replaced items stretch in flex, as in browsers (the intrinsic
+        // ratio applies only where no stretch/size overrides it).
+        assert_eq!(pic.width, 40.0);
+        assert_eq!(pic.height, 30.0);
+        assert_eq!(grow.width, 160.0);
+        assert_eq!(grow.x, pic.x + pic.width);
     }
 }

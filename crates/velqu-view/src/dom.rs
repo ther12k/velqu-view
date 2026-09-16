@@ -107,6 +107,17 @@ impl Dom {
         }
     }
 
+    /// The element's first attribute with `name`, or `None`.
+    pub(crate) fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
+        match &self.nodes[id].data {
+            NodeData::Element { attrs, .. } => attrs
+                .iter()
+                .find(|a| a.name == name)
+                .map(|a| a.value.as_str()),
+            _ => None,
+        }
+    }
+
     /// Depth-first pre-order visit of every node (document root included).
     #[allow(dead_code)]
     pub(crate) fn walk(&self, mut visit: impl FnMut(NodeId, &Node)) {

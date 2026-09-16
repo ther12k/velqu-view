@@ -84,7 +84,8 @@ pub(crate) fn layout_box_tree(root: &mut BoxNode, viewport: Viewport, fonts: &mu
                     return LayoutOutput::HIDDEN;
                 };
                 // Delegate the CSS size/min/max/inset handling to Taffy's own
-                // leaf layout; only the text content measurement is ours.
+                // leaf layout; only the content measurement is ours (text
+                // wrapping, or replaced-image intrinsic sizing).
                 if input.run_mode == RunMode::PerformHiddenLayout {
                     return LayoutOutput::HIDDEN;
                 }
@@ -93,7 +94,7 @@ pub(crate) fn layout_box_tree(root: &mut BoxNode, viewport: Viewport, fonts: &mu
                     style,
                     |_, _| 0.0,
                     |known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>| {
-                        text_content_size(box_node, known.width, available.width, fonts, scale)
+                        leaf_content_size(box_node, known, available, fonts, scale)
                     },
                 )
             },
@@ -126,6 +127,7 @@ fn project<'a>(
         &node.style,
         scale,
         PAGE_ROOT_TAGS.contains(&node.tag.as_str()),
+        node.replaced.is_some() || node.tag == "img",
     );
 
     // Leaves: no block children — the box's own words (possibly none).
@@ -177,7 +179,17 @@ fn project<'a>(
 
 /// Maps a Velqu computed style onto a Taffy style. All CSS lengths are
 /// resolved to device pixels here so Taffy computes in one metric space.
-fn map_style(style: &ComputedStyle, scale: f32, is_page_root: bool) -> TaffyStyle {
+///
+/// `is_replaced` marks `<img>` leaves: Taffy's block algorithm then sizes
+/// an auto width by content (intrinsic) instead of stretching it, per CSS
+/// replaced-element sizing. Flex cross-stretch still applies (as in
+/// browsers); ratio handling lives in `image_content_size`.
+fn map_style(
+    style: &ComputedStyle,
+    scale: f32,
+    is_page_root: bool,
+    is_replaced: bool,
+) -> TaffyStyle {
     let display: taffy::style::Display = match style.display {
         Display::None => taffy::style::Display::None,
         Display::Flex => taffy::style::Display::Flex,
@@ -214,6 +226,7 @@ fn map_style(style: &ComputedStyle, scale: f32, is_page_root: bool) -> TaffyStyl
     TaffyStyle {
         display,
         box_sizing: BoxSizing::ContentBox,
+        item_is_replaced: is_replaced,
         overflow: TaffyPoint {
             x: map_overflow(style.overflow_x),
             y: map_overflow(style.overflow_y),
@@ -337,6 +350,71 @@ fn length_percentage_auto(len: Length, scale: f32) -> LengthPercentageAuto {
 }
 
 // -- leaf measurement ---------------------------------------------------------
+
+/// Measures one leaf's **content size**: replaced images by intrinsic size,
+/// everything else by text wrapping. CSS size/min/max/inset handling is
+/// delegated to Taffy's `compute_leaf_layout` by the caller.
+fn leaf_content_size(
+    box_node: &BoxNode,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<AvailableSpace>,
+    fonts: &mut FontStore,
+    scale: f32,
+) -> TaffySize<f32> {
+    if let Some(image) = &box_node.replaced {
+        // Intrinsic dimensions are image pixels = logical CSS px; scale into
+        // the layout metric space (device px).
+        let intrinsic = TaffySize {
+            width: image.width as f32 * scale,
+            height: image.height as f32 * scale,
+        };
+        return image_content_size(box_node, intrinsic, image.aspect_ratio(), scale);
+    }
+    if box_node.tag == "img" {
+        // Broken or missing asset (ADR 0008): no intrinsic size, no ratio —
+        // the CSS default object size keeps a deterministic footprint.
+        let intrinsic = TaffySize {
+            width: crate::image::DEFAULT_OBJECT_SIZE.0 * scale,
+            height: crate::image::DEFAULT_OBJECT_SIZE.1 * scale,
+        };
+        return image_content_size(box_node, intrinsic, None, scale);
+    }
+    text_content_size(box_node, known.width, available.width, fonts, scale)
+}
+
+/// Replaced-element sizing (ADR 0008), driven by the **author CSS** on the
+/// computed style — never by algorithm-resolved dimensions Taffy may pass
+/// through (a stretched cross size must not retro-apply the ratio).
+///
+/// * an absolute `width`/`height` in the style wins; the other (auto)
+///   dimension is measured from the intrinsic ratio;
+/// * both auto: the intrinsic size;
+/// * percentage sizes resolve in `compute_leaf_layout` from the style; the
+///   auto companion dimension then keeps the intrinsic size (documented
+///   profile limitation);
+/// * no ratio (broken image): the auto dimension keeps the intrinsic
+///   (default object size) dimension.
+fn image_content_size(
+    box_node: &BoxNode,
+    intrinsic: TaffySize<f32>,
+    ratio: Option<f32>,
+    scale: f32,
+) -> TaffySize<f32> {
+    let style = &box_node.style;
+    let specified = |len: Option<Length>| match len {
+        Some(Length::Px(v)) => Some(v * scale),
+        Some(Length::Rem(v)) => Some(v * scale),
+        // Percentages need the containing block; the intrinsic fallback
+        // covers the auto companion axis.
+        Some(Length::Percent(_)) | None => None,
+    };
+    let (width, height) = match (specified(style.width), specified(style.height)) {
+        (Some(w), _) => (w, ratio.map_or(intrinsic.height, |r| w / r)),
+        (None, Some(h)) => (ratio.map_or(intrinsic.width, |r| h * r), h),
+        (None, None) => (intrinsic.width, intrinsic.height),
+    };
+    TaffySize { width, height }
+}
 
 /// Measures a text leaf's **content size**: wraps the box's words at the
 /// available width. CSS size/min/max/inset handling is delegated to

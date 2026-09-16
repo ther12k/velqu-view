@@ -14,10 +14,6 @@
 //!   bounded *before* a full-size decode allocation happens (the header is
 //!   read first via `into_dimensions`);
 //! * decode is single-threaded (no `rayon`) and deterministic.
-//!
-//! Staging: the box tree and painter consume this module in the next M2c
-//! commit (`<img>` as a replaced element); until then only tests drive it.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -38,6 +34,11 @@ pub const DEFAULT_MAX_DIMENSION: u32 = 16384;
 /// Upper bound on decoded pixels by default (2^28 = a 1 GiB RGBA8 buffer,
 /// matching [`crate::MAX_PIXELS`]).
 pub const DEFAULT_MAX_PIXELS: u64 = 1 << 28;
+
+/// CSS default object size, in logical px, for an image with no intrinsic
+/// dimensions — a broken or missing asset keeps a deterministic layout
+/// footprint instead of collapsing to zero.
+pub(crate) const DEFAULT_OBJECT_SIZE: (f32, f32) = (300.0, 150.0);
 
 /// Resource limits applied to every image decode (ADR 0008).
 ///
@@ -251,12 +252,25 @@ impl ImageStore {
 
     /// Decodes `bytes` under `limits` and caches the outcome for `src`
     /// (successes and failures alike, so a broken asset is diagnosed once).
-    pub(crate) fn load(&mut self, src: &str, bytes: &[u8], limits: &ImageLimits) {
+    /// Decodes `bytes` under `limits` and caches the outcome for `src`
+    /// (successes and failures alike, so a broken asset is diagnosed once).
+    /// Returns the failure, if any, for diagnostics.
+    pub(crate) fn load(
+        &mut self,
+        src: &str,
+        bytes: &[u8],
+        limits: &ImageLimits,
+    ) -> Option<ImageFailure> {
         let entry = match decode_bounded(bytes, limits) {
             Ok(image) => ImageEntry::Loaded(Rc::new(image)),
-            Err(failure) => ImageEntry::Failed(failure),
+            Err(failure) => ImageEntry::Failed(failure.clone()),
+        };
+        let failure = match &entry {
+            ImageEntry::Loaded(_) => None,
+            ImageEntry::Failed(failure) => Some(failure.clone()),
         };
         self.entries.insert(src.to_owned(), entry);
+        failure
     }
 }
 
@@ -342,6 +356,17 @@ pub(crate) fn decode_bounded(
 
 // `::image` (extern crate) is spelled with a leading `::` because a
 // crate-root `mod image` shadows the crate name in plain paths.
+
+/// Encodes a solid-color PNG for tests in other modules (deterministic
+/// bytes; the visual fixture harness uses the same shape of input).
+#[cfg(test)]
+pub(crate) fn test_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba(rgba));
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, ImageFormat::Png)
+        .expect("png encode succeeds");
+    out.into_inner()
+}
 
 #[cfg(test)]
 mod tests {
