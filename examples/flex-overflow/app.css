@@ -1,0 +1,15 @@
+/* M2b overflow fixture. */
+body {
+  margin: 0;
+}
+
+.clip {
+  overflow: hidden;
+  width: 120px;
+  height: 40px;
+  background-color: #171d29;
+}
+
+.big {
+  width: 300px;
+}

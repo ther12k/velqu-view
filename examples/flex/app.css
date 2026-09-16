@@ -1,0 +1,18 @@
+/* M2b fractional-width flex fixture: three grow:1 items in a 101px row. */
+body {
+  margin: 0;
+}
+
+.row {
+  display: flex;
+  width: 101px;
+  height: 30px;
+}
+
+.grow {
+  flex-grow: 1;
+}
+
+.ga { background-color: #ef4444; }
+.gb { background-color: #22c55e; }
+.gc { background-color: #3b82f6; }

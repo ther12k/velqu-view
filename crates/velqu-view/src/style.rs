@@ -636,13 +636,6 @@ fn apply_declaration(
 
     let values: Vec<&str> = declaration.value.split_ascii_whitespace().collect();
     match declaration.property.as_str() {
-        "display" => match declaration.value.as_str() {
-            "block" => style.display = Display::Block,
-            "inline" => style.display = Display::Inline,
-            "flex" => style.display = Display::Flex,
-            "none" => style.display = Display::None,
-            _ => diagnostics.push(unsupported("display value")),
-        },
         "width" => match parse_length(&declaration.value) {
             Some(len) => style.width = Some(len),
             None => diagnostics.push(unsupported("length")),
@@ -800,8 +793,141 @@ fn apply_declaration(
             "nowrap" => style.white_space = WhiteSpace::Nowrap,
             _ => diagnostics.push(unsupported("white-space value")),
         },
+        "display" => match declaration.value.as_str() {
+            "block" => style.display = Display::Block,
+            "inline" => style.display = Display::Inline,
+            "flex" => style.display = Display::Flex,
+            "none" => style.display = Display::None,
+            _ => diagnostics.push(unsupported("display value")),
+        },
+        "flex-direction" => match declaration.value.as_str() {
+            "row" => style.flex_direction = FlexDirection::Row,
+            "row-reverse" => style.flex_direction = FlexDirection::RowReverse,
+            "column" => style.flex_direction = FlexDirection::Column,
+            "column-reverse" => style.flex_direction = FlexDirection::ColumnReverse,
+            _ => diagnostics.push(unsupported("flex-direction value")),
+        },
+        "flex-wrap" => match declaration.value.as_str() {
+            "nowrap" => style.flex_wrap = FlexWrap::Nowrap,
+            "wrap" => style.flex_wrap = FlexWrap::Wrap,
+            _ => diagnostics.push(unsupported("flex-wrap value")),
+        },
+        "flex-grow" => match declaration.value.parse::<f32>() {
+            Ok(grow) if grow >= 0.0 => style.flex_grow = grow,
+            _ => diagnostics.push(unsupported("flex-grow value")),
+        },
+        "flex-shrink" => match declaration.value.parse::<f32>() {
+            Ok(shrink) if shrink >= 0.0 => style.flex_shrink = shrink,
+            _ => diagnostics.push(unsupported("flex-shrink value")),
+        },
+        "flex-basis" => match declaration.value.as_str() {
+            "auto" => style.flex_basis = None,
+            other => match parse_length(other) {
+                Some(len) => style.flex_basis = Some(len),
+                None => diagnostics.push(unsupported("flex-basis value")),
+            },
+        },
+        "justify-content" => match declaration.value.as_str() {
+            "flex-start" | "start" | "normal" => style.justify_content = JustifyContent::FlexStart,
+            "center" => style.justify_content = JustifyContent::Center,
+            "flex-end" | "end" => style.justify_content = JustifyContent::FlexEnd,
+            "space-between" => style.justify_content = JustifyContent::SpaceBetween,
+            _ => diagnostics.push(unsupported("justify-content value")),
+        },
+        "align-items" => match declaration.value.as_str() {
+            "stretch" | "normal" => style.align_items = AlignItems::Stretch,
+            "flex-start" | "start" => style.align_items = AlignItems::FlexStart,
+            "center" => style.align_items = AlignItems::Center,
+            "flex-end" | "end" => style.align_items = AlignItems::FlexEnd,
+            // Baseline alignment is deferred (ADR 0007): diagnosed loudly,
+            // laid out as flex-start. Never a silent fallback.
+            "baseline" => {
+                style.align_items = AlignItems::Baseline;
+                diagnostics.push(skip(
+                    "align-items: baseline is deferred in the M2b profile; \
+                     laid out as flex-start"
+                        .into(),
+                ));
+            }
+            _ => diagnostics.push(unsupported("align-items value")),
+        },
+        "align-self" => match declaration.value.as_str() {
+            "auto" => style.align_self = AlignSelf::Auto,
+            "stretch" | "normal" => style.align_self = AlignSelf::Stretch,
+            "flex-start" | "start" => style.align_self = AlignSelf::FlexStart,
+            "center" => style.align_self = AlignSelf::Center,
+            "flex-end" | "end" => style.align_self = AlignSelf::FlexEnd,
+            "baseline" => {
+                style.align_self = AlignSelf::Baseline;
+                diagnostics.push(skip(
+                    "align-self: baseline is deferred in the M2b profile; \
+                     laid out as flex-start"
+                        .into(),
+                ));
+            }
+            _ => diagnostics.push(unsupported("align-self value")),
+        },
+        "gap" => {
+            let mut lengths: Vec<Length> = Vec::new();
+            let mut all_ok = !values.is_empty();
+            for value in &values {
+                match parse_length(value) {
+                    Some(len) => lengths.push(len),
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if all_ok {
+                let (row, column) = match lengths.as_slice() {
+                    [one] => (*one, *one),
+                    [row, column] => (*row, *column),
+                    _ => (Length::Px(0.0), Length::Px(0.0)),
+                };
+                style.row_gap = Some(row);
+                style.column_gap = Some(column);
+            } else {
+                diagnostics.push(unsupported("gap value"));
+            }
+        }
+        "row-gap" => match parse_length(&declaration.value) {
+            Some(len) => style.row_gap = Some(len),
+            None => diagnostics.push(unsupported("length")),
+        },
+        "column-gap" => match parse_length(&declaration.value) {
+            Some(len) => style.column_gap = Some(len),
+            None => diagnostics.push(unsupported("length")),
+        },
+        "overflow" => match declaration.value.as_str() {
+            "visible" => {
+                style.overflow_x = Overflow::Visible;
+                style.overflow_y = Overflow::Visible;
+            }
+            "hidden" => {
+                style.overflow_x = Overflow::Hidden;
+                style.overflow_y = Overflow::Hidden;
+            }
+            "clip" => {
+                style.overflow_x = Overflow::Clip;
+                style.overflow_y = Overflow::Clip;
+            }
+            _ => diagnostics.push(unsupported("overflow value")),
+        },
+        "overflow-x" => match declaration.value.as_str() {
+            "visible" => style.overflow_x = Overflow::Visible,
+            "hidden" => style.overflow_x = Overflow::Hidden,
+            "clip" => style.overflow_x = Overflow::Clip,
+            _ => diagnostics.push(unsupported("overflow value")),
+        },
+        "overflow-y" => match declaration.value.as_str() {
+            "visible" => style.overflow_y = Overflow::Visible,
+            "hidden" => style.overflow_y = Overflow::Hidden,
+            "clip" => style.overflow_y = Overflow::Clip,
+            _ => diagnostics.push(unsupported("overflow value")),
+        },
         _ => diagnostics.push(skip(format!(
-            "property {:?} is outside the M2a profile",
+            "property {:?} is outside the M2b profile",
             declaration.property
         ))),
     }
@@ -1102,7 +1228,7 @@ mod tests {
     #[test]
     fn unknown_property_produces_diagnostic() {
         let mut fx = build(
-            "<p data-vv-test=p style=\"flex-direction: row; color: red\">x</p>",
+            "<p data-vv-test=p style=\"order: 2; color: red\">x</p>",
             &["p { backdrop-filter: blur(2px); font-weight: 700 }"],
         );
         let (style, diagnostics) = fx.compute_for("p");
@@ -1113,11 +1239,7 @@ mod tests {
                 .iter()
                 .any(|d| d.message.contains("backdrop-filter"))
         );
-        assert!(
-            diagnostics
-                .iter()
-                .any(|d| d.message.contains("flex-direction"))
-        );
+        assert!(diagnostics.iter().any(|d| d.message.contains("order")));
     }
 
     #[test]

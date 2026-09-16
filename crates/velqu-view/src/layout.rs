@@ -794,13 +794,111 @@ mod tests {
     }
 
     #[test]
-    fn probe_body_geometry() {
+    fn flex_grow_distributes_fractional_widths() {
+        // Three grow:1 items in 101px: widths cannot all be integers; the
+        // contract is the deterministic 101/3 split and its exact sum.
         let facts = facts_for(
-            "<body data-vv-test=b><div data-vv-test=a>one</div></body>",
-            "",
+            "<body><div data-vv-test=row class=row>\
+             <div data-vv-test=a class=ga></div>\
+             <div data-vv-test=b class=gb></div>\
+             <div data-vv-test=c class=gc></div></div></body>",
+            "body { margin: 0 } .row { display: flex; width: 101px; height: 30px } \
+             .ga, .gb, .gc { flex-grow: 1 }",
             400,
-            400,
+            300,
         );
-        eprintln!("PROBE facts: {:#?}", facts.nodes);
+        let a = fact(&facts, "a");
+        let b = fact(&facts, "b");
+        let c = fact(&facts, "c");
+        assert_eq!(a.width, 101.0 / 3.0);
+        assert_eq!(b.width, 101.0 / 3.0);
+        assert_eq!(c.width, 101.0 / 3.0);
+        // Deterministic containment: the items tile the container exactly.
+        assert_eq!(a.x + a.width, b.x);
+        assert_eq!(b.x + b.width, c.x);
+        assert!((c.x + c.width - 101.0).abs() < 1e-3);
+        // Cross-axis stretch by default align-items.
+        assert_eq!(a.height, 30.0);
+    }
+
+    #[test]
+    fn flex_row_nests_block_and_column() {
+        // block → flex → (text | block | flex column) — the mixed-nesting
+        // shape that a flex-island architecture cannot handle.
+        let facts = facts_for(
+            "<body><div data-vv-test=mix class=mix>\
+             <span data-vv-test=t1>hi</span>\
+             <div data-vv-test=blk class=blk></div>\
+             <div data-vv-test=col class=col>\
+             <div data-vv-test=c1>x</div>\
+             <div data-vv-test=c2>y</div>\
+             </div></div></body>",
+            "body { margin: 0 } .mix { display: flex } .blk { width: 50px; height: 30px } \
+             .col { display: flex; flex-direction: column }",
+            400,
+            300,
+        );
+        let mix = fact(&facts, "mix");
+        let t1 = fact(&facts, "t1");
+        let blk = fact(&facts, "blk");
+        let col = fact(&facts, "col");
+        let c1 = fact(&facts, "c1");
+        let c2 = fact(&facts, "c2");
+        // Row order: text, block, column — strictly increasing x.
+        assert!(
+            t1.x < blk.x && blk.x < col.x,
+            "{} {} {}",
+            t1.x,
+            blk.x,
+            col.x
+        );
+        assert_eq!(blk.y, mix.y);
+        assert_eq!(blk.width, 50.0);
+        // Column children stack vertically.
+        assert_eq!(c1.x, col.x);
+        assert!(c2.y > c1.y, "column stacks: {} {}", c1.y, c2.y);
+        assert_eq!(t1.text_runs, ["hi"]);
+    }
+
+    #[test]
+    fn overflow_hidden_clips_paint_not_layout() {
+        // The child keeps its full laid-out size; clipping is a paint-side
+        // concern (PushClip in the display list).
+        let dom = crate::html::parse(
+            "<body><div data-vv-test=clip class=clip>\
+             <div data-vv-test=big class=big>wide child text</div>\
+             </div></body>",
+        );
+        let ua_sheet = StylesheetSource::new("velqu:ua", "");
+        let ua_parsed = crate::css::parse(&ua_sheet, 0);
+        let author = StylesheetSource::new(
+            "t.css",
+            "body { margin: 0 } .clip { overflow: hidden; width: 60px; height: 20px } \
+             .big { width: 200px; height: 40px }",
+        );
+        let author_parsed = crate::css::parse(&author, 0);
+        let sheets = [author_parsed];
+        let mut cascade = crate::style::Cascade::new(&ua_parsed.rules, &sheets);
+        let mut fonts = FontStore::bundled();
+        let viewport = Viewport::try_new(400, 300, 1.0).unwrap();
+        let (root, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
+        let mut facts = LayoutFacts {
+            schema_version: 0,
+            viewport_width: 0,
+            viewport_height: 0,
+            scale: 0.0,
+            nodes: Vec::new(),
+        };
+        collect_facts(&dom, &root, viewport, &mut facts);
+        // Layout truth: the child is fully sized and positioned.
+        let big = fact(&facts, "big");
+        assert_eq!(big.width, 200.0);
+        assert_eq!(big.x, 0.0);
+        // Paint truth: a clip scope wraps the container's children.
+        let has_clip = list
+            .items
+            .iter()
+            .any(|item| matches!(item, crate::display_list::DisplayItem::PushClip(_)));
+        assert!(has_clip, "overflow:hidden emits PushClip");
     }
 }

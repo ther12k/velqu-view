@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Overflow clipping</title></head>
+<body>
+  <!-- A clipping container with a larger child holding wrapped text:
+       layout keeps full child geometry; paint clips to the padding box. -->
+  <div data-vv-test="clip" class="clip">
+    <div data-vv-test="big" class="big">
+      this text is wider than the clipping container and must be cut off at
+      the padding box edge during painting while layout still measures the
+      full unwrapped extent
+    </div>
+  </div>
+</body>
+</html>

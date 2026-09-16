@@ -1,0 +1,33 @@
+# M2b fixture: block → flex → text/block/flex-column mixed nesting.
+name = "flex-mixed"
+html = "examples/flex-mixed/index.html"
+css = ["examples/flex-mixed/app.css"]
+viewport = { width = 400, height = 300, scale = 1.0 }
+
+[expect]
+pixels_sha256 = "f4d5d97a9e481f84c6d12d4da29a6d73506ee2e5fb4adb5ce08c6c12b61ea625"
+
+[[expect.facts]]
+id = "mix"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+
+[[expect.facts]]
+id = "blk"
+tag = "div"
+display = "block"
+width = 50.0
+height = 30.0
+
+[[expect.facts]]
+id = "col"
+tag = "div"
+display = "flex"
+
+[[expect.facts]]
+id = "t1"
+tag = "span"
+display = "inline"
+text_runs = ["text"]

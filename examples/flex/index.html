@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Flex fractional widths</title></head>
+<body>
+  <!-- Three equal-grow children in 101 logical px: widths cannot all be
+       integers; the fixture asserts the deterministic split and their sum. -->
+  <div data-vv-test="row" class="row">
+    <div data-vv-test="a" class="grow ga"></div>
+    <div data-vv-test="b" class="grow gb"></div>
+    <div data-vv-test="c" class="grow gc"></div>
+  </div>
+</body>
+</html>

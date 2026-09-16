@@ -1,0 +1,28 @@
+# M2b fixture: overflow hidden — layout truth (full child size) plus paint
+# truth (clipped raster): the pixel probes inside the clip rect show the
+# child's background; beyond it, the container's.
+name = "flex-overflow"
+html = "examples/flex-overflow/index.html"
+css = ["examples/flex-overflow/app.css"]
+viewport = { width = 400, height = 300, scale = 1.0 }
+
+[expect]
+pixels_sha256 = "6e70f3f5a6bdd2fd76c103365e788b5131623100578c533aca6e4ec209fcd9f4"
+
+# Layout truth: the child keeps its full 300px width.
+[[expect.facts]]
+id = "big"
+tag = "div"
+display = "block"
+x = 0.0
+width = 300.0
+
+# Paint truth: outside the clip rect the (white) page shows; inside it,
+# the container's fill.
+[[expect.pixel]]
+pos = [150, 20]
+color = "#FFFFFF"   # page background beyond the clip
+
+[[expect.pixel]]
+pos = [100, 20]
+color = "#171D29"   # container fill, inside the clip

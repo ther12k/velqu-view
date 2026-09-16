@@ -189,12 +189,10 @@ fn human_bytes(n: usize) -> String {
 }
 
 fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
-    let viewport = Viewport::try_new(
-        args.size.0 * args.scale as u32,
-        args.size.1 * args.scale as u32,
-        args.scale,
-    )
-    .map_err(|e| e.to_string())?;
+    // Physical = logical × scale, rounded per axis (1.25 × 400 = 500).
+    let physical = |logical: u32| (logical as f32 * args.scale).round() as u32;
+    let viewport = Viewport::try_new(physical(args.size.0), physical(args.size.1), args.scale)
+        .map_err(|e| e.to_string())?;
     let mut hashes: Vec<String> = Vec::new();
     let mut durations: Vec<Duration> = Vec::new();
     let mut first: Option<velqu_view::FrameResult> = None;

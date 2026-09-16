@@ -1,0 +1,43 @@
+# M2b fixture: fractional flex widths — three grow:1 items in 101 logical px.
+# Run at 1x, 1.25x, 2x: widths cannot all be integers; the contract is
+# deterministic layout, correct containment, and a documented rounding
+# policy (ADR 0007) — NOT "2x facts = 2 × 1x facts".
+name = "flex-101"
+html = "examples/flex/index.html"
+css = ["examples/flex/app.css"]
+viewport = { width = 400, height = 300, scale = 1.0 }
+
+[expect]
+pixels_sha256 = "b07012fabaf8904fa1cda2c8db67ae6b2568757f605fe8766ba39de77886fb18"
+
+[[expect.facts]]
+id = "row"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+width = 101.0
+height = 30.0
+margin = [0.0, 0.0, 0.0, 0.0]
+
+[[expect.facts]]
+id = "a"
+tag = "div"
+display = "block"
+x = 0.0
+width = 33.666668
+height = 30.0
+
+[[expect.facts]]
+id = "b"
+tag = "div"
+display = "block"
+x = 33.666668
+width = 33.666668
+
+[[expect.facts]]
+id = "c"
+tag = "div"
+display = "block"
+x = 67.333336
+width = 33.666668

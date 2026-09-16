@@ -1,0 +1,40 @@
+# M2b fixture: the 101px flex row at 1.25x — catches hidden integer
+# assumptions (widths become 42.0833.., painted edges land on non-integer
+# device coordinates).
+name = "flex-101-125"
+html = "examples/flex/index.html"
+css = ["examples/flex/app.css"]
+viewport = { width = 500, height = 375, scale = 1.25 }
+
+[expect]
+pixels_sha256 = "115eb55ca15bbae5b87203a3683fc439bea3f88ec616725e5e96552a41dbde9d"
+
+[[expect.facts]]
+id = "row"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+width = 126.25
+height = 37.5
+
+[[expect.facts]]
+id = "a"
+tag = "div"
+display = "block"
+x = 0.0
+width = 42.083332
+
+[[expect.facts]]
+id = "b"
+tag = "div"
+display = "block"
+x = 42.083332
+width = 42.083332
+
+[[expect.facts]]
+id = "c"
+tag = "div"
+display = "block"
+x = 84.166664
+width = 42.083332

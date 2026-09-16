@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Flex mixed nesting</title></head>
+<body>
+  <!-- block → flex row → (text | block | flex column): the mixed-nesting
+       shape that defeats flex-island architectures. -->
+  <div data-vv-test="mix" class="mix">
+    <span data-vv-test="t1" class="t1">text</span>
+    <div data-vv-test="blk" class="blk"></div>
+    <div data-vv-test="col" class="col">
+      <div data-vv-test="c1" class="c1">x</div>
+      <div data-vv-test="c2" class="c2">y</div>
+    </div>
+  </div>
+</body>
+</html>

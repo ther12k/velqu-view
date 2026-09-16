@@ -1,0 +1,19 @@
+/* M2b mixed-nesting flex fixture. */
+body {
+  margin: 0;
+}
+
+.mix {
+  display: flex;
+}
+
+.blk {
+  width: 50px;
+  height: 30px;
+  background-color: #2a3242;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+}
