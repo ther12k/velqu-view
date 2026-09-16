@@ -1200,19 +1200,37 @@ mod tests {
         .unwrap();
         let vp = Viewport::try_new(200, 200, 1.0).unwrap();
         let facts_before = view.layout_facts(vp).unwrap();
+        let a = view.render(vp).unwrap();
         let passes_after_layout = view.layout_stats().passes;
         assert_eq!(facts_before.document_scroll_height, 600.0);
 
         // Scrolling is a state change only: no layout pass runs, and the
-        // facts (unscrolled layout truth) are identical afterwards.
-        view.set_scroll_offset(None, 0.0, 350.0).unwrap();
+        // facts (unscrolled layout truth) are identical afterwards...
+        view.set_scroll_offset(None, 0.0, 250.0).unwrap();
         assert_eq!(view.layout_stats().passes, passes_after_layout);
         let facts_after = view.layout_facts(vp).unwrap();
         assert_eq!(facts_before, facts_after);
+        // ...but the raster moved (at 250: 50px red, then blue).
+        let b = view.render(vp).unwrap();
+        assert_ne!(a.frame.sha256_hex(), b.frame.sha256_hex());
 
-        // Clamping is central: over-scroll requests are accepted and clamped
-        // at apply time; non-finite offsets are rejected outright.
+        // Offsets are pure presentation state: scrolling back to 0
+        // reproduces frame A byte-for-byte.
+        view.set_scroll_offset(None, 0.0, 0.0).unwrap();
+        let again = view.render(vp).unwrap();
+        assert_eq!(a.frame.sha256_hex(), again.frame.sha256_hex());
+
+        // Clamping is central: over-scroll lands exactly on max scroll.
+        view.set_scroll_offset(None, 0.0, 400.0).unwrap();
+        let at_max = view.render(vp).unwrap();
         view.set_scroll_offset(None, 0.0, 100_000.0).unwrap();
+        let clamped = view.render(vp).unwrap();
+        assert_eq!(
+            at_max.frame.sha256_hex(),
+            clamped.frame.sha256_hex(),
+            "400 and 100000 clamp to the same maximum offset"
+        );
+        // Unknown targets never apply; non-finite offsets are rejected.
         view.set_scroll_offset(Some("missing-pane"), 10.0, 10.0)
             .unwrap();
         assert!(matches!(

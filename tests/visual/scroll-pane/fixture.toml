@@ -1,0 +1,71 @@
+name = "scroll container: horizontal offset shifts paint, geometry stays put"
+
+# A 120x40 scroll pane containing 300px of content, scrolled 50px right.
+# The facts pin the unscrolled layout truth (content at x=0/150, extents
+# 300x40); the probes pin the paint: content x=50..170 is visible inside
+# the pane, and the clip keeps it inside 0..120.
+
+html = "tests/visual/scroll-pane/index.html"
+css = ["tests/visual/scroll-pane/app.css"]
+
+[viewport]
+width = 200
+height = 80
+scale = 1.0
+
+[scroll]
+pane = [50, 0]
+
+[expect]
+pixels_sha256 = "b57634e9cb811bff3cbefde4f8ea90a5016227dd8f5490e085d51842a1ee87c6"
+
+[[expect.facts]]
+id = "pane"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+width = 120.0
+height = 40.0
+scroll_width = 300.0
+scroll_height = 40.0
+
+[[expect.facts]]
+id = "left"
+tag = "div"
+display = "block"
+x = 0.0
+y = 0.0
+width = 150.0
+height = 40.0
+
+[[expect.facts]]
+id = "right"
+tag = "div"
+display = "block"
+x = 150.0
+y = 0.0
+width = 150.0
+height = 40.0
+
+# View shows content x=50..170: red until content x=150, then green.
+[[expect.pixel]]
+pos = [5, 10]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [110, 10]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [5, 39]
+color = "#ef4444"
+
+# Outside the pane: page background (the clip holds).
+[[expect.pixel]]
+pos = [150, 20]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [60, 60]
+color = "#FFFFFF"

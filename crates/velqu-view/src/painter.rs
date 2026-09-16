@@ -57,6 +57,8 @@ pub(crate) fn paint_document(
         glyphs: 0,
         items: 0,
         clip: Vec::new(),
+        offset: (0.0, 0.0),
+        offset_stack: Vec::new(),
     };
 
     for item in &list.items {
@@ -92,6 +94,8 @@ pub(crate) fn paint_document(
                 ctx.draw_image(rect, image);
                 ctx.items += 1;
             }
+            DisplayItem::PushTransform { x, y } => ctx.push_transform(*x, *y),
+            DisplayItem::PopTransform => ctx.pop_transform(),
         }
     }
 
@@ -113,14 +117,43 @@ struct PaintCtx<'a> {
     /// Clip stack: the innermost (last) entry bounds every pixel. Balanced
     /// push/pop emission keeps restore semantics correct for nested scopes.
     clip: Vec<Rect>,
+    /// Current translation (accumulated scroll transforms, ADR 0008) plus
+    /// the saved offsets of enclosing scopes.
+    offset: (f32, f32),
+    offset_stack: Vec<(f32, f32)>,
 }
 
 impl PaintCtx<'_> {
+    /// Enters a transform scope: items are translated by `(x, y)` until the
+    /// matching `pop_transform`.
+    fn push_transform(&mut self, x: f32, y: f32) {
+        self.offset_stack.push(self.offset);
+        self.offset.0 += x;
+        self.offset.1 += y;
+    }
+
+    /// Leaves the innermost transform scope, restoring the enclosing
+    /// translation. Emission is balanced; a stray pop is a harmless no-op.
+    fn pop_transform(&mut self) {
+        if let Some(offset) = self.offset_stack.pop() {
+            self.offset = offset;
+        }
+    }
+
     /// Intersects the pushed rect with the running clip and scopes it.
+    /// Clip rects live in the space of the scope they are pushed in
+    /// (scroll containers clip in parent space), so the current
+    /// translation applies.
     fn push_clip(&mut self, rect: Rect) {
+        let placed = Rect {
+            x: rect.x + self.offset.0,
+            y: rect.y + self.offset.1,
+            w: rect.w,
+            h: rect.h,
+        };
         let clipped = match self.clip.last() {
-            None => rect,
-            Some(outer) => intersect(*outer, rect),
+            None => placed,
+            Some(outer) => intersect(*outer, placed),
         };
         self.clip.push(clipped);
     }
@@ -158,7 +191,11 @@ impl PaintCtx<'_> {
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        // Rects arrive already in device pixels; snap the edges only.
+        // Rects arrive in layout space; the current translation (scroll
+        // scopes) applies before edge snapping.
+        let x = x + self.offset.0;
+        let y = y + self.offset.1;
+        // Snap the edges only.
         let x0 = x.round().max(0.0) as u32;
         let y0 = y.round().max(0.0) as u32;
         let x1 = (x + w).round().clamp(0.0, self.width as f32) as u32;
@@ -176,10 +213,12 @@ impl PaintCtx<'_> {
     /// (`object-fit: fill`). Edges snap like fills; source indices come from
     /// integer math only, so sampling is deterministic across runs.
     fn draw_image(&mut self, rect: &Rect, image: &crate::image::DecodedImage) {
-        let x0 = rect.x.round().max(0.0) as i64;
-        let y0 = rect.y.round().max(0.0) as i64;
-        let x1 = (rect.x + rect.w).round().clamp(0.0, self.width as f32) as i64;
-        let y1 = (rect.y + rect.h).round().clamp(0.0, self.height as f32) as i64;
+        let x = rect.x + self.offset.0;
+        let y = rect.y + self.offset.1;
+        let x0 = x.round().max(0.0) as i64;
+        let y0 = y.round().max(0.0) as i64;
+        let x1 = (x + rect.w).round().clamp(0.0, self.width as f32) as i64;
+        let y1 = (y + rect.h).round().clamp(0.0, self.height as f32) as i64;
         let dst_w = (x1 - x0).max(1);
         let dst_h = (y1 - y0).max(1);
         let src_w = i64::from(image.width.max(1));
@@ -212,13 +251,13 @@ impl PaintCtx<'_> {
         } else {
             crate::font::FontWeight::Regular
         };
-        let mut pen_x = run.x.round();
+        let mut pen_x = run.x.round() + self.offset.0;
+        let baseline = run.baseline_y.round() + self.offset.1;
         for ch in run.text.chars() {
             let glyph = fonts.glyph(weight, ch, run.px);
             let advance = glyph.advance;
             let bitmap_left = pen_x as i64 + glyph.xmin as i64;
-            let bitmap_top =
-                run.baseline_y.round() as i64 - glyph.ymin as i64 - glyph.height as i64;
+            let bitmap_top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
             for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
                 let dy = bitmap_top + row as i64;
                 if dy < 0 || dy >= self.height as i64 {

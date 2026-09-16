@@ -1,0 +1,11 @@
+body {
+  margin: 0;
+}
+.top {
+  height: 150px;
+  background-color: #ef4444;
+}
+.bottom {
+  height: 150px;
+  background-color: #3b82f6;
+}

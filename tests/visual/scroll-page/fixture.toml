@@ -1,0 +1,54 @@
+name = "document scroll: offset 100 moves the raster, facts stay unscrolled"
+
+# The document (300px tall) is scrolled to y=100 inside a 120px viewport:
+# 50px of red remain at the top, blue fills the rest. The layout facts of
+# both blocks are the unscrolled truth and are identical to scroll 0.
+
+html = "tests/visual/scroll-page/index.html"
+css = ["tests/visual/scroll-page/app.css"]
+
+[viewport]
+width = 160
+height = 120
+scale = 1.0
+
+[scroll]
+"" = [0, 100]
+
+[expect]
+pixels_sha256 = "5687b26b70d18535be05373d70d52e4f7385fab61d964a5cdf66e2250bf2d5f5"
+
+[[expect.facts]]
+id = "top"
+tag = "div"
+display = "block"
+x = 0.0
+y = 0.0
+width = 160.0
+height = 150.0
+
+[[expect.facts]]
+id = "bottom"
+tag = "div"
+display = "block"
+x = 0.0
+y = 150.0
+width = 160.0
+height = 150.0
+
+# Page y=100..220 in view: red until page y=150, blue after.
+[[expect.pixel]]
+pos = [80, 10]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [80, 49]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [80, 51]
+color = "#3b82f6"
+
+[[expect.pixel]]
+pos = [80, 110]
+color = "#3b82f6"

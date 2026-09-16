@@ -31,6 +31,12 @@ struct Fixture {
     /// blobs in the repository.
     #[serde(default)]
     assets: BTreeMap<String, AssetSpec>,
+    /// Programmatic scroll offsets (M2c): the key is the scroll target —
+    /// the empty string is the document-level scroller, anything else an
+    /// element `id` — and the value is `[x, y]`. Offsets are runtime state:
+    /// facts stay unscrolled, only the raster moves.
+    #[serde(default)]
+    scroll: BTreeMap<String, [f32; 2]>,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +190,15 @@ fn build_view(fixture: &Fixture) -> VelquView {
             map.insert(name.clone(), encode_asset(spec));
         }
         view.set_asset_resolver(Rc::new(FixtureAssets { map }));
+    }
+    for (target, offset) in &fixture.scroll {
+        let target = if target.is_empty() {
+            None
+        } else {
+            Some(target.as_str())
+        };
+        view.set_scroll_offset(target, offset[0], offset[1])
+            .expect("fixture scroll offset is valid");
     }
     view
 }

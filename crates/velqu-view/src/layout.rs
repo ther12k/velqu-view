@@ -385,10 +385,6 @@ pub(crate) struct LaidOutDocument {
     /// Document scrollable extent (device px): `max(page content,
     /// viewport)` per axis; the scrollport is the viewport itself.
     pub document_scroll: ScrollExtent,
-    /// Clamped document-level scroll offset (the empty scroll key).
-    /// Consumed by the display-list emission in the next M2c commit.
-    #[allow(dead_code)]
-    pub root_offset: (f32, f32),
 }
 
 /// Runtime scroll offsets, keyed by scroll target: the empty key is the
@@ -466,13 +462,22 @@ pub(crate) fn layout_document(
 
     let mut list = DisplayList::default();
     emit_display_list(&root, &mut list);
+    // The document-level scroller translates the whole frame; the viewport
+    // is its scrollport, so no root clip scope is needed.
+    if document_offset_clamped != (0.0, 0.0) {
+        list.items.insert(
+            0,
+            DisplayItem::PushTransform {
+                x: -document_offset_clamped.0,
+                y: -document_offset_clamped.1,
+            },
+        );
+        list.items.push(DisplayItem::PopTransform);
+    }
     Some(LaidOutDocument {
         root,
         display_list: list,
         document_scroll,
-        // The clamped root offset rides on the output; emission wraps the
-        // frame in it.
-        root_offset: document_offset_clamped,
     })
 }
 
@@ -587,22 +592,31 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
     }
 
     // Children, scoped by this box's clip when it clips overflow. Scroll
-    // containers clip too (M2c); their `PushTransform` scope is emitted in
-    // the next commit alongside the painter's transform stack.
+    // containers (M2c) additionally translate their content by the negated
+    // clamped scroll offset: layout geometry stays unscrolled, only the
+    // paint moves.
     match style.overflow_y {
         crate::style::Overflow::Visible => {
             for child in &node.children {
                 emit_box(child, list, parent_clip);
             }
         }
-        crate::style::Overflow::Hidden
-        | crate::style::Overflow::Clip
-        | crate::style::Overflow::Auto
-        | crate::style::Overflow::Scroll => {
+        crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
             list.items.push(DisplayItem::PushClip(node.padding_box));
             for child in &node.children {
                 emit_box(child, list, Some(node.padding_box));
             }
+            list.items.push(DisplayItem::PopClip);
+        }
+        crate::style::Overflow::Auto | crate::style::Overflow::Scroll => {
+            list.items.push(DisplayItem::PushClip(node.padding_box));
+            let (ox, oy) = node.applied_scroll;
+            list.items
+                .push(DisplayItem::PushTransform { x: -ox, y: -oy });
+            for child in &node.children {
+                emit_box(child, list, Some(node.padding_box));
+            }
+            list.items.push(DisplayItem::PopTransform);
             list.items.push(DisplayItem::PopClip);
         }
     }

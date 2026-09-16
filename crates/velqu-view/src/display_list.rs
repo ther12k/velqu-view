@@ -8,9 +8,10 @@
 //!
 //! M2b items: fills, text runs, and clip scoping (`PushClip`/`PopClip`) for
 //! `overflow: hidden`/`clip` boxes. Borders are lowered to fills by layout.
-//! M2c adds `DrawImage` (replaced content, ADR 0008).
-//! `PushTransform`/`PopTransform` for scrolling will extend this list in a
-//! later milestone without disturbing the division of labor.
+//! M2c adds `DrawImage` (replaced content, ADR 0008) and
+//! `PushTransform`/`PopTransform` (scroll offsets) without disturbing the
+//! division of labor: layout geometry stays unscrolled; the transform
+//! carries only the runtime scroll offset.
 
 use std::rc::Rc;
 
@@ -49,6 +50,13 @@ pub(crate) enum DisplayItem {
     /// fill`). The pixels travel with the item so the painter stays
     /// stateless beyond its font store.
     DrawImage { rect: Rect, image: Rc<DecodedImage> },
+    /// Translates all items until the matching [`DisplayItem::PopTransform`]
+    /// by `(x, y)` device px (M2c scrolling: the negated scroll offset).
+    /// Scopes nest; clips pushed inside a transform scope are positioned in
+    /// the *parent* space, items in the translated space.
+    PushTransform { x: f32, y: f32 },
+    /// Ends the innermost transform scope.
+    PopTransform,
 }
 
 /// The paint-ready result of one layout pass.
