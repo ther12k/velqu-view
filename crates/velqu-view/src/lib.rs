@@ -57,6 +57,7 @@
 //! ```
 
 mod color;
+mod css;
 mod dom;
 mod font;
 mod html;
@@ -270,6 +271,8 @@ pub struct VelquView {
     /// Parsed DOM of the loaded document (rebuilt on every load).
     dom: dom::Dom,
     stylesheets: Vec<StylesheetSource>,
+    /// Parsed form of `stylesheets`, kept index-aligned.
+    parsed_css: Vec<css::Stylesheet>,
     next_auto_sheet: u32,
     frame_index: u64,
     fonts: FontStore,
@@ -303,6 +306,7 @@ impl VelquView {
             document: None,
             dom: dom::Dom::empty(),
             stylesheets: Vec::new(),
+            parsed_css: Vec::new(),
             next_auto_sheet: 0,
             frame_index: 0,
             fonts: FontStore::bundled(),
@@ -382,7 +386,38 @@ impl VelquView {
             Some(existing) => *existing = source,
             None => self.stylesheets.push(source),
         }
+        self.rebuild_css();
         Ok(())
+    }
+
+    /// Re-parses every stylesheet source (cssparser is fast; sheets are
+    /// small). Rule `order` values stay globally consistent across sheets.
+    fn rebuild_css(&mut self) {
+        let mut order = 0;
+        self.parsed_css = self
+            .stylesheets
+            .iter()
+            .map(|sheet| {
+                let parsed = css::parse(sheet, order);
+                order += parsed.rules.len() as u32;
+                parsed
+            })
+            .collect();
+    }
+
+    /// Diagnostics from parsing all loaded stylesheets (deterministic, in
+    /// source order) — the base the M3 checker and Lab console build on.
+    pub fn css_diagnostics(&self) -> Vec<String> {
+        self.parsed_css
+            .iter()
+            .flat_map(|sheet| {
+                let source = sheet.source.as_str().to_owned();
+                sheet
+                    .diagnostics
+                    .iter()
+                    .map(move |d| format!("{source}: {d}"))
+            })
+            .collect()
     }
 
     /// The loaded HTML source text, if any.

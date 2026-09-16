@@ -32,6 +32,7 @@ velqu-shell = { path = "crates/velqu-shell" }
 fontdue = { version = "0.9", default-features = false, features = ["std"] }
 png = "0.17"
 html5ever = "0.40"
+cssparser = "0.38"
 winit = "0.30"
 softbuffer = "0.4"
 
