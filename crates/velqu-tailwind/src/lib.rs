@@ -21,6 +21,11 @@
 
 use std::fmt;
 
+mod compile;
+mod palette;
+
+pub use compile::{TailwindBuild, UtilityDiagnostic, compile_utilities};
+
 /// How a CSS concept relates to the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compatibility {
