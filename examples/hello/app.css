@@ -1,0 +1,8 @@
+/* Plain CSS within the Velqu CSS Profile.
+ * In M1 this file proves CSS ingestion into the renderer inputs; the probe
+ * scene reports its size. Real styling begins with the M2 renderer.
+ */
+body {
+  background-color: #020617;
+  color: #f1f5f9;
+}

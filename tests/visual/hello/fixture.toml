@@ -1,0 +1,36 @@
+# M1 visual fixture: deterministic paint probe over the `hello` example.
+# Rendered by crates/velqu-view/tests/visual_fixtures.rs (no display needed).
+name = "hello"
+html = "examples/hello/index.html"
+css = ["examples/hello/app.css"]
+viewport = { width = 800, height = 600, scale = 1.0 }
+
+[expect]
+# SHA-256 of the RGBA buffer; regenerate with
+#   cargo run -p velqu-lab -- --headless --size 800x600 examples/hello
+pixels_sha256 = "9f59e9fc1027924ff53a8135c84867c211ebd3afcb562be89aca2673d21c5345"
+
+# Exact-color probes in device pixels (swatch centers, background corner).
+[[expect.pixel]]
+pos = [32, 32]
+color = "#10141C"
+
+[[expect.pixel]]
+pos = [44, 144]
+color = "#EF4444"
+
+[[expect.pixel]]
+pos = [76, 144]
+color = "#22C55E"
+
+[[expect.pixel]]
+pos = [108, 144]
+color = "#3B82F6"
+
+[[expect.pixel]]
+pos = [140, 144]
+color = "#F59E0B"
+
+[[expect.pixel]]
+pos = [172, 144]
+color = "#8B5CF6"

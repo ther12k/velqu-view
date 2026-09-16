@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Velqu Reactive Counter</title>
+</head>
+<body class="min-h-screen bg-zinc-950 p-8 text-zinc-100">
+  <main
+    vx-state="{ count: 0 }"
+    class="mx-auto max-w-md rounded-xl border border-zinc-800 p-6"
+  >
+    <h1 class="text-xl font-semibold">Counter</h1>
+
+    <div class="mt-6 flex items-center gap-4">
+      <button @click="count--" class="rounded-md border border-zinc-700 px-3 py-2">-</button>
+      <span class="min-w-12 text-center text-2xl" vx-text="count"></span>
+      <button @click="count++" class="rounded-md bg-blue-600 px-3 py-2 font-medium">+</button>
+    </div>
+  </main>
+</body>
+</html>

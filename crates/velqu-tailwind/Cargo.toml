@@ -1,0 +1,12 @@
+[package]
+name = "velqu-tailwind"
+description = "Velqu Tailwind/CSS compatibility profile: the machine-readable v0 property manifest and classification (checker prototype lands in M3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+# M1 visual fixture: same document as `hello`, rendered at 2x DPI.
+# Proves logical geometry scales with the viewport's scale factor:
+# swatch centers land at exactly 2x the 1x coordinates.
+name = "hello-2x"
+html = "examples/hello/index.html"
+css = ["examples/hello/app.css"]
+viewport = { width = 1600, height = 1200, scale = 2.0 }
+
+[expect]
+pixels_sha256 = "a8e904435977e1c2bd9edb416cc18ffecaa69fa9e2f97b50e4cf81ad03dbffe5"
+
+[[expect.pixel]]
+pos = [64, 64]
+color = "#10141C"
+
+[[expect.pixel]]
+pos = [88, 288]
+color = "#EF4444"
+
+[[expect.pixel]]
+pos = [344, 288]
+color = "#8B5CF6"

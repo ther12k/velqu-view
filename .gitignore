@@ -1,0 +1,14 @@
+# Build artifacts.
+/target
+
+# Spec bundle input (kept locally, not part of the repository).
+/okf-bundle/
+/velqu-view-okf-bundle.zip
+
+# Fixture outputs are regenerated; committed baselines live next to fixtures.
+/tests/visual/**/out/
+/examples/**/out/
+
+# Editor/OS noise.
+*.swp
+.DS_Store

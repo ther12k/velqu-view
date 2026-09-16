@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/velqu-view",
+    "crates/velqu-reactive",
+    "crates/velqu-tailwind",
+    "crates/velqu-shell",
+    "apps/velqu-lab",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ther12k/velqu-view"
+publish = false
+
+[workspace.dependencies]
+# Internal crates.
+velqu-view = { path = "crates/velqu-view" }
+velqu-reactive = { path = "crates/velqu-reactive" }
+velqu-tailwind = { path = "crates/velqu-tailwind" }
+velqu-shell = { path = "crates/velqu-shell" }
+
+# Rendering / windowing.
+# fontdue: scalar path only (`simd` default-feature is x86-gated and could
+# rasterize differently on other architectures, breaking fixture hashes).
+fontdue = { version = "0.9", default-features = false, features = ["std"] }
+png = "0.17"
+winit = "0.30"
+softbuffer = "0.4"
+
+# Tooling / fixtures.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+sha2 = "0.10"
+
+[workspace.lints.rust]
+# Renderer internals must stay safe; any future unsafe block requires its own
+# ADR isolating and documenting it (see docs/decisions).
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+# Deterministic, debuggable release builds for benchmark evidence runs.
+debug = "line-tables-only"

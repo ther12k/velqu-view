@@ -1,0 +1,3 @@
+# Formatting is stock rustfmt; the only pinned knob is line width so that
+# `cargo fmt --check` stays stable across contributor machines.
+max_width = 100
