@@ -66,15 +66,16 @@ Taffy (`BorderBox`), defaulting to `ContentBox` exactly as before.
 Without the pipeline nothing changes; with it, `w-64 p-4` is a 256px
 border box, as Tailwind authors expect.
 
-### 4. Diagnostics are the checker, in-process
+### 4. Diagnostics are the checker, in-process and standalone
 
 Every class the compiler cannot map is reported through
 `VelquView::tailwind_diagnostics()` (and printed by `velqu-lab
 --tailwind`). The profile classification API (ADR 0004's
-`classify_declaration`/`classify_at_rule`) remains the standalone check
-layer; a standalone `velqu css check` CLI on top of it is deferred — the
-in-pipeline diagnostics already give authors the same verdicts where
-they act on them.
+`classify_declaration`/`classify_at_rule`) also drives the standalone
+`velqu-css-check` CLI (added in the phase-1 review round): it parses CSS
+files or stdin, prints per-construct verdicts with source lines and
+suggestions, and exits non-zero when anything is unsupported so it can
+gate builds. `@media` contents are checked too — they render.
 
 ### 5. SVG icon strategy (recorded, deferred)
 
@@ -83,6 +84,20 @@ v0 and are diagnosed as unknown/unsupported markup. Icons for v0 are
 raster assets through the existing bounded `<img>` path (PNG/JPEG from
 the host resolver, ADR 0008). A native SVG icon path remains open for a
 later milestone if dashboards demand it.
+
+### 6. Rounded corners are painted (review-round addition)
+
+`border-radius` had been computed since M2a but rasterized square. The
+phase-1 review round added rounded coverage to the painter:
+`RoundedFill` for backgrounds, `RoundedBorder` (a ring between the
+rounded border box and the rounded padding box, inner corner radii
+shrunk by the adjacent border widths), and `PushClipRounded` (overflow
+clipping follows the shape). Coverage is a strict per-pixel in/out test
+on pixel centers — no anti-aliasing, deterministic by construction.
+Zero-radius boxes keep the original square paths byte-identically;
+`tailwind-hello`'s hash migrated with a documented note, and a
+dedicated `rounded` fixture pins a stadium fill, a border ring, and a
+rounded clip with corner-math probes.
 
 ## Consequences
 
@@ -97,7 +112,6 @@ later milestone if dashboards demand it.
   output through the profile checker) remains the upgrade path; the
   renderer side needs no changes for it — only a better compiler behind
   the same seam.
-* Rounded corners are computed but not yet painted (radius values land
-  in ComputedStyle; rasterization of rounded rects is future work) —
-  utilities compile and documents lay out correctly; corners render
-  square. Recorded as a known visual limitation, not a profile gap.
+* Rounded corners are painted (review round, §6): fills, border rings,
+  and rounded overflow clips rasterize with deterministic per-pixel
+  coverage; square paths are byte-identical to before.
