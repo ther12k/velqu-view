@@ -1,0 +1,58 @@
+name = "flex image: intrinsic main size, stretched cross size"
+
+html = "tests/visual/image-flex/index.html"
+
+css = ["tests/visual/image-flex/app.css"]
+
+[viewport]
+width = 320
+height = 120
+scale = 1.0
+
+[assets."red.png"]
+format = "png"
+width = 40
+height = 20
+color = "#ef4444"
+
+[expect]
+pixels_sha256 = "b6a56760e969a30c81f533faa38d7eae55ffceaa285579d96927e956769dc325"
+
+[[expect.facts]]
+id = "row"
+tag = "div"
+display = "flex"
+x = 0.0
+y = 0.0
+width = 200.0
+height = 30.0
+
+[[expect.facts]]
+id = "pic"
+tag = "img"
+display = "block"
+x = 0.0
+y = 0.0
+width = 40.0
+height = 30.0
+
+[[expect.facts]]
+id = "grow"
+tag = "div"
+display = "block"
+x = 40.0
+y = 0.0
+width = 160.0
+height = 30.0
+
+[[expect.pixel]]
+pos = [20, 15]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [100, 15]
+color = "#22c55e"
+
+[[expect.pixel]]
+pos = [250, 15]
+color = "#FFFFFF"

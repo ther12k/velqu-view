@@ -450,6 +450,16 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
         }
     }
 
+    // Replaced content (M2c): the decoded image paints into the content box
+    // (object-fit: fill). A broken/missing image paints nothing; its layout
+    // footprint remains and the failure is reported via diagnostics.
+    if let Some(image) = &node.replaced {
+        list.items.push(DisplayItem::DrawImage {
+            rect: node.content,
+            image: std::rc::Rc::clone(image),
+        });
+    }
+
     // Inline content: anchored at the box's text origin (content origin,
     // or the anonymous words node when the backend created one).
     let (origin_x, origin_y) = match node.text_origin {

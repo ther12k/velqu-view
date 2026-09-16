@@ -1,0 +1,32 @@
+name = "broken image: default object size footprint, nothing painted"
+
+# No [assets] table: the reference resolves to nothing (null host), so the
+# image renders as broken — a 300x150 layout footprint with no pixels.
+
+html = "tests/visual/image-broken/index.html"
+
+[viewport]
+width = 400
+height = 240
+scale = 1.0
+
+[expect]
+pixels_sha256 = "857891706b1698637cb83d2e7a6e005c5af26909187cc1426195a088fd1e2561"
+
+[[expect.facts]]
+id = "i"
+tag = "img"
+display = "block"
+x = 8.0
+y = 8.0
+width = 300.0
+height = 150.0
+
+# Nothing painted inside the footprint: still the white page background.
+[[expect.pixel]]
+pos = [100, 50]
+color = "#FFFFFF"
+
+[[expect.pixel]]
+pos = [300, 150]
+color = "#FFFFFF"

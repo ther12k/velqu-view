@@ -1,0 +1,12 @@
+body {
+  margin: 0;
+}
+.row {
+  display: flex;
+  width: 200px;
+  height: 30px;
+}
+.grow {
+  flex-grow: 1;
+  background-color: #22c55e;
+}

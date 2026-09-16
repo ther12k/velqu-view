@@ -10,7 +10,9 @@
 //!
 //! See `tests/README.md` for the fixture schema.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use serde::Deserialize;
 use velqu_view::{Color, LayoutFacts, VelquView, Viewport};
@@ -24,6 +26,55 @@ struct Fixture {
     css: Vec<PathBuf>,
     viewport: ViewportSpec,
     expect: Expect,
+    /// Synthetic image assets: `<img src="KEY">` resolves to a solid-color
+    /// PNG/JPEG generated at test time. Deterministic bytes, no binary
+    /// blobs in the repository.
+    #[serde(default)]
+    assets: BTreeMap<String, AssetSpec>,
+}
+
+#[derive(Deserialize)]
+struct AssetSpec {
+    /// "png" or "jpeg" (the M2c-supported formats).
+    format: String,
+    width: u32,
+    height: u32,
+    color: String,
+}
+
+fn encode_asset(spec: &AssetSpec) -> Vec<u8> {
+    let color = Color::from_hex(&spec.color).unwrap_or_else(|e| panic!("asset color: {e}"));
+    let img = image::RgbaImage::from_pixel(
+        spec.width,
+        spec.height,
+        image::Rgba([color.r, color.g, color.b, color.a]),
+    );
+    let mut out = std::io::Cursor::new(Vec::new());
+    match spec.format.as_str() {
+        "png" => img
+            .write_to(&mut out, image::ImageFormat::Png)
+            .expect("png asset encodes"),
+        "jpeg" | "jpg" => image::DynamicImage::ImageRgba8(img)
+            .to_rgb8()
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .expect("jpeg asset encodes"),
+        other => panic!("unsupported asset format {other:?}"),
+    }
+    out.into_inner()
+}
+
+/// Serves fixture-declared assets to the renderer's `<img src>` requests.
+struct FixtureAssets {
+    map: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl velqu_view::AssetResolver for FixtureAssets {
+    fn resolve(&self, request: velqu_view::AssetRequest<'_>) -> Option<velqu_view::Asset> {
+        self.map.get(request.path).map(|bytes| velqu_view::Asset {
+            id: velqu_view::SourceId::new(request.path),
+            bytes: bytes.clone(),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -122,6 +173,13 @@ fn build_view(fixture: &Fixture) -> VelquView {
         ))
         .expect("fixture css loads");
     }
+    if !fixture.assets.is_empty() {
+        let mut map = std::collections::HashMap::new();
+        for (name, spec) in &fixture.assets {
+            map.insert(name.clone(), encode_asset(spec));
+        }
+        view.set_asset_resolver(Rc::new(FixtureAssets { map }));
+    }
     view
 }
 
@@ -212,10 +270,15 @@ fn run_fixture(dir: &Path) {
 
     let actual_hash = result.frame.sha256_hex();
     match fixture.expect.pixels_sha256.as_deref() {
-        Some("PENDING") | None => panic!(
-            "{}: fixture has no baseline hash; set pixels_sha256 = {actual_hash}",
-            dir.display()
-        ),
+        Some("PENDING") | None => {
+            // Regenerate the human-checkable reference while the hash is
+            // still pending, then fail with the digest to pin.
+            let _ = result.frame.save_png(&dir.join("baseline.png"));
+            panic!(
+                "{}: fixture has no baseline hash; set pixels_sha256 = {actual_hash}",
+                dir.display()
+            );
+        }
         Some(expected) => assert_eq!(
             expected,
             actual_hash,

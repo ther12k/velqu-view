@@ -88,6 +88,10 @@ pub(crate) fn paint_document(
             }
             DisplayItem::PushClip(rect) => ctx.push_clip(*rect),
             DisplayItem::PopClip => ctx.pop_clip(),
+            DisplayItem::DrawImage { rect, image } => {
+                ctx.draw_image(rect, image);
+                ctx.items += 1;
+            }
         }
     }
 
@@ -163,6 +167,37 @@ impl PaintCtx<'_> {
                 if self.clip_contains(px as i64, py as i64) {
                     self.blend_pixel(px as usize, py as usize, color);
                 }
+            }
+        }
+    }
+
+    /// Blits a decoded image into `rect` with nearest-neighbor sampling
+    /// (`object-fit: fill`). Edges snap like fills; source indices come from
+    /// integer math only, so sampling is deterministic across runs.
+    fn draw_image(&mut self, rect: &Rect, image: &crate::image::DecodedImage) {
+        let x0 = rect.x.round().max(0.0) as i64;
+        let y0 = rect.y.round().max(0.0) as i64;
+        let x1 = (rect.x + rect.w).round().clamp(0.0, self.width as f32) as i64;
+        let y1 = (rect.y + rect.h).round().clamp(0.0, self.height as f32) as i64;
+        let dst_w = (x1 - x0).max(1);
+        let dst_h = (y1 - y0).max(1);
+        let src_w = i64::from(image.width.max(1));
+        let src_h = i64::from(image.height.max(1));
+        for dy in y0..y1 {
+            let sy = ((dy - y0) * src_h / dst_h) as usize;
+            for dx in x0..x1 {
+                if !self.clip_contains(dx, dy) {
+                    continue;
+                }
+                let sx = ((dx - x0) * src_w / dst_w) as usize;
+                let i = (sy * src_w as usize + sx) * 4;
+                let color = Color::from_rgba8(
+                    image.rgba[i],
+                    image.rgba[i + 1],
+                    image.rgba[i + 2],
+                    image.rgba[i + 3],
+                );
+                self.blend_pixel(dx as usize, dy as usize, color);
             }
         }
     }

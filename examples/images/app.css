@@ -1,0 +1,28 @@
+body {
+  margin: 16px;
+  background-color: #10141c;
+}
+h1 {
+  color: #e2e8f0;
+  font-size: 24px;
+}
+.logo {
+  width: 80px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+.badge {
+  width: 48px;
+}
+.caption {
+  color: #94a3b8;
+  flex-grow: 1;
+}
+.wide {
+  margin-top: 12px;
+  width: 200px;
+}

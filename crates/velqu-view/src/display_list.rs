@@ -8,10 +8,14 @@
 //!
 //! M2b items: fills, text runs, and clip scoping (`PushClip`/`PopClip`) for
 //! `overflow: hidden`/`clip` boxes. Borders are lowered to fills by layout.
+//! M2c adds `DrawImage` (replaced content, ADR 0008).
 //! `PushTransform`/`PopTransform` for scrolling will extend this list in a
 //! later milestone without disturbing the division of labor.
 
+use std::rc::Rc;
+
 use crate::color::Color;
+use crate::image::DecodedImage;
 
 /// A device-pixel rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -41,6 +45,10 @@ pub(crate) enum DisplayItem {
     PushClip(Rect),
     /// Ends the innermost clip scope.
     PopClip,
+    /// Blits a decoded image into `rect` (nearest-neighbor, `object-fit:
+    /// fill`). The pixels travel with the item so the painter stays
+    /// stateless beyond its font store.
+    DrawImage { rect: Rect, image: Rc<DecodedImage> },
 }
 
 /// The paint-ready result of one layout pass.

@@ -226,6 +226,9 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
         "frame 1: {} items, {} glyphs",
         first.stats.items, first.stats.glyphs
     );
+    for message in view.image_diagnostics() {
+        println!("image diagnostic: {message}");
+    }
     println!("sha256: {}", hashes[0]);
     if args.frames > 1 {
         println!("determinism: {identical}/{} frames identical", args.frames);

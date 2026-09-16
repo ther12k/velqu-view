@@ -22,8 +22,18 @@ html = "examples/hello/index.html"     # relative to the repository root
 css  = ["examples/hello/app.css"]
 viewport = { width = 800, height = 600, scale = 1.0 }
 
+# Optional: synthetic image assets for <img src> (M2c). The key is the src
+# reference exactly as written in the HTML; bytes are generated at test time
+# (deterministic; no binary blobs in the repository).
+[assets."red.png"]
+format = "png"                         # png | jpeg
+width = 40
+height = 20
+color = "#ef4444"
+
 [expect]
-pixels_sha256 = "…"        # exact digest of the RGBA buffer
+pixels_sha256 = "…"        # exact digest of the RGBA buffer ("PENDING"
+                           # regenerates baseline.png and fails with the digest)
 
 [[expect.pixel]]           # exact-color probes in device pixels
 pos = [44, 144]
@@ -33,5 +43,7 @@ color = "#EF4444"
 - Deterministic by construction: bundled fonts, scalar rasterizer, no
   timings/counters in pixel output.
 - `baseline.png` next to a fixture is the human-checkable reference
-  (regenerate with `velqu-lab --headless`).
+  (regenerate by setting `pixels_sha256 = "PENDING"` and running the suite).
 - M2 adds `layout_facts` (expected geometry) to this schema.
+- M2c adds image facts (replaced elements size by intrinsic ratio; broken
+  images keep a 300×150 footprint and paint nothing).

@@ -1,0 +1,48 @@
+name = "block image: intrinsic sizing, CSS width with ratio height"
+
+html = "tests/visual/image-block/index.html"
+
+[viewport]
+width = 320
+height = 200
+scale = 1.0
+
+# Served to <img src="red.png">: a deterministic 40x20 solid PNG.
+[assets."red.png"]
+format = "png"
+width = 40
+height = 20
+color = "#ef4444"
+
+[expect]
+pixels_sha256 = "5469e4d00864d77dd7f099f65b3c79e0026f63d4838efc58c3304ce031a00a4d"
+
+[[expect.facts]]
+id = "a"
+tag = "img"
+display = "block"
+x = 8.0
+y = 8.0
+width = 40.0
+height = 20.0
+
+[[expect.facts]]
+id = "b"
+tag = "img"
+display = "block"
+x = 8.0
+y = 28.0
+width = 60.0
+height = 30.0
+
+[[expect.pixel]]
+pos = [10, 10]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [30, 40]
+color = "#ef4444"
+
+[[expect.pixel]]
+pos = [200, 150]
+color = "#FFFFFF"
