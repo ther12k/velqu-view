@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use cssparser::{Parser, ToCss, Token};
+use cssparser::{Parser, Token};
 
 use crate::source::StylesheetSource;
 
@@ -420,93 +420,48 @@ fn skip_until_semicolon(input: &mut Parser<'_>) {
     }
 }
 
-/// Appends `serialized` to `value`, inserting a single space when the
-/// previous token wanted a separator (never right after an open bracket).
-fn write_serialized(value: &mut String, pending_space: &mut bool, serialized: &str) {
-    let last = value.chars().last();
-    if !value.is_empty() && *pending_space && last != Some('(') {
-        value.push(' ');
-    }
-    value.push_str(serialized);
-    *pending_space = false;
-}
-
-/// Reads declaration value tokens up to the terminating semicolon,
-/// serializing them with minimal separators. Function/bracket blocks are
-/// consumed recursively so their contents are included. Returns the value
-/// and whether `!important` was present.
+/// Reads one declaration value as the **raw source text** between the
+/// colon and the terminating semicolon. Token re-serialization was tried
+/// and is subtly wrong for nested function blocks (`repeat(2, minmax(…))`
+/// loses closing parens); the raw slice is byte-exact and is what the
+/// downstream value parsers (colors, lengths, grid tracks) expect. Returns
+/// the value and whether `!important` was present.
 fn read_value(input: &mut Parser<'_>) -> (String, bool) {
-    let mut value = String::new();
-    let mut pending_space = false;
+    let start = input.position();
+    let mut end = start;
     let mut important = false;
-
-    while let Ok(token) = input.next_including_whitespace() {
-        match token {
-            Token::Comment(_) => {}
-            Token::WhiteSpace(_) => pending_space = true,
-            Token::Semicolon => break,
-            Token::Delim(bang) if *bang == '!' => {
+    loop {
+        match input.next_including_whitespace() {
+            Err(_) => break,
+            Ok(Token::Semicolon) => break,
+            Ok(Token::Delim(bang)) if *bang == '!' => {
                 // !important (or an invalid bang; either way the value ends).
                 input.skip_whitespace();
                 important = matches!(
                     input.next(),
                     Ok(Token::Ident(name)) if name.eq_ignore_ascii_case("important")
                 );
-                if !important {
-                    break;
-                }
-                // Consume any trailing tokens up to the semicolon.
-                continue;
+                break;
             }
-            Token::Function(_)
-            | Token::ParenthesisBlock
-            | Token::SquareBracketBlock
-            | Token::CurlyBracketBlock => {
-                let close = match token {
-                    Token::SquareBracketBlock => ']',
-                    Token::CurlyBracketBlock => '}',
-                    _ => ')',
-                };
-                // The token itself serializes as the opening part only
-                // ("rgb(", "("); its contents are the nested block.
-                let open = token.to_css_string();
-                write_serialized(&mut value, &mut pending_space, &open);
-                let nested =
-                    input.parse_nested_block::<_, (), cssparser::BasicParseError>(|nested| {
-                        loop {
-                            match nested.next_including_whitespace() {
-                                Err(_) => break,
-                                Ok(Token::Comment(_)) => {}
-                                Ok(Token::WhiteSpace(_)) => pending_space = true,
-                                Ok(Token::CloseParenthesis)
-                                | Ok(Token::CloseSquareBracket)
-                                | Ok(Token::CloseCurlyBracket) => {
-                                    value.push(close);
-                                    pending_space = false;
-                                }
-                                Ok(other) => {
-                                    let serialized = other.to_css_string();
-                                    write_serialized(&mut value, &mut pending_space, &serialized);
-                                }
-                            }
-                        }
-                        Ok(())
-                    });
-                let _ = nested;
-                // parse_nested_block consumed everything up to the block's
-                // end; emit the closing bracket if the stream didn't.
-                if !value.ends_with(close) {
-                    value.push(close);
-                }
-                pending_space = false;
+            Ok(Token::Function(_))
+            | Ok(Token::ParenthesisBlock)
+            | Ok(Token::SquareBracketBlock)
+            | Ok(Token::CurlyBracketBlock) => {
+                // Consume the balanced block (cssparser does not descend
+                // into blocks on its own); the raw slice then spans it,
+                // closing paren included.
+                let consumed =
+                    input.parse_nested_block::<_, (), cssparser::BasicParseError>(|_| Ok(()));
+                let _ = consumed;
+                end = input.position();
             }
-            other => {
-                let serialized = other.to_css_string();
-                write_serialized(&mut value, &mut pending_space, &serialized);
-            }
+            // Whitespace separates tokens; the value text ends after the
+            // last non-whitespace token.
+            Ok(Token::WhiteSpace(_)) => {}
+            Ok(_) => end = input.position(),
         }
     }
-    (value, important)
+    (input.slice(start..end).trim().to_owned(), important)
 }
 
 // -- internals shared with the cascade/inline-style path ---------------------

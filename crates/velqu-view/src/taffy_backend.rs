@@ -22,8 +22,12 @@ use std::collections::HashMap;
 
 use taffy::geometry::{Point as TaffyPoint, Rect as TaffyRect};
 use taffy::style::{
-    BoxSizing, Dimension as TaffyDimension, LengthPercentage, LengthPercentageAuto,
+    BoxSizing, CheapCloneStr, Dimension as TaffyDimension, GridAutoFlow as TaffyGridFlow,
+    GridPlacement as TaffyPlacement, GridTemplateComponent, GridTemplateRepetition,
+    LengthPercentage, LengthPercentageAuto, MaxTrackSizingFunction, MinTrackSizingFunction,
+    RepetitionCount, TrackSizingFunction,
 };
+use taffy::style_helpers::TaffyAuto;
 use taffy::tree::NodeId as TaffyId;
 use taffy::tree::{LayoutInput, LayoutOutput, RunMode};
 use taffy::{AvailableSpace, Size as TaffySize, Style as TaffyStyle, TaffyTree};
@@ -32,8 +36,8 @@ use crate::display_list::Rect;
 use crate::font::FontStore;
 use crate::layout::{BoxNode, LaidLine, RunBox, TextOrigin};
 use crate::style::{
-    AlignItems, AlignSelf, ComputedStyle, Display, JustifyContent, Length, LineHeight, Overflow,
-    Sides, TextAlign,
+    AlignItems, AlignSelf, ComputedStyle, Display, GridAutoFlow, GridLine, GridTrack, GridTrackMax,
+    GridTrackMin, JustifyContent, Length, LineHeight, Overflow, Sides, TextAlign,
 };
 use crate::viewport::Viewport;
 
@@ -193,6 +197,7 @@ fn map_style(
     let display: taffy::style::Display = match style.display {
         Display::None => taffy::style::Display::None,
         Display::Flex => taffy::style::Display::Flex,
+        Display::Grid => taffy::style::Display::Grid,
         Display::Inline | Display::Block => {
             if is_page_root {
                 taffy::style::Display::FlowRoot
@@ -202,23 +207,10 @@ fn map_style(
         }
     };
 
-    let align_items = match style.align_items {
-        // Baseline is deferred (ADR 0007): diagnosed at parse time, laid
-        // out as flex-start.
-        AlignItems::Baseline => Some(taffy::style::AlignItems::FLEX_START),
-        AlignItems::Stretch => Some(taffy::style::AlignItems::STRETCH),
-        AlignItems::FlexStart => Some(taffy::style::AlignItems::FLEX_START),
-        AlignItems::Center => Some(taffy::style::AlignItems::CENTER),
-        AlignItems::FlexEnd => Some(taffy::style::AlignItems::FLEX_END),
-    };
-    let align_self = match style.align_self {
-        AlignSelf::Auto => None,
-        AlignSelf::Baseline => Some(taffy::style::AlignSelf::FLEX_START),
-        AlignSelf::Stretch => Some(taffy::style::AlignSelf::STRETCH),
-        AlignSelf::FlexStart => Some(taffy::style::AlignSelf::FLEX_START),
-        AlignSelf::Center => Some(taffy::style::AlignSelf::CENTER),
-        AlignSelf::FlexEnd => Some(taffy::style::AlignSelf::FLEX_END),
-    };
+    let align_items = map_align_items(style.align_items);
+    let align_self = map_align_self(style.align_self);
+    let justify_items = map_align_items(style.justify_items);
+    let justify_self = map_align_self(style.justify_self);
 
     let length = |len: Length| length_percentage(len, scale);
     let length_auto = |len: Length| length_percentage_auto(len, scale);
@@ -299,6 +291,22 @@ fn map_style(
         },
         align_items,
         align_self,
+        justify_items,
+        justify_self,
+        grid_template_columns: map_tracks(&style.grid_template_columns, scale),
+        grid_template_rows: map_tracks(&style.grid_template_rows, scale),
+        grid_column: taffy::geometry::Line {
+            start: map_grid_line(style.grid_column.start),
+            end: map_grid_line(style.grid_column.end),
+        },
+        grid_row: taffy::geometry::Line {
+            start: map_grid_line(style.grid_row.start),
+            end: map_grid_line(style.grid_row.end),
+        },
+        grid_auto_flow: match style.grid_auto_flow {
+            GridAutoFlow::Row => TaffyGridFlow::Row,
+            GridAutoFlow::Column => TaffyGridFlow::Column,
+        },
         gap: TaffySize {
             width: style
                 .column_gap
@@ -310,6 +318,111 @@ fn map_style(
                 .unwrap_or(LengthPercentage::length(0.0)),
         },
         ..TaffyStyle::default()
+    }
+}
+
+// -- grid profile mapping (M2c) -------------------------------------------------
+
+fn map_align_items(align: AlignItems) -> Option<taffy::style::AlignItems> {
+    // Baseline is deferred (ADR 0007/0008): diagnosed at parse time, laid
+    // out as flex-start.
+    match align {
+        AlignItems::Baseline => Some(taffy::style::AlignItems::FLEX_START),
+        AlignItems::Stretch => Some(taffy::style::AlignItems::STRETCH),
+        AlignItems::FlexStart => Some(taffy::style::AlignItems::FLEX_START),
+        AlignItems::Center => Some(taffy::style::AlignItems::CENTER),
+        AlignItems::FlexEnd => Some(taffy::style::AlignItems::FLEX_END),
+    }
+}
+
+fn map_align_self(align: AlignSelf) -> Option<taffy::style::AlignSelf> {
+    match align {
+        AlignSelf::Auto => None,
+        AlignSelf::Baseline => Some(taffy::style::AlignSelf::FLEX_START),
+        AlignSelf::Stretch => Some(taffy::style::AlignSelf::STRETCH),
+        AlignSelf::FlexStart => Some(taffy::style::AlignSelf::FLEX_START),
+        AlignSelf::Center => Some(taffy::style::AlignSelf::CENTER),
+        AlignSelf::FlexEnd => Some(taffy::style::AlignSelf::FLEX_END),
+    }
+}
+
+/// Maps a frozen-profile track list onto Taffy track sizing functions. `S`
+/// is inferred at the assignment site (Taffy's default cheap string type is
+/// crate-private).
+fn map_tracks<S: CheapCloneStr>(tracks: &[GridTrack], scale: f32) -> Vec<GridTemplateComponent<S>> {
+    tracks.iter().map(|track| map_track(track, scale)).collect()
+}
+
+fn map_track<S: CheapCloneStr>(track: &GridTrack, scale: f32) -> GridTemplateComponent<S> {
+    match track {
+        GridTrack::Px(v) => GridTemplateComponent::Single(fixed_track(*v, scale)),
+        GridTrack::Percent(p) => GridTemplateComponent::Single(taffy::style_helpers::minmax(
+            MinTrackSizingFunction::percent(*p / 100.0),
+            MaxTrackSizingFunction::percent(*p / 100.0),
+        )),
+        // `1fr` == `minmax(auto, 1fr)` per CSS.
+        GridTrack::Fr(f) => GridTemplateComponent::Single(taffy::style_helpers::minmax(
+            MinTrackSizingFunction::AUTO,
+            MaxTrackSizingFunction::fr(*f),
+        )),
+        GridTrack::Auto => GridTemplateComponent::Single(taffy::style_helpers::minmax(
+            MinTrackSizingFunction::AUTO,
+            MaxTrackSizingFunction::AUTO,
+        )),
+        GridTrack::MinMax(min, max) => GridTemplateComponent::Single(taffy::style_helpers::minmax(
+            map_track_min(min, scale),
+            map_track_max(max, scale),
+        )),
+        GridTrack::Repeat { count, tracks } => {
+            GridTemplateComponent::Repeat(GridTemplateRepetition {
+                count: RepetitionCount::Count(*count),
+                tracks: tracks
+                    .iter()
+                    .map(|inner| match map_track::<S>(inner, scale) {
+                        GridTemplateComponent::Single(function) => function,
+                        // The parser rejects nested repeats; this arm is a
+                        // defensive fallback only.
+                        GridTemplateComponent::Repeat(_) => taffy::style_helpers::minmax(
+                            MinTrackSizingFunction::AUTO,
+                            MaxTrackSizingFunction::AUTO,
+                        ),
+                    })
+                    .collect(),
+                line_names: Vec::new(),
+            })
+        }
+    }
+}
+
+fn fixed_track(v: f32, scale: f32) -> TrackSizingFunction {
+    taffy::style_helpers::minmax(
+        MinTrackSizingFunction::length(v * scale),
+        MaxTrackSizingFunction::length(v * scale),
+    )
+}
+
+fn map_track_min(min: &GridTrackMin, scale: f32) -> MinTrackSizingFunction {
+    match min {
+        GridTrackMin::Px(v) => MinTrackSizingFunction::length(*v * scale),
+        GridTrackMin::Percent(p) => MinTrackSizingFunction::percent(*p / 100.0),
+        GridTrackMin::Auto => MinTrackSizingFunction::AUTO,
+    }
+}
+
+fn map_track_max(max: &GridTrackMax, scale: f32) -> MaxTrackSizingFunction {
+    match max {
+        GridTrackMax::Px(v) => MaxTrackSizingFunction::length(*v * scale),
+        GridTrackMax::Percent(p) => MaxTrackSizingFunction::percent(*p / 100.0),
+        GridTrackMax::Fr(f) => MaxTrackSizingFunction::fr(*f),
+        GridTrackMax::Auto => MaxTrackSizingFunction::AUTO,
+    }
+}
+
+fn map_grid_line(line: GridLine) -> TaffyPlacement {
+    match line {
+        GridLine::Auto => TaffyPlacement::Auto,
+        GridLine::Index(i) => TaffyPlacement::Line(i.into()),
+        GridLine::Span(n) => TaffyPlacement::Span(n),
     }
 }
 

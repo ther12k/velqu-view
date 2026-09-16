@@ -54,6 +54,8 @@ pub(crate) enum Display {
     Inline,
     /// M2b: children laid out with the flex algorithm (Taffy-backed).
     Flex,
+    /// M2c: children placed on a grid (frozen M2c profile, ADR 0008).
+    Grid,
     None,
 }
 
@@ -118,6 +120,75 @@ pub(crate) enum Overflow {
     Visible,
     Hidden,
     Clip,
+}
+
+/// M2c grid profile (ADR 0008): one track sizing function.
+///
+/// Frozen surface: px, %, fr, auto, `minmax(min, max)`, and
+/// `repeat(<fixed integer>, …)`. Named lines, template areas, auto-fill/
+/// auto-fit, subgrid, and masonry are outside the profile (diagnostics).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GridTrack {
+    Px(f32),
+    Percent(f32),
+    Fr(f32),
+    Auto,
+    /// `minmax(min, max)`; the min side is a length/auto, the max side a
+    /// length/auto/fr (profile restriction).
+    MinMax(GridTrackMin, GridTrackMax),
+    /// `repeat(count, tracks)` with a fixed integer count; inner tracks may
+    /// not themselves be repeats.
+    Repeat {
+        count: u16,
+        tracks: Vec<GridTrack>,
+    },
+}
+
+/// The min side of `minmax()`: a length, percentage, or auto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum GridTrackMin {
+    Px(f32),
+    Percent(f32),
+    Auto,
+}
+
+/// The max side of `minmax()`: a length, percentage, fr, or auto.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum GridTrackMax {
+    Px(f32),
+    Percent(f32),
+    Fr(f32),
+    Auto,
+}
+
+/// M2c grid profile: one side of a `grid-column`/`grid-row` placement.
+///
+/// Positive integer lines and spans only; negative line numbers (from the
+/// end) are outside the profile (diagnostic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GridLine {
+    #[default]
+    Auto,
+    /// 1-based line index from the start.
+    Index(i16),
+    /// Span this many tracks.
+    Span(u16),
+}
+
+/// M2c grid profile: start/end placement for one axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct GridPlacement {
+    pub start: GridLine,
+    pub end: GridLine,
+}
+
+/// M2c grid profile: auto-placement direction. `dense` packing is outside
+/// the profile (diagnostic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum GridAutoFlow {
+    #[default]
+    Row,
+    Column,
 }
 
 /// Text alignment in the M2a profile.
@@ -228,6 +299,16 @@ pub(crate) struct ComputedStyle {
     pub column_gap: Option<Length>,
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
+    /// M2c grid profile (only meaningful when `display` is `Grid`).
+    pub grid_template_columns: Vec<GridTrack>,
+    pub grid_template_rows: Vec<GridTrack>,
+    pub grid_column: GridPlacement,
+    pub grid_row: GridPlacement,
+    pub grid_auto_flow: GridAutoFlow,
+    /// Grid/flex item alignment along the container's inline axis; same
+    /// value space as `align_items` (start/center/end/stretch).
+    pub justify_items: AlignItems,
+    pub justify_self: AlignSelf,
 }
 
 impl ComputedStyle {
@@ -266,6 +347,13 @@ impl ComputedStyle {
             column_gap: None,
             overflow_x: Overflow::Visible,
             overflow_y: Overflow::Visible,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_column: GridPlacement::default(),
+            grid_row: GridPlacement::default(),
+            grid_auto_flow: GridAutoFlow::Row,
+            justify_items: AlignItems::Stretch,
+            justify_self: AlignSelf::Auto,
         }
     }
 }
@@ -799,6 +887,7 @@ fn apply_declaration(
             "block" => style.display = Display::Block,
             "inline" => style.display = Display::Inline,
             "flex" => style.display = Display::Flex,
+            "grid" => style.display = Display::Grid,
             "none" => style.display = Display::None,
             _ => diagnostics.push(unsupported("display value")),
         },
@@ -928,10 +1017,292 @@ fn apply_declaration(
             "clip" => style.overflow_y = Overflow::Clip,
             _ => diagnostics.push(unsupported("overflow value")),
         },
+        "grid-template-columns" | "grid-template-rows" => {
+            match parse_track_list(&declaration.value) {
+                Ok(tracks) => {
+                    if declaration.property == "grid-template-columns" {
+                        style.grid_template_columns = tracks;
+                    } else {
+                        style.grid_template_rows = tracks;
+                    }
+                }
+                Err(message) => diagnostics.push(skip(format!(
+                    "unsupported {} value {:?}: {}",
+                    declaration.property, declaration.value, message
+                ))),
+            }
+        }
+        "grid-column" | "grid-row" => match parse_grid_placement(&declaration.value) {
+            Ok(placement) => {
+                if declaration.property == "grid-column" {
+                    style.grid_column = placement;
+                } else {
+                    style.grid_row = placement;
+                }
+            }
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported {} value {:?}: {}",
+                declaration.property, declaration.value, message
+            ))),
+        },
+        "grid-auto-flow" => match declaration.value.as_str() {
+            "row" => style.grid_auto_flow = GridAutoFlow::Row,
+            "column" => style.grid_auto_flow = GridAutoFlow::Column,
+            _ => diagnostics.push(unsupported(
+                "grid-auto-flow value (dense is outside the M2c profile)",
+            )),
+        },
+        "justify-items" => match declaration.value.as_str() {
+            "stretch" | "normal" => style.justify_items = AlignItems::Stretch,
+            "flex-start" | "start" => style.justify_items = AlignItems::FlexStart,
+            "center" => style.justify_items = AlignItems::Center,
+            "flex-end" | "end" => style.justify_items = AlignItems::FlexEnd,
+            "baseline" => {
+                style.justify_items = AlignItems::Baseline;
+                diagnostics.push(skip(
+                    "justify-items: baseline is deferred in the M2c profile; \
+                     laid out as start"
+                        .into(),
+                ));
+            }
+            _ => diagnostics.push(unsupported("justify-items value")),
+        },
+        "justify-self" => match declaration.value.as_str() {
+            "auto" => style.justify_self = AlignSelf::Auto,
+            "stretch" | "normal" => style.justify_self = AlignSelf::Stretch,
+            "flex-start" | "start" => style.justify_self = AlignSelf::FlexStart,
+            "center" => style.justify_self = AlignSelf::Center,
+            "flex-end" | "end" => style.justify_self = AlignSelf::FlexEnd,
+            "baseline" => {
+                style.justify_self = AlignSelf::Baseline;
+                diagnostics.push(skip(
+                    "justify-self: baseline is deferred in the M2c profile; \
+                     laid out as start"
+                        .into(),
+                ));
+            }
+            _ => diagnostics.push(unsupported("justify-self value")),
+        },
         _ => diagnostics.push(skip(format!(
             "property {:?} is outside the M2b profile",
             declaration.property
         ))),
+    }
+}
+
+// -- grid track / placement parsing (M2c profile) ----------------------------
+
+/// Splits `value` on `sep`, ignoring separators nested in parentheses
+/// (so `minmax(20px, 1fr)` survives a comma split).
+fn split_top_level(value: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                parts.push(value[start..i].trim());
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts.into_iter().filter(|part| !part.is_empty()).collect()
+}
+
+/// Splits a track list into top-level items: whitespace-separated, but a
+/// parenthesized group (`minmax(…)`, `repeat(…)` — including nested
+/// repeats) is always one item.
+fn top_level_tokens(value: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut depth = 0usize;
+    let mut start = None;
+    for (i, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_ascii_whitespace() && depth == 0 => {
+                if let Some(s) = start.take() {
+                    tokens.push(&value[s..i]);
+                }
+            }
+            _ if start.is_none() => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&value[s..]);
+    }
+    tokens
+}
+
+/// Splits `s` at its first top-level (non-parenthesized) comma.
+fn split_first_top_level_comma(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some((&s[..i], &s[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parses a `grid-template-columns`/`grid-template-rows` track list
+/// (M2c profile: px, %, fr, auto, minmax(), repeat(fixed integer, …)).
+fn parse_track_list(value: &str) -> Result<Vec<GridTrack>, String> {
+    top_level_tokens(value)
+        .iter()
+        .map(|token| parse_grid_track(token))
+        .collect()
+}
+
+fn parse_grid_track(token: &str) -> Result<GridTrack, String> {
+    if let Some(rest) = token.strip_prefix("repeat(") {
+        let Some(inner) = rest.strip_suffix(')') else {
+            return Err("unbalanced parentheses".into());
+        };
+        // Grammar inside repeat(): `count , tracks…`. Only the count is
+        // comma-separated; the tracks are whitespace-separated and may
+        // contain nested parens (which is how nested repeats are detected).
+        let Some((count_token, tracks_str)) = split_first_top_level_comma(inner) else {
+            return Err("repeat(count, tracks…) needs a count and at least one track".into());
+        };
+        let count: u16 = count_token.trim().parse().map_err(|_| {
+            String::from(
+                "repeat count must be a fixed integer (auto-fill/auto-fit are \
+                 outside the M2c profile)",
+            )
+        })?;
+        if count == 0 {
+            return Err("repeat count must be >= 1".into());
+        }
+        let mut tracks = Vec::new();
+        for track_token in top_level_tokens(tracks_str) {
+            tracks.push(parse_grid_track(track_token)?);
+        }
+        if tracks.is_empty() {
+            return Err("repeat needs at least one track".into());
+        }
+        if tracks
+            .iter()
+            .any(|track| matches!(track, GridTrack::Repeat { .. }))
+        {
+            return Err("nested repeat() is outside the M2c profile".into());
+        }
+        Ok(GridTrack::Repeat { count, tracks })
+    } else if let Some(rest) = token.strip_prefix("minmax(") {
+        let Some(inner) = rest.strip_suffix(')') else {
+            return Err("unbalanced parentheses".into());
+        };
+        let parts = split_top_level(inner, ',');
+        let [min, max] = parts.as_slice() else {
+            return Err("minmax(min, max) takes exactly two values".into());
+        };
+        Ok(GridTrack::MinMax(
+            parse_track_min(min.trim())?,
+            parse_track_max(max.trim())?,
+        ))
+    } else if token == "auto" {
+        Ok(GridTrack::Auto)
+    } else if let Some(fr) = token.strip_suffix("fr") {
+        let value: f32 = fr
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid fr value {token:?}"))?;
+        if value < 0.0 {
+            return Err("fr values must be >= 0".into());
+        }
+        Ok(GridTrack::Fr(value))
+    } else {
+        match parse_length(token) {
+            Some(Length::Px(v)) => Ok(GridTrack::Px(v)),
+            // rem resolves against the root font size in parse_length.
+            Some(Length::Rem(v)) => Ok(GridTrack::Px(v)),
+            Some(Length::Percent(p)) => Ok(GridTrack::Percent(p)),
+            None => Err(format!(
+                "unsupported track {token:?} (named lines and \
+                template areas are outside the M2c profile)"
+            )),
+        }
+    }
+}
+
+fn parse_track_min(token: &str) -> Result<GridTrackMin, String> {
+    match token {
+        "auto" => Ok(GridTrackMin::Auto),
+        _ => match parse_length(token) {
+            Some(Length::Px(v)) | Some(Length::Rem(v)) => Ok(GridTrackMin::Px(v)),
+            Some(Length::Percent(p)) => Ok(GridTrackMin::Percent(p)),
+            None => Err(format!("invalid minmax min {token:?} (length or auto)")),
+        },
+    }
+}
+
+fn parse_track_max(token: &str) -> Result<GridTrackMax, String> {
+    match token {
+        "auto" => Ok(GridTrackMax::Auto),
+        _ if token.ends_with("fr") => {
+            let value: f32 = token
+                .strip_suffix("fr")
+                .and_then(|v| v.trim().parse().ok())
+                .ok_or_else(|| format!("invalid fr value {token:?}"))?;
+            if value < 0.0 {
+                return Err("fr values must be >= 0".into());
+            }
+            Ok(GridTrackMax::Fr(value))
+        }
+        _ => match parse_length(token) {
+            Some(Length::Px(v)) | Some(Length::Rem(v)) => Ok(GridTrackMax::Px(v)),
+            Some(Length::Percent(p)) => Ok(GridTrackMax::Percent(p)),
+            None => Err(format!(
+                "invalid minmax max {token:?} (length, %, fr, or auto)"
+            )),
+        },
+    }
+}
+
+/// Parses a `grid-column`/`grid-row` value: `<start>` or `<start> / <end>`.
+fn parse_grid_placement(value: &str) -> Result<GridPlacement, String> {
+    let sides = split_top_level(value, '/');
+    let (start_token, end_token) = match sides.as_slice() {
+        [only] => (*only, "auto"),
+        [start, end] => (*start, *end),
+        _ => return Err("placement is `<start> / <end>`".into()),
+    };
+    Ok(GridPlacement {
+        start: parse_grid_line(start_token)?,
+        end: parse_grid_line(end_token)?,
+    })
+}
+
+fn parse_grid_line(token: &str) -> Result<GridLine, String> {
+    if token == "auto" {
+        Ok(GridLine::Auto)
+    } else if let Some(span) = token.strip_prefix("span") {
+        let value: u16 = span
+            .trim()
+            .parse()
+            .map_err(|_| format!("span needs an integer >= 1, got {token:?}"))?;
+        if value == 0 {
+            return Err("span must be >= 1".into());
+        }
+        Ok(GridLine::Span(value))
+    } else if let Ok(index) = token.parse::<i16>() {
+        if index >= 1 {
+            Ok(GridLine::Index(index))
+        } else {
+            Err("negative line numbers are outside the M2c profile".into())
+        }
+    } else {
+        Err(format!(
+            "unsupported grid line {token:?} (named lines are outside the M2c profile)"
+        ))
     }
 }
 
@@ -1225,6 +1596,105 @@ mod tests {
         );
         assert_eq!(style.padding.top, Length::Percent(5.0));
         assert_eq!(style.padding.left, Length::Px(10.0));
+    }
+
+    #[test]
+    fn grid_track_lists_parse_into_the_profile() {
+        let mut fx = build("<p data-vv-test=p>x</p>", &[]);
+        let (style, _) = fx.compute_for("p");
+        // Defaults: empty templates, auto placements.
+        assert!(style.grid_template_columns.is_empty());
+        assert_eq!(style.grid_column, GridPlacement::default());
+
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &["p { grid-template-columns: 1fr 2fr; grid-template-rows: 100px auto }"],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(diagnostics.is_empty());
+        assert_eq!(
+            style.grid_template_columns,
+            [GridTrack::Fr(1.0), GridTrack::Fr(2.0)]
+        );
+        assert_eq!(
+            style.grid_template_rows,
+            [GridTrack::Px(100.0), GridTrack::Auto]
+        );
+
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &["p { grid-template-columns: minmax(20px, 1fr) repeat(3, 50% auto) }"],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            style.grid_template_columns,
+            [
+                GridTrack::MinMax(GridTrackMin::Px(20.0), GridTrackMax::Fr(1.0)),
+                GridTrack::Repeat {
+                    count: 3,
+                    tracks: vec![GridTrack::Percent(50.0), GridTrack::Auto],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn grid_profile_deferrals_are_loud() {
+        // auto-fill/auto-fit, dense packing, named lines, negative lines.
+        for (property, value, forbidden) in [
+            (
+                "grid-template-columns",
+                "repeat(auto-fill, 1fr)",
+                "fixed integer",
+            ),
+            (
+                "grid-template-columns",
+                "repeat(2, repeat(2, 1fr))",
+                "nested repeat",
+            ),
+            (
+                "grid-template-columns",
+                "[main] 1fr [alt]",
+                "unsupported track",
+            ),
+            ("grid-auto-flow", "row dense", "grid-auto-flow"),
+            ("grid-column", "-1 / 3", "negative"),
+        ] {
+            let mut fx = build(
+                "<p data-vv-test=p>x</p>",
+                &[&format!("p {{ {property}: {value} }}")],
+            );
+            let (_style, diagnostics) = fx.compute_for("p");
+            assert!(
+                diagnostics.iter().any(|d| d.message.contains(forbidden)),
+                "{property}: {value} should be diagnosed ({diagnostics:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_placements_parse() {
+        let mut fx = build(
+            "<div data-vv-test=a style=\"grid-column: 1 / 3; grid-row: span 2\">x</div>",
+            &[],
+        );
+        let (style, diagnostics) = fx.compute_for("a");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(
+            style.grid_column,
+            GridPlacement {
+                start: GridLine::Index(1),
+                end: GridLine::Index(3),
+            }
+        );
+        assert_eq!(
+            style.grid_row,
+            GridPlacement {
+                start: GridLine::Span(2),
+                end: GridLine::Auto,
+            }
+        );
     }
 
     #[test]

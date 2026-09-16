@@ -233,7 +233,7 @@ pub(crate) fn build_boxes(
                     .map(|s| s.display)
                     .unwrap_or(Display::Inline);
                 match display {
-                    Display::Block | Display::Flex => {
+                    Display::Block | Display::Flex | Display::Grid => {
                         if let Some(child_box) = build_boxes(dom, child, styles, images) {
                             box_node.children.push(child_box);
                         }
@@ -646,6 +646,7 @@ fn display_name(display: Display) -> String {
     match display {
         Display::Block => "block".into(),
         Display::Flex => "flex".into(),
+        Display::Grid => "grid".into(),
         Display::Inline => "inline".into(),
         Display::None => "none".into(),
     }
@@ -1020,5 +1021,60 @@ mod tests {
         assert_eq!(pic.height, 30.0);
         assert_eq!(grow.width, 160.0);
         assert_eq!(grow.x, pic.x + pic.width);
+    }
+
+    #[test]
+    fn grid_frs_split_the_container_and_rows_stack() {
+        // The unit-test precursor of the grid-fr fixture family: 101px with
+        // `1fr 2fr` cannot land on integers; the contract is the exact
+        // deterministic split, tiling, and row stacking.
+        let facts = facts_for(
+            "<body><div data-vv-test=grid class=g>\
+             <div data-vv-test=a class=cell></div>\
+             <div data-vv-test=b class=cell></div>\
+             <div data-vv-test=c class=cell></div>\
+             <div data-vv-test=d class=cell></div>\
+             </div></body>",
+            "body { margin: 0 } .g { display: grid; width: 101px; height: 60px; \
+             grid-template-columns: 1fr 2fr; grid-template-rows: 30px 30px }",
+            400,
+            300,
+        );
+        let a = fact(&facts, "a");
+        let b = fact(&facts, "b");
+        let c = fact(&facts, "c");
+        let d = fact(&facts, "d");
+        assert_eq!(a.width, 101.0 / 3.0);
+        assert!(
+            (b.width - 202.0 / 3.0).abs() < 0.01,
+            "b.width = {}",
+            b.width
+        );
+        assert_eq!(a.x + a.width, b.x, "columns tile exactly");
+        assert_eq!(c.y, a.y + 30.0, "second row starts at the first row's end");
+        assert_eq!(d.y, b.y + 30.0);
+        // Row-major auto-placement.
+        assert_eq!(c.x, a.x);
+        assert_eq!(d.x, b.x);
+    }
+
+    #[test]
+    fn grid_span_covers_two_tracks() {
+        let facts = facts_for(
+            "<body><div data-vv-test=grid class=g>\
+             <div data-vv-test=wide style=\"grid-column: 1 / 3\"></div>\
+             <div data-vv-test=x></div>\
+             </div></body>",
+            "body { margin: 0 } .g { display: grid; width: 100px; height: 40px; \
+             grid-template-columns: 1fr 1fr }",
+            400,
+            300,
+        );
+        let wide = fact(&facts, "wide");
+        let x = fact(&facts, "x");
+        assert_eq!(wide.width, 100.0, "spanning both tracks");
+        // The second item auto-places on the next row's first track.
+        assert_eq!(x.y, wide.y + wide.height);
+        assert_eq!(x.x, wide.x);
     }
 }
