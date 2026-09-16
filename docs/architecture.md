@@ -43,27 +43,37 @@ Dependency direction: `velqu-lab → velqu-shell → velqu-view`.
 `velqu-reactive` and `velqu-tailwind` are leaves; nothing depends on
 windowing or GPU crates except `velqu-shell`.
 
-## M1 paint pipeline (what runs today)
+## Render pipeline (M2a)
 
 ```
-VelquView::load_document / load_stylesheet      sources carry identity (SourceId);
-(from load_html/load_css conveniences)           stylesheets upsert by id (hot-reload
-                                                 primitive, ADR 0004)
+DocumentSource / StylesheetSource          sources carry identity (SourceId);
+                                           stylesheets upsert by id (ADR 0004)
         ↓
-probe scene (src/probe.rs)                       explicit debug scene: rects, outline,
-                                                 text in two weights, viewport/DPI status,
-                                                 document size echo
+html5ever → dom::Dom                       spec-correct tokenization/tree building
+                                           lowered into the small Velqu tree;
+                                           data-vv-test extracted as fixture identity
         ↓
-painter (src/painter.rs)                         CPU raster into an RGBA8 buffer;
-                                                 logical→device = round(v * scale);
-                                                 solid rects, fontdue glyphs (scalar path);
-                                                 fallible, pixel-bounded allocation
+cssparser → css::Stylesheet                rules, selectors + specificity,
+                                           declarations + source lines; profile
+                                           diagnostics for anything skipped
         ↓
-Frame                                             pixels + sha256 + PNG encode
+style::Cascade                             UA defaults → author sheets → inline;
+                                           inheritance; per-property diagnostics
         ↓
-velqu-shell                                       winit window; softbuffer blit
-                                                  (native-endian 0x00RRGGBB)
+layout.rs                                  box tree → block flow → wrapped lines;
+                                           LayoutFacts v1 (data-vv-test keyed) and
+                                           a DisplayList (fills + text runs)
+        ↓
+painter.rs                                 rasterizes the display list — no layout
+                                           decisions; fallible, pixel-bounded alloc
+        ↓
+Frame                                       pixels + sha256 + PNG encode
+        ↓
+velqu-shell                                 winit window; softbuffer blit
 ```
+
+Identity is separated per stage (ADR 0005): DOM `NodeId`s never reach
+fixtures (which use `data-vv-test`) and the painter never sees the DOM.
 
 `Viewport` is validated at construction (`try_new`: non-zero dimensions,
 finite positive scale, `width*height <= MAX_PIXELS`), so layout and paint
@@ -71,20 +81,22 @@ consume a target whose invariants cannot be violated.
 
 Rendering is fully offscreen and deterministic: identical state + viewport
 produce identical bytes. A window is only one possible sink for a `Frame`.
-This is what makes the M1 fixture (`tests/visual/hello`) run in CI with no
+This is what makes the fixtures (`tests/visual/…`) run in CI with no
 display server (`docs/decisions/0002-offscreen-determinism.md`).
 
 ## Renderer strategy
 
-Phase A (now): prove the pipeline with minimal, replaceable pieces —
+Phase A (done): proved the pipeline with minimal, replaceable pieces —
 winit + softbuffer + fontdue — behind the Velqu-owned API
 (`docs/decisions/0001-m1-paint-backend.md`).
 
-Phase B (M2): build HTML parsing, cascade, and layout (block/flex/grid)
-behind the same API. Candidate engines (html5ever, Stylo, Taffy, Parley,
-Vello/AnyRender, AccessKit) may be adopted when milestone evidence
-justifies them; selected Blitz components are explicitly allowed as a
-feasibility shortcut. None of their types may appear in the public API
+Phase B (M2a done, M2b/M2c next): HTML parsing (html5ever), CSS syntax
+(cssparser), cascade, and **block layout** now run behind the same API
+(ADR 0005/0006). Flex and grid are the next layout milestones; **Taffy is
+the adopted candidate** (its 0.14 line implements block/flex/grid and its
+MSRV fits the 1.87 floor — verified). Text shaping (Parley candidate) is
+deferred; the current deterministic Latin subset is documented in
+ADR 0006. None of the engine types may appear in the public API
 (`docs/decisions/0003-api-boundary.md`).
 
 Phase C (M9/M10): comparative benchmark against matched Electron and
