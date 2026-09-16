@@ -180,6 +180,9 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         ("flex", Some("col")) => Ok(vec![("flex-direction", "column".into())]),
         ("flex", Some("col-reverse")) => Ok(vec![("flex-direction", "column-reverse".into())]),
         ("flex", Some("wrap")) => Ok(vec![("flex-wrap", "wrap".into())]),
+        ("flex", Some("wrap-reverse")) => {
+            Err("flex-wrap: wrap-reverse is outside the renderer profile".into())
+        }
         ("flex", Some("nowrap")) => Ok(vec![("flex-wrap", "nowrap".into())]),
         ("flex", Some("1")) => Ok(vec![
             ("flex-grow", "1".into()),
@@ -335,11 +338,22 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         ("rounded", Some("3xl")) => Ok(vec![("border-radius", "24px".into())]),
         ("rounded", Some("full")) => Ok(vec![("border-radius", "9999px".into())]),
 
-        // -- overflow ----------------------------------------------------------
+        // -- overflow / white-space ------------------------------------------
         ("overflow", Some("visible" | "hidden" | "auto" | "scroll")) => Ok(vec![(
             "overflow",
             class.rsplit('-').next().expect("non-empty").to_owned(),
         )]),
+        ("whitespace", Some("normal")) => Ok(vec![("white-space", "normal".into())]),
+        ("whitespace", Some("nowrap")) => Ok(vec![("white-space", "nowrap".into())]),
+        // The renderer collapses pre-line/pre-wrap to preserved-whitespace
+        // layout (M2a profile); break-spaces is outside it entirely.
+        ("whitespace", Some("pre" | "pre-line" | "pre-wrap")) => Ok(vec![(
+            "white-space",
+            class.rsplit('-').next().expect("non-empty").to_owned(),
+        )]),
+        ("whitespace", Some("break-spaces")) => {
+            Err("white-space: break-spaces is outside the renderer profile".into())
+        }
 
         // -- background ----------------------------------------------------------
         ("bg", Some(color)) => match color_token(color) {

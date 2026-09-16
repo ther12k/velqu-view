@@ -334,6 +334,8 @@ pub struct VelquView {
     tailwind_enabled: bool,
     tailwind_css: Option<String>,
     tailwind_diagnostics_list: Vec<String>,
+    /// `<style>` block text extracted from the document, in order.
+    style_blocks: Vec<String>,
 }
 
 impl Default for VelquView {
@@ -378,6 +380,7 @@ impl VelquView {
             tailwind_enabled: false,
             tailwind_css: None,
             tailwind_diagnostics_list: Vec::new(),
+            style_blocks: Vec::new(),
         }
     }
 
@@ -561,9 +564,30 @@ impl VelquView {
         // Image identity is per-document, like the DOM: a new document
         // invalidates every decoded asset.
         self.images.clear();
+        // `<style>` blocks travel with the document (review fix: they were
+        // silently dropped before M3's review).
+        self.collect_style_blocks();
         // Utility classes are per-document too: recompile when enabled.
         self.rebuild_tailwind();
         Ok(())
+    }
+
+    /// Extracts `<style>` element text from the parsed DOM, in document
+    /// order. These are author sheets: they sort after host-installed
+    /// stylesheets and override the generated utilities at equal
+    /// specificity (ADR 0009).
+    fn collect_style_blocks(&mut self) {
+        self.style_blocks.clear();
+        let mut blocks: Vec<String> = Vec::new();
+        self.dom.walk(|id, _| {
+            if self.dom.tag_name(id) == Some("style") {
+                let text = self.dom.descendant_text(id);
+                if !text.trim().is_empty() {
+                    blocks.push(text);
+                }
+            }
+        });
+        self.style_blocks = blocks;
     }
 
     /// Adds a CSS stylesheet source on top of any previously loaded ones,
@@ -670,16 +694,27 @@ impl VelquView {
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
         let mut parsed_author = Vec::with_capacity(self.parsed_css.len() + 1);
+        // The generated utility sheet participates FIRST among author
+        // sheets: utilities still beat element rules via class specificity,
+        // while author class rules override utilities at equal specificity —
+        // Tailwind's layered-utilities semantics, where the author's own CSS
+        // wins (ADR 0009).
+        if let Some(text) = &self.tailwind_css {
+            let source = StylesheetSource::new("velqu:tailwind", text.clone());
+            let parsed = css::parse(&source, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
+        }
         for sheet in &self.stylesheets {
             let parsed = css::parse(sheet, order);
             order += parsed.rules.len() as u32;
             parsed_author.push(parsed);
         }
-        // The generated utility sheet participates last: utilities outrank
-        // element rules, lose to inline styles (ADR 0009).
-        if let Some(text) = &self.tailwind_css {
-            let source = StylesheetSource::new("velqu:tailwind", text.clone());
-            parsed_author.push(css::parse(&source, order));
+        for (i, block) in self.style_blocks.iter().enumerate() {
+            let source = StylesheetSource::new(format!("velqu:style-{i}"), block.clone());
+            let parsed = css::parse(&source, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
@@ -757,14 +792,24 @@ impl VelquView {
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
         let mut parsed_author = Vec::with_capacity(self.parsed_css.len() + 1);
+        // Generated utility sheet first among author sheets (ADR 0009):
+        // author class rules override utilities at equal specificity.
+        if let Some(text) = &self.tailwind_css {
+            let source = StylesheetSource::new("velqu:tailwind", text.clone());
+            let parsed = css::parse(&source, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
+        }
         for sheet in &self.stylesheets {
             let parsed = css::parse(sheet, order);
             order += parsed.rules.len() as u32;
             parsed_author.push(parsed);
         }
-        if let Some(text) = &self.tailwind_css {
-            let source = StylesheetSource::new("velqu:tailwind", text.clone());
-            parsed_author.push(css::parse(&source, order));
+        for (i, block) in self.style_blocks.iter().enumerate() {
+            let source = StylesheetSource::new(format!("velqu:style-{i}"), block.clone());
+            let parsed = css::parse(&source, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
         let Some(laid) = self.run_layout(viewport, &mut cascade) else {
@@ -1315,6 +1360,53 @@ mod tests {
         assert_eq!(fact_of(&facts, "a").width, 128.0);
         // …and an inline style beats the utility, as CSS specifies.
         assert_eq!(fact_of(&facts, "b").width, 40.0);
+    }
+
+    #[test]
+    fn tailwind_author_css_overrides_utilities() {
+        // Tailwind's layered-utilities semantics: the author's own CSS
+        // beats a utility at equal specificity (ADR 0009, review
+        // correction — the first implementation had this backwards).
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <style>.card { width: 96px }</style>\
+             <div data-vv-test=card class=\"card w-32 h-8\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(320, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        // .card wins the tie against .w-32 (author sheet sorts after the
+        // generated one), while .h-8 still applies unopposed.
+        assert_eq!(fact_of(&facts, "card").width, 96.0);
+        assert_eq!(fact_of(&facts, "card").height, 32.0);
+    }
+
+    #[test]
+    fn tailwind_whitespace_utilities_map_into_the_profile() {
+        // white-space is a supported renderer property; the utilities must
+        // compile (review finding: they were missing from v0).
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <p data-vv-test=p class=\"w-40 whitespace-nowrap\">\
+             aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk</p>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(320, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        // nowrap keeps everything on one line that would otherwise wrap.
+        assert_eq!(
+            fact_of(&facts, "p").text_runs.len(),
+            1,
+            "{:?}",
+            fact_of(&facts, "p").text_runs
+        );
+        assert!(view.tailwind_diagnostics().is_empty());
     }
 
     #[test]

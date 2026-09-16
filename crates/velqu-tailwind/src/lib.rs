@@ -16,8 +16,14 @@
 //! three-tier result (`Supported` / `Normalized` / `Unsupported`) plus
 //! replacement suggestions match what the M3 `velqu css check` must report.
 //!
-//! **M3 scope (not built yet):** real compiled-Tailwind ingestion, source
-//! locations, and the checker CLI built on this model.
+//! **M3 (shipped):** the v0 utility synthesizer — `compile_utilities`
+//! maps Tailwind v3-compatible classes to plain CSS (the "Tailwind build"
+//! stage of utilities → CSS → profile check → renderer), with
+//! deterministic diagnostics for everything outside the profile.
+//!
+//! **Deferred beyond M3:** real compiled-Tailwind ingestion (consuming a
+//! `tailwindcss` build output), source locations, and the `velqu css
+//! check` CLI built on this model.
 
 use std::fmt;
 

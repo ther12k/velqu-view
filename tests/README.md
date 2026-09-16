@@ -8,7 +8,7 @@ Test layers and their homes:
 | Reactive syntax surface | `crates/velqu-reactive` | yes |
 | CSS profile classification | `crates/velqu-tailwind` | yes |
 | Visual fixtures (offscreen render) | `tests/visual/*/fixture.toml` via `crates/velqu-view/tests/visual_fixtures.rs` | yes |
-| Tailwind conformance corpus | `tests/tailwind/` (M3) | later |
+| Tailwind conformance corpus (compiled-output) | `tests/tailwind/` | later (utility pipeline covered by visual fixtures) |
 | Reactive conformance | `tests/reactive/` (M5) | later |
 | Input matrix | `tests/input/` (M4) | later |
 

@@ -26,10 +26,12 @@ SHA over frames, headless and window (Wayland + X11) paths.
   full v3 palette (22 families × 11 shades, unit-tested anchor values),
   typography, borders/radius, overflow. 23 crate tests cover mappings,
   palette anchors, dedup/order, and override semantics.
-* **Cascade:** the generated sheet joins after every author sheet.
-  Pinned by `tailwind_utilities_lose_to_inline_but_beat_element_rules`:
-  utilities beat element rules (class specificity), inline styles beat
-  utilities.
+* **Cascade:** the generated sheet joins **first among the author
+  sheets** (review correction — see ADR 0009): utilities beat element
+  rules via class specificity, the author's own class rules override
+  utilities at equal specificity (Tailwind's layered-utilities
+  semantics), and inline styles beat both. Pinned by
+  `tailwind_author_css_overrides_utilities`.
 * **Opt-in:** without `enable_tailwind()`, utilities do nothing and
   produce no diagnostics (`tailwind_is_opt_in_…`).
 * **Loud failures:** unsupported classes (`shadow-md`, `hover:flex`,

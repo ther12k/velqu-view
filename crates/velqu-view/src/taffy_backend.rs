@@ -608,11 +608,15 @@ fn text_content_size(
 ) -> TaffySize<f32> {
     let line_height = box_line_height(&box_node.style, scale);
 
-    let wrap_width = match available_width {
-        AvailableSpace::Definite(w) => known_width.or(Some(w)),
-        // MaxContent: no wrapping; MinContent: wrap at the longest word.
-        AvailableSpace::MaxContent => None,
-        AvailableSpace::MinContent => Some(longest_word(box_node, fonts, scale)),
+    let wrap_width = match box_node.style.white_space {
+        // nowrap never wraps, whatever space is available.
+        crate::style::WhiteSpace::Nowrap => None,
+        _ => match available_width {
+            AvailableSpace::Definite(w) => known_width.or(Some(w)),
+            // MaxContent: no wrapping; MinContent: wrap at the longest word.
+            AvailableSpace::MaxContent => None,
+            AvailableSpace::MinContent => Some(longest_word(box_node, fonts, scale)),
+        },
     };
 
     let width = match wrap_width {
@@ -777,17 +781,28 @@ fn write_back_at(
 fn layout_inline_content(node: &mut BoxNode, fonts: &mut FontStore, scale: f32) {
     if !node.words.is_empty() {
         // Only the wrap width matters here; emit reads the absolute text
-        // origin from the box when painting.
-        let wrap_width = match node.text_origin {
-            Some(origin) => origin.width,
-            None => node.content.w,
+        // origin from the box when painting. nowrap never wraps.
+        let wrap_width = match node.style.white_space {
+            crate::style::WhiteSpace::Nowrap => None,
+            _ => match node.text_origin {
+                Some(origin) => Some(origin.width),
+                None => Some(node.content.w),
+            },
         };
         let line_height = match node.style.line_height {
             LineHeight::Normal => 1.5 * (node.style.font_size * scale).max(1.0),
             LineHeight::Number(n) => n * (node.style.font_size * scale).max(1.0),
             LineHeight::Px(v) => v * scale,
         };
-        let mut lines = break_lines(&node.words, wrap_width, fonts, scale);
+        let mut lines = break_lines(
+            &node.words,
+            wrap_width.unwrap_or(f32::INFINITY),
+            fonts,
+            scale,
+        );
+        // Alignment still measures against the containing width (content
+        // width under nowrap), so centered/right nowrap text behaves.
+        let align_width = wrap_width.unwrap_or(node.content.w);
         let mut cursor = 0.0;
         for line in &mut lines {
             line.y = cursor;
@@ -795,8 +810,8 @@ fn layout_inline_content(node: &mut BoxNode, fonts: &mut FontStore, scale: f32) 
             let width = line_width(line);
             let offset = match node.style.text_align {
                 TextAlign::Left => 0.0,
-                TextAlign::Center => ((wrap_width - width) / 2.0).max(0.0),
-                TextAlign::Right => (wrap_width - width).max(0.0),
+                TextAlign::Center => ((align_width - width) / 2.0).max(0.0),
+                TextAlign::Right => (align_width - width).max(0.0),
             };
             for run in &mut line.runs {
                 run.x += offset;
