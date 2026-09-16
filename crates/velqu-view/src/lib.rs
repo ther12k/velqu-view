@@ -65,6 +65,7 @@ mod painter;
 mod probe;
 mod scene;
 mod source;
+mod style;
 mod viewport;
 
 use std::fmt;

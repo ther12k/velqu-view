@@ -509,6 +509,21 @@ fn read_value(input: &mut Parser<'_>) -> (String, bool) {
     (value, important)
 }
 
+// -- internals shared with the cascade/inline-style path ---------------------
+
+/// Creates a bare parser over CSS text (used for inline `style=""` values).
+// Consumed by the box tree/layout stages landing in the next M2a commit.
+#[allow(dead_code)]
+pub(crate) fn new_parser(input: &str) -> Parser<'_> {
+    Parser::new(input)
+}
+
+/// Parses a declaration list (rule block or inline style value).
+#[allow(dead_code)]
+pub(crate) fn parse_declarations_pub(input: &mut Parser<'_>) -> Vec<Declaration> {
+    parse_declarations(input).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
