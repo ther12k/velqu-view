@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 
 use crate::font::FontStore;
-use crate::scene::FontWeight;
+use crate::font::FontWeight;
 
 /// One laid-out line: its text plus measured width in device pixels.
 #[derive(Debug, Clone, PartialEq)]

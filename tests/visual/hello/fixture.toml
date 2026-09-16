@@ -1,5 +1,6 @@
-# M1 visual fixture: deterministic paint probe over the `hello` example.
-# Rendered by crates/velqu-view/tests/visual_fixtures.rs (no display needed).
+# M2a fixture: hello document — cascade + block layout + deterministic paint.
+# Layout facts are asserted structurally (data-vv-test keys); the pixel hash
+# only guards "did the final raster change".
 name = "hello"
 html = "examples/hello/index.html"
 css = ["examples/hello/app.css"]
@@ -8,29 +9,46 @@ viewport = { width = 800, height = 600, scale = 1.0 }
 [expect]
 # SHA-256 of the RGBA buffer; regenerate with
 #   cargo run -p velqu-lab -- --headless --size 800x600 examples/hello
-pixels_sha256 = "9f59e9fc1027924ff53a8135c84867c211ebd3afcb562be89aca2673d21c5345"
+pixels_sha256 = "b6af24a4dce1af41aa69e601bdfb182f7c8c11e57d4963877c07770f8f76b91a"
 
-# Exact-color probes in device pixels (swatch centers, background corner).
+# Exact-color probes: page background, card fill, card border.
 [[expect.pixel]]
-pos = [32, 32]
+pos = [4, 4]
 color = "#10141C"
 
 [[expect.pixel]]
-pos = [44, 144]
-color = "#EF4444"
+pos = [40, 40]
+color = "#171D29"
 
+# Border top edge of the card (border-box starts at x=16, y=16).
 [[expect.pixel]]
-pos = [76, 144]
-color = "#22C55E"
+pos = [16, 17]
+color = "#2A3242"
 
-[[expect.pixel]]
-pos = [108, 144]
-color = "#3B82F6"
+[[expect.facts]]
+id = "card"
+tag = "main"
+display = "block"
+x = 16.0
+y = 16.0
+width = 436.0            # 2 border + 16 padding + 400 width + 16 padding + 2 border
+padding = [16.0, 16.0, 16.0, 16.0]  # device px (scale 1)
+border = [2.0, 2.0, 2.0, 2.0]
+margin = [16.0, 16.0, 16.0, 16.0]
+content_x = 34.0
+content_y = 34.0
+content_width = 400.0
 
-[[expect.pixel]]
-pos = [140, 144]
-color = "#F59E0B"
+[[expect.facts]]
+id = "title"
+tag = "h1"
+display = "block"
+text_runs = ["Hello, VelquView"]
 
-[[expect.pixel]]
-pos = [172, 144]
-color = "#8B5CF6"
+[[expect.facts]]
+id = "subtitle"
+tag = "p"
+display = "block"
+# The sentence wraps in the 400px content box at 14px — wrapping is part of
+# the structural contract.
+text_runs = ["M1 fixture: native window, rectangle, text, resize, DPI,", "frame capture."]

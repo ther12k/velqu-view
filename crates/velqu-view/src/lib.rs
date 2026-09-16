@@ -58,12 +58,12 @@
 
 mod color;
 mod css;
+mod display_list;
 mod dom;
 mod font;
 mod html;
+mod layout;
 mod painter;
-mod probe;
-mod scene;
 mod source;
 mod style;
 mod text;
@@ -75,6 +75,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 pub use color::{Color, ColorParseError};
+pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
     SourceId, StylesheetSource,
@@ -445,15 +446,54 @@ impl VelquView {
     /// Renders one frame into `viewport`, fully offscreen.
     ///
     /// Deterministic: identical instance state + viewport produce identical
-    /// pixels. Requires a loaded document.
+    /// pixels. Requires a loaded document. The pipeline is
+    /// DOM → cascade → block layout → display list → paint (ADR 0005); the
+    /// M1 probe scene is retired.
     pub fn render(&mut self, viewport: Viewport) -> Result<FrameResult, VelquError> {
-        let Some(document) = self.document.as_ref() else {
+        if self.document.is_none() {
             return Err(VelquError::DocumentNotLoaded);
-        };
+        }
         self.frame_index += 1;
 
-        let scene = probe::build(document, &self.stylesheets, viewport);
-        let (frame, items, glyphs) = painter::paint(&scene, viewport, &mut self.fonts)?;
+        // UA defaults (M2a baseline: body margin, heading sizes, hidden
+        // head elements) then author sheets, in order.
+        let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
+        let ua_parsed = css::parse(&ua_sheet, 0);
+        let mut order = ua_parsed.rules.len() as u32;
+        let mut parsed_author = Vec::with_capacity(self.parsed_css.len());
+        for sheet in &self.stylesheets {
+            let parsed = css::parse(sheet, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
+        }
+
+        let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
+        let Some((_root_box, display_list)) =
+            layout::layout_document(&self.dom, viewport, &mut cascade, &mut self.fonts)
+        else {
+            // Nothing visible (e.g. an all-hidden document): paint the
+            // author background only.
+            let background = document_background(&parsed_author);
+            let (frame, items, glyphs) = painter::paint_document(
+                &display_list::DisplayList::default(),
+                background,
+                viewport,
+                &mut self.fonts,
+            )?;
+            return Ok(FrameResult {
+                frame,
+                stats: RenderStats {
+                    frame_index: self.frame_index,
+                    viewport,
+                    items,
+                    glyphs,
+                },
+            });
+        };
+
+        let background = document_background(&parsed_author);
+        let (frame, items, glyphs) =
+            painter::paint_document(&display_list, background, viewport, &mut self.fonts)?;
         Ok(FrameResult {
             frame,
             stats: RenderStats {
@@ -464,7 +504,85 @@ impl VelquView {
             },
         })
     }
+
+    /// Lays the current document out and returns fixture-facing facts.
+    ///
+    /// Runs the same cascade+layout pass as [`VelquView::render`] minus
+    /// painting. Keys are `data-vv-test` values (ADR 0005).
+    pub fn layout_facts(&mut self, viewport: Viewport) -> Result<LayoutFacts, VelquError> {
+        if self.document.is_none() {
+            return Err(VelquError::DocumentNotLoaded);
+        }
+        let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
+        let ua_parsed = css::parse(&ua_sheet, 0);
+        let mut order = ua_parsed.rules.len() as u32;
+        let mut parsed_author = Vec::with_capacity(self.parsed_css.len());
+        for sheet in &self.stylesheets {
+            let parsed = css::parse(sheet, order);
+            order += parsed.rules.len() as u32;
+            parsed_author.push(parsed);
+        }
+        let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
+        let mut fonts = font::FontStore::bundled();
+        let Some((root, _)) =
+            layout::layout_document(&self.dom, viewport, &mut cascade, &mut fonts)
+        else {
+            return Ok(LayoutFacts {
+                schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
+                viewport_width: viewport.width(),
+                viewport_height: viewport.height(),
+                scale: viewport.scale_factor(),
+                nodes: Vec::new(),
+            });
+        };
+        let mut facts = LayoutFacts {
+            schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
+            viewport_width: viewport.width(),
+            viewport_height: viewport.height(),
+            scale: viewport.scale_factor(),
+            nodes: Vec::new(),
+        };
+        layout::collect_facts(&self.dom, &root, viewport, &mut facts);
+        Ok(facts)
+    }
 }
+
+/// The author-declared page background: `html`'s, then `body`'s, then white
+/// (CSS background propagation, simplified).
+fn document_background(sheets: &[css::Stylesheet]) -> Color {
+    let mut body_background = None;
+    for sheet in sheets {
+        for rule in &sheet.rules {
+            for declaration in &rule.declarations {
+                if declaration.property == "background-color"
+                    || declaration.property == "background"
+                {
+                    if let Some(color) = style::parse_color(&declaration.value) {
+                        let matches_root = rule.selectors.iter().any(|selector| {
+                            selector.segments.len() == 1
+                                && selector.segments[0]
+                                    .compound
+                                    .simples
+                                    .iter()
+                                    .any(|s| {
+                                        matches!(s, css::Simple::Type(tag) if tag == "html" || tag == "body")
+                                    })
+                        });
+                        if matches_root && body_background.is_none() {
+                            body_background = Some(color);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    body_background.unwrap_or(Color::WHITE)
+}
+
+/// The M2a UA stylesheet: minimal defaults the cascade cannot express as
+/// per-tag Rust defaults alone (here: nothing beyond what `ua_default`
+/// covers; kept as a hook for spec-derived UA rules).
+const UA_STYLESHEET: &str = "";
 
 #[cfg(test)]
 mod tests {

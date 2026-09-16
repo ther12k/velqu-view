@@ -102,6 +102,17 @@ impl Default for Sides<Length> {
     }
 }
 
+impl Default for Sides<f32> {
+    fn default() -> Self {
+        Sides {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        }
+    }
+}
+
 impl Sides<Length> {
     pub(crate) fn px_or_zero(&self) -> Sides<f32> {
         Sides {
@@ -769,6 +780,15 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim();
     if let Ok(color) = Color::from_hex(value) {
         return Some(color);
+    }
+    // 3-digit hex (#rgb → #rrggbb).
+    if let Some(hex) = value.strip_prefix('#') {
+        if hex.len() == 3 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            let expanded: String = hex.chars().flat_map(|c| [c, c]).collect();
+            if let Ok(color) = Color::from_hex(&expanded) {
+                return Some(color);
+            }
+        }
     }
     if let Some(inner) = value
         .strip_prefix("rgb(")

@@ -1,8 +1,32 @@
-/* Plain CSS within the Velqu CSS Profile.
- * In M1 this file proves CSS ingestion into the renderer inputs; the probe
- * scene reports its size. Real styling begins with the M2 renderer.
+/* Plain CSS within the M2a CSS profile (ADR 0006).
+ * Exercises the cascade: type/class selectors, box model, colors,
+ * inheritance (subtitle color comes from the card), text alignment.
  */
+html {
+  background-color: #10141c;
+}
+
 body {
-  background-color: #020617;
-  color: #f1f5f9;
+  margin: 0;
+}
+
+.card {
+  margin: 16px;
+  padding: 16px;
+  width: 400px;
+  border: 2px solid #2a3242;
+  background-color: #171d29;
+}
+
+.title {
+  color: #f4f6fb;
+  font-size: 28px;
+  font-weight: 700;
+  margin: 0 0 8px 0;
+}
+
+.subtitle {
+  color: #93a0b4;
+  font-size: 14px;
+  margin: 0;
 }

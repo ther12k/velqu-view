@@ -1,14 +1,19 @@
-//! Visual fixture harness: renders every `tests/visual/*/fixture.toml`
-//! offscreen and asserts the expectations inside.
+//! M2a fixture harness.
 //!
-//! See `tests/README.md` at the repository root for the fixture schema.
-//! Fixtures live outside this crate; they are located relative to the
-//! workspace root so the same files drive tests and `velqu-lab` capture.
+//! Two layers of assertions per `tests/visual/*/fixture.toml`:
+//!
+//! 1. **Structural first** — `layout_facts` expectations (exact geometry,
+//!    box model, text runs) keyed by author-written `data-vv-test` ids
+//!    (ADR 0005: internal `NodeId`s never leak into fixtures).
+//! 2. **Raster second** — the pixel digest answers only "did the final
+//!    raster change?" and exact-color probes pin deterministic colors.
+//!
+//! See `tests/README.md` for the fixture schema.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use velqu_view::{Color, VelquView, Viewport};
+use velqu_view::{Color, LayoutFacts, VelquView, Viewport};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -39,12 +44,40 @@ struct Expect {
     pixels_sha256: Option<String>,
     #[serde(default)]
     pixel: Vec<PixelProbe>,
+    /// Structural assertions per `data-vv-test` id.
+    #[serde(default)]
+    facts: Vec<FactExpect>,
 }
 
 #[derive(Deserialize)]
 struct PixelProbe {
     pos: [u32; 2],
     color: String,
+}
+
+/// Structural expectation: only the fields present in the TOML are
+/// compared (f32 compares are exact — layout is deterministic).
+#[derive(Deserialize)]
+struct FactExpect {
+    id: String,
+    tag: Option<String>,
+    display: Option<String>,
+    x: Option<f32>,
+    y: Option<f32>,
+    width: Option<f32>,
+    height: Option<f32>,
+    content_x: Option<f32>,
+    content_y: Option<f32>,
+    content_width: Option<f32>,
+    content_height: Option<f32>,
+    #[serde(default)]
+    padding: Option<[f32; 4]>,
+    #[serde(default)]
+    border: Option<[f32; 4]>,
+    #[serde(default)]
+    margin: Option<[f32; 4]>,
+    #[serde(default)]
+    text_runs: Option<Vec<String>>,
 }
 
 fn workspace_root() -> &'static Path {
@@ -64,21 +97,37 @@ fn load_fixture(dir: &Path) -> Fixture {
     toml::from_str(&manifest).unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
 }
 
-fn run_fixture(dir: &Path) {
-    let fixture = load_fixture(dir);
+fn build_view(fixture: &Fixture) -> VelquView {
     let mut view = VelquView::new();
-
     let html_path = workspace_root().join(&fixture.html);
     let html = std::fs::read_to_string(&html_path)
         .unwrap_or_else(|e| panic!("{}: {e}", html_path.display()));
-    view.load_html(&html).expect("fixture html loads");
-
+    view.load_document(
+        velqu_view::DocumentSource::new(fixture.html.to_string_lossy().into_owned(), html)
+            .with_base(
+                html_path
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+    )
+    .expect("fixture html loads");
     for css_rel in &fixture.css {
         let css_path = workspace_root().join(css_rel);
         let css = std::fs::read_to_string(&css_path)
             .unwrap_or_else(|e| panic!("{}: {e}", css_path.display()));
-        view.load_css(&css).expect("fixture css loads");
+        view.load_stylesheet(velqu_view::StylesheetSource::new(
+            css_rel.to_string_lossy().into_owned(),
+            css,
+        ))
+        .expect("fixture css loads");
     }
+    view
+}
+
+fn run_fixture(dir: &Path) {
+    let fixture = load_fixture(dir);
+    let mut view = build_view(&fixture);
 
     let viewport = Viewport::try_new(
         fixture.viewport.width,
@@ -86,19 +135,87 @@ fn run_fixture(dir: &Path) {
         fixture.viewport.scale,
     )
     .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    let result = view.render(viewport).expect("fixture renders");
 
+    // Layer 1: structural facts.
+    let facts: LayoutFacts = view.layout_facts(viewport).expect("fixture lays out");
+    assert_eq!(
+        facts.schema_version,
+        velqu_view::LAYOUT_FACTS_SCHEMA_VERSION,
+        "{}: schema version",
+        dir.display()
+    );
+    assert_eq!(facts.viewport_width, viewport.width(), "facts width");
+    assert_eq!(facts.viewport_height, viewport.height(), "facts height");
+
+    for expected in &fixture.expect.facts {
+        let actual = facts
+            .nodes
+            .iter()
+            .find(|n| n.fixture_id == expected.id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: no layout fact for data-vv-test={:?} (have {:?})",
+                    dir.display(),
+                    expected.id,
+                    facts
+                        .nodes
+                        .iter()
+                        .map(|n| &n.fixture_id)
+                        .collect::<Vec<_>>()
+                )
+            });
+        let FactExpect {
+            id,
+            tag,
+            display,
+            x,
+            y,
+            width,
+            height,
+            content_x,
+            content_y,
+            content_width,
+            content_height,
+            padding,
+            border,
+            margin,
+            text_runs,
+        } = expected;
+        assert_eq!(Some(&actual.tag), tag.as_ref(), "{id}: tag");
+        assert_eq!(Some(&actual.display), display.as_ref(), "{id}: display");
+        assert_f32(id, "x", actual.x, *x);
+        assert_f32(id, "y", actual.y, *y);
+        assert_f32(id, "width", actual.width, *width);
+        assert_f32(id, "height", actual.height, *height);
+        assert_f32(id, "content_x", actual.content_x, *content_x);
+        assert_f32(id, "content_y", actual.content_y, *content_y);
+        assert_f32(id, "content_width", actual.content_width, *content_width);
+        assert_f32(id, "content_height", actual.content_height, *content_height);
+        if let Some(expected) = padding {
+            assert_eq!(actual.padding, *expected, "{id}: padding");
+        }
+        if let Some(expected) = border {
+            assert_eq!(actual.border, *expected, "{id}: border");
+        }
+        if let Some(expected) = margin {
+            assert_eq!(actual.margin, *expected, "{id}: margin");
+        }
+        if let Some(expected) = text_runs {
+            assert_eq!(&actual.text_runs, expected, "{id}: text_runs");
+        }
+    }
+
+    // Layer 2: raster.
+    let result = view.render(viewport).expect("fixture renders");
     assert_eq!(result.frame.width(), viewport.width(), "frame width");
     assert_eq!(result.frame.height(), viewport.height(), "frame height");
 
     let actual_hash = result.frame.sha256_hex();
     match fixture.expect.pixels_sha256.as_deref() {
-        Some("PENDING") | None => {
-            panic!(
-                "{}: fixture has no baseline hash; set pixels_sha256 = {actual_hash}",
-                dir.display()
-            );
-        }
+        Some("PENDING") | None => panic!(
+            "{}: fixture has no baseline hash; set pixels_sha256 = {actual_hash}",
+            dir.display()
+        ),
         Some(expected) => assert_eq!(
             expected,
             actual_hash,
@@ -119,6 +236,15 @@ fn run_fixture(dir: &Path) {
             expected,
             "{}: probe at ({x},{y}) expected {expected}, got {actual}",
             dir.display()
+        );
+    }
+}
+
+fn assert_f32(id: &str, field: &str, actual: f32, expected: Option<f32>) {
+    if let Some(expected) = expected {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{id}: {field} expected {expected}, got {actual}"
         );
     }
 }
@@ -144,24 +270,19 @@ fn visual_fixtures_match_baselines() {
 #[test]
 fn fixtures_are_deterministic_across_instances() {
     // Independent VelquView instances over the same fixture inputs must
-    // produce byte-identical frames (no hidden global state).
+    // produce byte-identical frames and identical facts (no hidden state).
     for dir in fixture_dirs() {
         let fixture = load_fixture(&dir);
-        let mut views = [VelquView::new(), VelquView::new()];
-        for view in &mut views {
-            let html = std::fs::read_to_string(workspace_root().join(&fixture.html)).unwrap();
-            view.load_html(&html).unwrap();
-            for css_rel in &fixture.css {
-                let css = std::fs::read_to_string(workspace_root().join(css_rel)).unwrap();
-                view.load_css(&css).unwrap();
-            }
-        }
         let viewport = Viewport::try_new(
             fixture.viewport.width,
             fixture.viewport.height,
             fixture.viewport.scale,
         )
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        let mut views = [build_view(&fixture), build_view(&fixture)];
+        let facts_a = views[0].layout_facts(viewport).unwrap();
+        let facts_b = views[1].layout_facts(viewport).unwrap();
+        assert_eq!(facts_a, facts_b, "{}: layout facts diverged", dir.display());
         let a = views[0].render(viewport).unwrap();
         let b = views[1].render(viewport).unwrap();
         assert_eq!(

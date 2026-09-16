@@ -1,111 +1,67 @@
-//! CPU rasterizer for the M1 paint scene.
+//! CPU rasterizer for display lists produced by the layout pass.
+//!
+//! The painter makes **no layout decisions** (ADR 0005): it consumes a
+//! finished [`DisplayList`] plus a background color and produces pixels.
 //!
 //! Determinism rules (fixture hashes depend on them):
-//!
-//! * logical → device conversion is `round(v * scale_factor)`;
 //! * rectangles are solid fills snapped to device-pixel edges — no
 //!   anti-aliasing, so coverage math cannot vary;
 //! * glyph coverage comes from fontdue's scalar rasterizer at whole-pixel
-//!   sizes (see `font.rs`).
-//!
-//! Anti-aliasing of primitives, clipping, and transforms are M2 concerns and
-//! will arrive with the real renderer backend behind the same API.
+//!   sizes (see `font.rs`);
+//! * frame buffers are pixel-bounded upstream and allocated fallibly.
 
 use crate::color::Color;
+use crate::display_list::{DisplayList, DisplayRect, DisplayText};
 use crate::font::FontStore;
-use crate::scene::{Item, Scene};
-use crate::{Frame, Viewport};
+use crate::viewport::Viewport;
+use crate::{Frame, VelquError};
 
-/// Line spacing multiplier applied to the nominal text size.
-const LINE_HEIGHT_FACTOR: f32 = 1.5;
-
-/// Paints `scene` into a frame for `viewport`.
+/// Paints `list` over `background` into a frame for `viewport`.
 ///
 /// Returns the frame, the number of items painted, and the number of glyphs
-/// composited (reported through [`crate::RenderStats`]). Frame allocation is
-/// fallible: the buffer is reserved with `try_reserve_exact` so an exhausted
-/// allocator surfaces as [`crate::VelquError::FrameAllocationFailed`] instead
-/// of aborting the process.
-pub(crate) fn paint(
-    scene: &Scene,
+/// composited (reported through [`crate::RenderStats`]).
+pub(crate) fn paint_document(
+    list: &DisplayList,
+    background: Color,
     viewport: Viewport,
     fonts: &mut FontStore,
-) -> Result<(Frame, usize, usize), crate::VelquError> {
-    // u64 math: the viewport was validated against MAX_PIXELS at
-    // construction, but this stays safe on 32-bit targets too.
+) -> Result<(Frame, usize, usize), VelquError> {
     let byte_count = u64::from(viewport.width()) * u64::from(viewport.height()) * 4;
     let byte_count =
-        usize::try_from(byte_count).map_err(|_| crate::VelquError::FrameAllocationFailed {
+        usize::try_from(byte_count).map_err(|_| VelquError::FrameAllocationFailed {
             width: viewport.width(),
             height: viewport.height(),
         })?;
     let mut rgba: Vec<u8> = Vec::new();
     rgba.try_reserve_exact(byte_count)
-        .map_err(|_| crate::VelquError::FrameAllocationFailed {
+        .map_err(|_| VelquError::FrameAllocationFailed {
             width: viewport.width(),
             height: viewport.height(),
         })?;
     rgba.resize(byte_count, 0);
 
-    let bg = scene.background;
     for px in rgba.chunks_exact_mut(4) {
-        px[0] = bg.r;
-        px[1] = bg.g;
-        px[2] = bg.b;
-        px[3] = bg.a;
+        px[0] = background.r;
+        px[1] = background.g;
+        px[2] = background.b;
+        px[3] = background.a;
     }
 
     let mut ctx = PaintCtx {
         width: viewport.width(),
         height: viewport.height(),
-        scale: viewport.scale_factor(),
         rgba: &mut rgba,
         glyphs: 0,
     };
 
     let mut items = 0;
-    for item in &scene.items {
-        let painted = match item {
-            Item::Rect { x, y, w, h, color } => {
-                ctx.fill_rect(*x, *y, *w, *h, *color);
-                true
-            }
-            Item::RectOutline {
-                x,
-                y,
-                w,
-                h,
-                thickness,
-                color,
-            } => {
-                ctx.stroke_rect(*x, *y, *w, *h, *thickness, *color);
-                true
-            }
-            Item::Text {
-                x,
-                y,
-                text,
-                size,
-                color,
-                weight,
-            } => {
-                ctx.draw_text(
-                    fonts,
-                    &TextRun {
-                        x: *x,
-                        y: *y,
-                        text,
-                        size: *size,
-                        color: *color,
-                        weight: *weight,
-                    },
-                );
-                true
-            }
-        };
-        if painted {
-            items += 1;
-        }
+    for DisplayRect { rect, color } in &list.rects {
+        ctx.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
+        items += 1;
+    }
+    for text in &list.texts {
+        ctx.draw_text(fonts, text);
+        items += 1;
     }
 
     let glyphs = ctx.glyphs;
@@ -119,16 +75,11 @@ pub(crate) fn paint(
 struct PaintCtx<'a> {
     width: u32,
     height: u32,
-    scale: f32,
     rgba: &'a mut [u8],
     glyphs: usize,
 }
 
 impl PaintCtx<'_> {
-    fn to_device(&self, v: f32) -> i64 {
-        (v * self.scale).round() as i64
-    }
-
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
         let i = (y * self.width as usize + x) * 4;
         let dst = Color::from_rgba8(
@@ -145,10 +96,11 @@ impl PaintCtx<'_> {
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        let x0 = self.to_device(x).max(0) as u32;
-        let y0 = self.to_device(y).max(0) as u32;
-        let x1 = self.to_device(x + w).clamp(0, self.width as i64) as u32;
-        let y1 = self.to_device(y + h).clamp(0, self.height as i64) as u32;
+        // Rects arrive already in device pixels; snap the edges only.
+        let x0 = x.round().max(0.0) as u32;
+        let y0 = y.round().max(0.0) as u32;
+        let x1 = (x + w).round().clamp(0.0, self.width as f32) as u32;
+        let y1 = (y + h).round().clamp(0.0, self.height as f32) as u32;
         for py in y0..y1 {
             for px in x0..x1 {
                 self.blend_pixel(px as usize, py as usize, color);
@@ -156,156 +108,46 @@ impl PaintCtx<'_> {
         }
     }
 
-    fn stroke_rect(&mut self, x: f32, y: f32, w: f32, h: f32, thickness: f32, color: Color) {
-        self.fill_rect(x, y, w, thickness, color); // top
-        self.fill_rect(x, y + h - thickness, w, thickness, color); // bottom
-        self.fill_rect(x, y + thickness, thickness, h - 2.0 * thickness, color); // left
-        self.fill_rect(
-            x + w - thickness,
-            y + thickness,
-            thickness,
-            h - 2.0 * thickness,
-            color,
-        ); // right
-    }
-
-    fn draw_text(&mut self, fonts: &mut FontStore, run: &TextRun<'_>) {
-        let px = (run.size * self.scale).round().max(1.0) as u16;
-        let ascent = fonts.ascent(run.weight, px);
-        let line_height = px as f32 * LINE_HEIGHT_FACTOR;
-        let mut line_index = 0u32;
-        for line in run.text.split('\n') {
-            let pen_y = run.y * self.scale + line_index as f32 * line_height + ascent;
-            let mut pen_x = run.x * self.scale;
-            for ch in line.chars() {
-                let glyph = fonts.glyph(run.weight, ch, px);
-                let advance = glyph.advance;
-                let bitmap_left = pen_x as i64 + glyph.xmin as i64;
-                let bitmap_top = (pen_y.round() as i64) - glyph.ymin as i64 - glyph.height as i64;
-                for (row, coverage_row) in
-                    glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate()
-                {
-                    let dy = bitmap_top + row as i64;
-                    if dy < 0 || dy >= self.height as i64 {
+    /// Draws one run: glyphs are placed so the run's *baseline* sits at
+    /// `text.y`, matching the layout pass's line-box centering.
+    fn draw_text(&mut self, fonts: &mut FontStore, text: &DisplayText) {
+        let weight = if text.bold {
+            crate::font::FontWeight::Bold
+        } else {
+            crate::font::FontWeight::Regular
+        };
+        let mut pen_x = text.x.round();
+        for ch in text.text.chars() {
+            let glyph = fonts.glyph(weight, ch, text.px);
+            let advance = glyph.advance;
+            let bitmap_left = pen_x as i64 + glyph.xmin as i64;
+            let bitmap_top = text.y.round() as i64 - glyph.ymin as i64 - glyph.height as i64;
+            for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
+                let dy = bitmap_top + row as i64;
+                if dy < 0 || dy >= self.height as i64 {
+                    continue;
+                }
+                for (col, alpha) in coverage_row.iter().enumerate() {
+                    let dx = bitmap_left + col as i64;
+                    if dx < 0 || dx >= self.width as i64 || *alpha == 0 {
                         continue;
                     }
-                    for (col, alpha) in coverage_row.iter().enumerate() {
-                        let dx = bitmap_left + col as i64;
-                        if dx < 0 || dx >= self.width as i64 || *alpha == 0 {
-                            continue;
-                        }
-                        let shade = Color::from_rgba8(
-                            run.color.r,
-                            run.color.g,
-                            run.color.b,
-                            scale_u8(*alpha, run.color.a),
-                        );
-                        self.blend_pixel(dx as usize, dy as usize, shade);
-                    }
+                    let shade = Color::from_rgba8(
+                        text.color.r,
+                        text.color.g,
+                        text.color.b,
+                        scale_u8(*alpha, text.color.a),
+                    );
+                    self.blend_pixel(dx as usize, dy as usize, shade);
                 }
-                self.glyphs += 1;
-                pen_x += advance;
             }
-            line_index += 1;
+            self.glyphs += 1;
+            pen_x += advance;
         }
     }
-}
-
-/// A text item borrowed for painting.
-struct TextRun<'a> {
-    x: f32,
-    y: f32,
-    text: &'a str,
-    size: f32,
-    color: Color,
-    weight: crate::scene::FontWeight,
 }
 
 /// Coverage-to-alpha scaling that stays exact at the ends (0, 255).
 fn scale_u8(a: u8, b: u8) -> u8 {
     ((a as u16 * b as u16 + 127) / 255) as u8
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scene::Item;
-
-    fn vp(w: u32, h: u32, scale: f32) -> Viewport {
-        Viewport::try_new(w, h, scale).unwrap()
-    }
-
-    #[test]
-    fn fill_rect_snaps_to_device_pixels() {
-        let scene = Scene {
-            background: Color::BLACK,
-            items: vec![Item::Rect {
-                x: 10.3,
-                y: 10.3,
-                w: 20.4,
-                h: 20.4,
-                color: Color::WHITE,
-            }],
-        };
-        let (frame, items, glyphs) =
-            paint(&scene, vp(64, 64, 1.0), &mut FontStore::bundled()).unwrap();
-        assert_eq!((items, glyphs), (1, 0));
-        // round(10.3)=10 .. round(30.7)=31.
-        assert_eq!(frame.pixel(10, 10), Some(Color::WHITE));
-        assert_eq!(frame.pixel(30, 30), Some(Color::WHITE));
-        assert_eq!(frame.pixel(31, 30), Some(Color::BLACK));
-        assert_eq!(frame.pixel(10, 9), Some(Color::BLACK));
-    }
-
-    #[test]
-    fn fill_rect_clips_to_viewport() {
-        let scene = Scene {
-            background: Color::BLACK,
-            items: vec![Item::Rect {
-                x: -10.0,
-                y: -10.0,
-                w: 200.0,
-                h: 200.0,
-                color: Color::WHITE,
-            }],
-        };
-        let (frame, _, _) = paint(&scene, vp(64, 64, 1.0), &mut FontStore::bundled()).unwrap();
-        assert_eq!(frame.pixel(0, 0), Some(Color::WHITE));
-        assert_eq!(frame.pixel(63, 63), Some(Color::WHITE));
-    }
-
-    #[test]
-    fn dpi_scale_grows_text_coverage() {
-        let text_scene = |size: f32| Scene {
-            background: Color::BLACK,
-            items: vec![Item::Text {
-                x: 4.0,
-                y: 4.0,
-                text: "VelquView".into(),
-                size,
-                color: Color::WHITE,
-                weight: crate::scene::FontWeight::Regular,
-            }],
-        };
-        let mut fonts = FontStore::bundled();
-        let (small, _, g1) = paint(&text_scene(12.0), vp(200, 80, 1.0), &mut fonts).unwrap();
-        let (large, _, g2) = paint(&text_scene(12.0), vp(400, 160, 2.0), &mut fonts).unwrap();
-        assert_eq!(g1, g2, "same glyph count at any DPI");
-        let ink = |f: &Frame| f.pixels().chunks_exact(4).filter(|p| p[0] > 0).count();
-        let small_ink = ink(&small);
-        let large_ink = ink(&large);
-        assert!(large_ink > small_ink * 3, "2x DPI covers ~4x the pixels");
-    }
-
-    #[test]
-    fn pixel_buffer_is_fully_initialized() {
-        // The fallible-allocation path must still produce a fully painted
-        // background (resize zero-fills; the fill loop must cover it).
-        let scene = Scene::new(Color::from_rgb8(0x11, 0x22, 0x33));
-        let (frame, _, _) = paint(&scene, vp(37, 23, 1.0), &mut FontStore::bundled()).unwrap();
-        assert_eq!(frame.pixels().len(), 37 * 23 * 4);
-        for px in frame.pixels().chunks_exact(4) {
-            assert_eq!(px, [0x11, 0x22, 0x33, 0xff]);
-        }
-    }
 }

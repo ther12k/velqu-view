@@ -13,7 +13,14 @@ use std::collections::HashMap;
 
 use fontdue::Font;
 
-use crate::scene::FontWeight;
+/// Text weight, resolved to one of the bundled faces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum FontWeight {
+    /// The regular bundled face.
+    Regular,
+    /// The bold bundled face.
+    Bold,
+}
 
 const DEJAVU_SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 const DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
@@ -71,6 +78,9 @@ impl FontStore {
     }
 
     /// Ascent (distance above the baseline) in device pixels for `px`-sized text.
+    /// Unused since layout centers text with constant metric ratios (layout.rs);
+    /// kept for the M2b text overhaul which needs real font metrics.
+    #[allow(dead_code)]
     pub(crate) fn ascent(&self, weight: FontWeight, px: u16) -> f32 {
         self.face(weight)
             .vertical_line_metrics(px as f32)
@@ -78,6 +88,9 @@ impl FontStore {
             .unwrap_or(px as f32 * 0.8)
     }
 
+    /// Ascent (distance above the baseline) in device pixels; unused since the
+    /// layout pass centers text with constant metric ratios (see layout.rs).
+    #[allow(dead_code)]
     /// Returns the rasterized glyph for `ch`, caching by weight + pixel size.
     pub(crate) fn glyph(&mut self, weight: FontWeight, ch: char, px: u16) -> &Glyph {
         let key = GlyphKey { weight, ch, px };

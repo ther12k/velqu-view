@@ -1,22 +1,50 @@
-# M1 visual fixture: same document as `hello`, rendered at 2x DPI.
-# Proves logical geometry scales with the viewport's scale factor:
-# swatch centers land at exactly 2x the 1x coordinates.
+# M2a fixture: the hello document at 2x DPI. Proves the whole pipeline —
+# cascade, block layout, text wrapping — is a pure function of the viewport:
+# geometry lands at exactly 2x the 1x device coordinates.
 name = "hello-2x"
 html = "examples/hello/index.html"
 css = ["examples/hello/app.css"]
 viewport = { width = 1600, height = 1200, scale = 2.0 }
 
 [expect]
-pixels_sha256 = "a8e904435977e1c2bd9edb416cc18ffecaa69fa9e2f97b50e4cf81ad03dbffe5"
+pixels_sha256 = "43a27e3fbda894af3901c8c367507e276a1781b91e3e4a825b0546e8d4e0e0b4"
 
+# Exact-color probes at 2x the 1x coordinates (page bg, card fill, border).
 [[expect.pixel]]
-pos = [64, 64]
+pos = [8, 8]
 color = "#10141C"
 
 [[expect.pixel]]
-pos = [88, 288]
-color = "#EF4444"
+pos = [80, 80]
+color = "#171D29"
 
 [[expect.pixel]]
-pos = [344, 288]
-color = "#8B5CF6"
+pos = [32, 34]
+color = "#2A3242"
+
+[[expect.facts]]
+id = "card"
+tag = "main"
+display = "block"
+x = 32.0
+y = 32.0
+width = 872.0            # exactly 2x the 1x border box
+# Box-model facts are device pixels: 16 CSS px padding → 32 at 2x.
+padding = [32.0, 32.0, 32.0, 32.0]
+border = [4.0, 4.0, 4.0, 4.0]
+margin = [32.0, 32.0, 32.0, 32.0]
+content_x = 68.0
+content_y = 68.0
+content_width = 800.0
+
+[[expect.facts]]
+id = "title"
+tag = "h1"
+display = "block"
+text_runs = ["Hello, VelquView"]
+
+[[expect.facts]]
+id = "subtitle"
+tag = "p"
+display = "block"
+text_runs = ["M1 fixture: native window, rectangle, text, resize, DPI,", "frame capture."]
