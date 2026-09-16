@@ -66,6 +66,7 @@ mod layout;
 mod painter;
 mod source;
 mod style;
+mod taffy_backend;
 mod text;
 mod viewport;
 

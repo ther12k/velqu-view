@@ -52,7 +52,72 @@ impl Length {
 pub(crate) enum Display {
     Block,
     Inline,
+    /// M2b: children laid out with the flex algorithm (Taffy-backed).
+    Flex,
     None,
+}
+
+/// M2b flex profile: main-axis direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FlexDirection {
+    #[default]
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+/// M2b flex profile: line wrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FlexWrap {
+    #[default]
+    Nowrap,
+    Wrap,
+}
+
+/// M2b flex profile: main-axis distribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum JustifyContent {
+    #[default]
+    FlexStart,
+    Center,
+    FlexEnd,
+    SpaceBetween,
+}
+
+/// M2b flex profile: cross-axis alignment of items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AlignItems {
+    #[default]
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd,
+    /// Deferred (ADR 0007): accepted by the parser with a diagnostic,
+    /// laid out as FlexStart — never silently.
+    Baseline,
+}
+
+/// align-self: auto inherits the container align-items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AlignSelf {
+    #[default]
+    Auto,
+    Stretch,
+    FlexStart,
+    Center,
+    FlexEnd,
+    Baseline,
+}
+
+/// M2b overflow: visible | hidden | clip. Clipping executes in the
+/// display list/painter; layout only switches containment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Clip,
 }
 
 /// Text alignment in the M2a profile.
@@ -148,6 +213,21 @@ pub(crate) struct ComputedStyle {
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
+    /// M2b flex profile (all non-inheriting).
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    pub flex_grow: f32,
+    pub flex_shrink: f32,
+    /// `None` = auto.
+    pub flex_basis: Option<Length>,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    pub align_self: AlignSelf,
+    /// `gap` shorthand sets both; percentages resolve at layout.
+    pub row_gap: Option<Length>,
+    pub column_gap: Option<Length>,
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
 }
 
 impl ComputedStyle {
@@ -174,6 +254,18 @@ impl ComputedStyle {
             line_height: LineHeight::Normal,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
+            flex_direction: FlexDirection::Row,
+            flex_wrap: FlexWrap::Nowrap,
+            flex_grow: 0.0,
+            flex_shrink: 1.0,
+            flex_basis: None,
+            justify_content: JustifyContent::FlexStart,
+            align_items: AlignItems::Stretch,
+            align_self: AlignSelf::Auto,
+            row_gap: None,
+            column_gap: None,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
         }
     }
 }
@@ -547,6 +639,7 @@ fn apply_declaration(
         "display" => match declaration.value.as_str() {
             "block" => style.display = Display::Block,
             "inline" => style.display = Display::Inline,
+            "flex" => style.display = Display::Flex,
             "none" => style.display = Display::None,
             _ => diagnostics.push(unsupported("display value")),
         },

@@ -1,27 +1,25 @@
-//! Box tree and block layout (M2a).
+//! Box tree and layout orchestration (M2a block semantics; M2b adds flex).
 //!
 //! Layout identity is distinct from DOM identity (ADR 0005): boxes are
 //! rebuilt from scratch on every layout pass. The pipeline is
-//! DOM + ComputedStyle → box tree → laid-out boxes → [`LayoutFacts`] and a
+//! DOM + ComputedStyle → box tree → **Taffy** (private backend,
+//! `taffy_backend.rs`, ADR 0007) → laid-out boxes → [`LayoutFacts`] and a
 //! [`DisplayList`] for painting.
 //!
-//! M2a scope: normal block flow only — margin/padding/border, width/height/
-//! min/max, greedy text wrapping, text-align. Documented simplifications: no
-//! margin collapsing (adjacent margins add), percentage heights resolve as
-//! auto (the containing height is not fixed in block flow), box-sizing is
-//! content-box, and inline boxes flatten into text runs (their
-//! backgrounds/borders arrive in M2b).
+//! This module owns the box tree, projection input ordering, inline content
+//! positioning, facts collection, and display-list emission. The layout
+//! algorithms themselves (block, flex) run in the private Taffy backend;
+//! rounding happens only at raster time (ADR 0007).
 //!
 //! All layout geometry is in **device pixels** — logical CSS px values are
-//! multiplied by the viewport scale during resolution so text measurement
-//! and painting share one metric space.
+//! scaled during projection so text measurement and painting share one
+//! metric space.
 
 use crate::color::Color;
-use crate::display_list::{DisplayList, DisplayRect, DisplayText, Rect};
+use crate::display_list::{DisplayItem, DisplayList, Rect};
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::font::FontStore;
-use crate::style::{ComputedStyle, Display, Length, LineHeight, Sides, TextAlign};
-use crate::text;
+use crate::style::{ComputedStyle, Display};
 use crate::viewport::Viewport;
 
 /// Versioned, fixture-facing layout facts.
@@ -86,13 +84,24 @@ pub struct LayoutNodeFact {
 
 /// One wrap unit with its own style.
 #[derive(Debug, Clone)]
-struct Word {
-    text: String,
-    style: ComputedStyle,
+pub(crate) struct Word {
+    pub text: String,
+    pub style: ComputedStyle,
     /// A whitespace separator preceded this word in the source.
-    space_before: bool,
+    pub space_before: bool,
     /// Element whose content produced this word (fixture facts).
-    source: NodeId,
+    pub source: NodeId,
+}
+
+/// Where a box's inline content (lines) is anchored. Differs from the
+/// content origin when the words were wrapped into an anonymous child by
+/// the Taffy projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TextOrigin {
+    pub x: f32,
+    pub y: f32,
+    /// Wrap width for line breaking and alignment.
+    pub width: f32,
 }
 
 /// A block box: geometry plus inline content lines.
@@ -112,9 +121,11 @@ pub(crate) struct BoxNode {
     /// Border box = padding box + border.
     pub border_box: Rect,
     /// Resolved margins (device px).
-    pub margin: Sides<f32>,
+    pub margin: crate::style::Sides<f32>,
     /// Inline content words, in source order (wrapped during layout).
-    words: Vec<Word>,
+    pub words: Vec<Word>,
+    /// Set by the backend when words live in an anonymous child.
+    pub text_origin: Option<TextOrigin>,
 }
 
 /// One laid-out line (runs positioned relative to the content box).
@@ -188,8 +199,9 @@ pub(crate) fn build_boxes(dom: &Dom, root: NodeId, styles: &StyleMap) -> Option<
         content: Rect::default(),
         padding_box: Rect::default(),
         border_box: Rect::default(),
-        margin: Sides::default(),
+        margin: crate::style::Sides::default(),
         words: Vec::new(),
+        text_origin: None,
     };
 
     let mut pending_space_before = false;
@@ -201,7 +213,7 @@ pub(crate) fn build_boxes(dom: &Dom, root: NodeId, styles: &StyleMap) -> Option<
                     .map(|s| s.display)
                     .unwrap_or(Display::Inline)
                 {
-                    Display::Block => {
+                    Display::Block | Display::Flex => {
                         if let Some(child_box) = build_boxes(dom, child, styles) {
                             box_node.children.push(child_box);
                         }
@@ -305,14 +317,15 @@ fn collect_inline_words(
 
 /// Lays out the document inside `viewport` and returns the root box plus
 /// its display list.
+///
+/// The box tree is built here (Velqu-canonical), then laid out by the
+/// private Taffy backend (ADR 0007), then lowered to a display list.
 pub(crate) fn layout_document(
     dom: &Dom,
     viewport: Viewport,
     cascade: &mut crate::style::Cascade<'_>,
     fonts: &mut FontStore,
 ) -> Option<(BoxNode, DisplayList)> {
-    let scale = viewport.scale_factor();
-
     // The layout root: <body> if present, else <html>, else the document.
     let mut root_element = None;
     dom.walk_from(dom.document(), |id, _node| {
@@ -325,286 +338,104 @@ pub(crate) fn layout_document(
     let styles = compute_all_styles(dom, root_element, cascade);
     let mut root = build_boxes(dom, root_element, &styles)?;
 
-    layout_box(
-        &mut root,
-        0.0,
-        0.0,
-        viewport.width() as f32,
-        viewport.height() as f32,
-        scale,
-        fonts,
-    );
+    crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts);
 
     let mut list = DisplayList::default();
     emit_display_list(&root, &mut list);
     Some((root, list))
 }
 
-/// Resolves a length against `containing` (device px).
-fn resolve(len: Length, containing: f32, scale: f32) -> f32 {
-    match len {
-        Length::Px(v) => v * scale,
-        Length::Percent(p) => p / 100.0 * containing,
-        Length::Rem(v) => v * scale,
-    }
-}
-
-fn resolve_sides(sides: Sides<Length>, containing: f32, scale: f32) -> Sides<f32> {
-    Sides {
-        top: resolve(sides.top, containing, scale),
-        right: resolve(sides.right, containing, scale),
-        bottom: resolve(sides.bottom, containing, scale),
-        left: resolve(sides.left, containing, scale),
-    }
-}
-
-/// Lays out one box. `x`/`y` are the margin-box origin; `available_width`
-/// is the containing block's content width. Returns the margin-box height.
-pub(crate) fn layout_box(
-    node: &mut BoxNode,
-    x: f32,
-    y: f32,
-    available_width: f32,
-    containing_height: f32,
-    scale: f32,
-    fonts: &mut FontStore,
-) -> f32 {
-    let style = node.style.clone();
-    let border = resolve_sides(
-        Sides {
-            top: style.border_width.top,
-            right: style.border_width.right,
-            bottom: style.border_width.bottom,
-            left: style.border_width.left,
-        },
-        available_width,
-        scale,
-    );
-    let padding = resolve_sides(style.padding, available_width, scale);
-    let margin = resolve_sides(style.margin, available_width, scale);
-    node.margin = margin;
-
-    // Content width: specified → clamped; else fill the remaining space.
-    let used_horizontally = padding.left + padding.right + border.left + border.right;
-    let mut content_width = match style.width {
-        Some(Length::Percent(p)) => p / 100.0 * available_width - used_horizontally,
-        Some(len) => resolve(len, available_width, scale),
-        None => (available_width - used_horizontally).max(0.0),
-    };
-    if let Some(max) = style.max_width {
-        let max = resolve(max, available_width, scale);
-        if content_width > max {
-            content_width = max;
-        }
-    }
-    if let Some(min) = style.min_width {
-        let min = resolve(min, available_width, scale);
-        if content_width < min {
-            content_width = min;
-        }
-    }
-    content_width = content_width.max(0.0);
-
-    node.border_box = Rect {
-        x: x + margin.left,
-        y: y + margin.top,
-        w: content_width + padding.left + padding.right + border.left + border.right,
-        h: 0.0,
-    };
-    node.padding_box = Rect {
-        x: node.border_box.x + border.left,
-        y: node.border_box.y + border.top,
-        w: content_width + padding.left + padding.right,
-        h: 0.0,
-    };
-    node.content = Rect {
-        x: node.padding_box.x + padding.left,
-        y: node.padding_box.y + padding.top,
-        w: content_width,
-        h: 0.0,
-    };
-
-    // Inline content: greedy wrap of the styled words.
-    let block_font_px = (style.font_size * scale).round().max(1.0);
-    let line_height = match style.line_height {
-        LineHeight::Normal => 1.5 * block_font_px,
-        LineHeight::Number(n) => n * block_font_px,
-        LineHeight::Px(v) => v * scale,
-    };
-    let mut lines: Vec<LaidLine> = Vec::new();
-    let mut current = LaidLine::default();
-    let mut cursor_x = 0.0;
-
-    for word in &node.words {
-        let word_px = (word.style.font_size * scale).round().max(1.0) as u16;
-        let weight = text::face_weight(word.style.font_weight);
-        let word_width = text::measure_run(fonts, &word.text, word_px, weight);
-        let space_width = if current.runs.is_empty() || !word.space_before {
-            0.0
-        } else {
-            let last = current.runs.last().expect("checked non-empty");
-            text::measure_run(fonts, " ", last.px, text::face_weight(400))
-        };
-        if !current.runs.is_empty()
-            && content_width > 0.0
-            && cursor_x + space_width + word_width > content_width
-        {
-            lines.push(std::mem::take(&mut current));
-            cursor_x = 0.0;
-        }
-        let at_line_start = current.runs.is_empty();
-        let space = if at_line_start { 0.0 } else { space_width };
-        let run_x = cursor_x + space;
-        current.runs.push(RunBox {
-            x: run_x,
-            text: word.text.clone(),
-            width: word_width,
-            px: word_px,
-            bold: weight == crate::font::FontWeight::Bold,
-            color: word.style.color,
-            source: word.source,
-        });
-        cursor_x = run_x + word_width;
-    }
-    if !current.runs.is_empty() {
-        lines.push(current);
-    }
-
-    // Position lines: vertical stacking + horizontal alignment.
-    let mut line_cursor = 0.0;
-    for line in &mut lines {
-        line.y = line_cursor;
-        line.height = line_height;
-        let line_width = line
-            .runs
-            .last()
-            .map(|last| last.x + last.width)
-            .unwrap_or(0.0);
-        let offset = match style.text_align {
-            TextAlign::Left => 0.0,
-            TextAlign::Center => ((content_width - line_width) / 2.0).max(0.0),
-            TextAlign::Right => (content_width - line_width).max(0.0),
-        };
-        for run in &mut line.runs {
-            run.x += offset;
-        }
-        line_cursor += line.height;
-    }
-    node.lines = lines;
-
-    // Block children stack below the inline content.
-    let mut child_cursor = line_cursor;
-    for child in &mut node.children {
-        let child_height = layout_box(
-            child,
-            node.content.x,
-            node.content.y + child_cursor,
-            content_width,
-            containing_height,
-            scale,
-            fonts,
-        );
-        child_cursor += child_height;
-    }
-
-    // Content height: specified → clamped; else the laid-out extent.
-    let mut content_height = match style.height {
-        Some(Length::Px(v)) => v * scale,
-        Some(Length::Rem(v)) => v * scale,
-        // Percentage heights need a fixed containing height; M2a resolves
-        // them as auto.
-        _ => child_cursor,
-    };
-    if let Some(max) = style.max_height {
-        let max = resolve(max, containing_height, scale);
-        if content_height > max {
-            content_height = max;
-        }
-    }
-    if let Some(min) = style.min_height {
-        let min = resolve(min, containing_height, scale);
-        if content_height < min {
-            content_height = min;
-        }
-    }
-    node.content.h = content_height;
-    node.padding_box.h = content_height + padding.top + padding.bottom;
-    node.border_box.h = node.padding_box.h + border.top + border.bottom;
-
-    margin.top + node.border_box.h + margin.bottom
-}
-
-/// Emits paint-ready items: backgrounds, borders, then text (per box).
+/// Emits paint-ready items: backgrounds, borders, text, with
+/// `overflow: hidden`/`clip` boxes scoping their descendants via clip
+/// items. Layout owns geometry; the display list owns paint ordering and
+/// clipping; the painter executes.
 pub(crate) fn emit_display_list(node: &BoxNode, list: &mut DisplayList) {
+    emit_box(node, list, None);
+}
+
+fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>) {
     let style = &node.style;
+    let _ = parent_clip;
+
+    // Own chrome (background, border): the painter applies the current
+    // clip stack, which at this point is the ancestors' clips.
     if style.background_color.a > 0 {
-        list.rects.push(DisplayRect {
+        list.items.push(DisplayItem::FillRect {
             rect: node.padding_box,
             color: style.background_color,
         });
     }
     if style.border_style_solid {
-        let b = Sides {
-            top: resolve(style.border_width.top, 0.0, 1.0),
-            right: resolve(style.border_width.right, 0.0, 1.0),
-            bottom: resolve(style.border_width.bottom, 0.0, 1.0),
-            left: resolve(style.border_width.left, 0.0, 1.0),
+        // Border widths derive from the laid-out boxes so they always
+        // agree with the geometry facts.
+        let b = crate::style::Sides {
+            top: node.padding_box.y - node.border_box.y,
+            left: node.padding_box.x - node.border_box.x,
+            right: node.border_box.x + node.border_box.w
+                - (node.padding_box.x + node.padding_box.w),
+            bottom: node.border_box.y + node.border_box.h
+                - (node.padding_box.y + node.padding_box.h),
         };
         let bb = node.border_box;
         let bc = style.border_color;
-        if b.top > 0.0 {
-            list.rects.push(DisplayRect {
-                rect: Rect {
+        for (rect, width) in [
+            (
+                Rect {
                     x: bb.x,
                     y: bb.y,
                     w: bb.w,
                     h: b.top,
                 },
-                color: bc,
-            });
-        }
-        if b.bottom > 0.0 {
-            list.rects.push(DisplayRect {
-                rect: Rect {
+                b.top,
+            ),
+            (
+                Rect {
                     x: bb.x,
                     y: bb.y + bb.h - b.bottom,
                     w: bb.w,
                     h: b.bottom,
                 },
-                color: bc,
-            });
-        }
-        if b.left > 0.0 {
-            list.rects.push(DisplayRect {
-                rect: Rect {
+                b.bottom,
+            ),
+            (
+                Rect {
                     x: bb.x,
                     y: bb.y + b.top,
                     w: b.left,
                     h: (bb.h - b.top - b.bottom).max(0.0),
                 },
-                color: bc,
-            });
-        }
-        if b.right > 0.0 {
-            list.rects.push(DisplayRect {
-                rect: Rect {
+                b.left,
+            ),
+            (
+                Rect {
                     x: bb.x + bb.w - b.right,
                     y: bb.y + b.top,
                     w: b.right,
                     h: (bb.h - b.top - b.bottom).max(0.0),
                 },
-                color: bc,
-            });
+                b.right,
+            ),
+        ] {
+            if width > 0.0 {
+                list.items.push(DisplayItem::FillRect { rect, color: bc });
+            }
         }
     }
+
+    // Inline content: anchored at the box's text origin (content origin,
+    // or the anonymous words node when the backend created one).
+    let (origin_x, origin_y) = match node.text_origin {
+        Some(origin) => (origin.x, origin.y),
+        None => (node.content.x, node.content.y),
+    };
     for line in &node.lines {
         for run in &line.runs {
             // Baseline: center the font's ink range in the line box.
             let (ascent, descent) = font_verticals(run.px);
             let ink = ascent - descent;
-            let baseline = node.content.y + line.y + (line.height - ink) / 2.0 + ascent;
-            list.texts.push(DisplayText {
-                x: node.content.x + run.x,
+            let baseline = origin_y + line.y + (line.height - ink) / 2.0 + ascent;
+            list.items.push(DisplayItem::TextRun {
+                x: origin_x + run.x,
                 y: baseline,
                 text: run.text.clone(),
                 px: run.px,
@@ -613,8 +444,21 @@ pub(crate) fn emit_display_list(node: &BoxNode, list: &mut DisplayList) {
             });
         }
     }
-    for child in &node.children {
-        emit_display_list(child, list);
+
+    // Children, scoped by this box's clip when it clips overflow.
+    match style.overflow_y {
+        crate::style::Overflow::Visible => {
+            for child in &node.children {
+                emit_box(child, list, parent_clip);
+            }
+        }
+        crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
+            list.items.push(DisplayItem::PushClip(node.padding_box));
+            for child in &node.children {
+                emit_box(child, list, Some(node.padding_box));
+            }
+            list.items.push(DisplayItem::PopClip);
+        }
     }
 }
 
@@ -763,6 +607,7 @@ fn runs_text(line: &LaidLine) -> String {
 fn display_name(display: Display) -> String {
     match display {
         Display::Block => "block".into(),
+        Display::Flex => "flex".into(),
         Display::Inline => "inline".into(),
         Display::None => "none".into(),
     }
@@ -843,8 +688,9 @@ mod tests {
     #[test]
     fn text_wraps_at_content_width() {
         let mut fonts = FontStore::bundled();
-        let mut measure =
-            |word: &str| text::measure_run(&mut fonts, word, 16, crate::font::FontWeight::Regular);
+        let mut measure = |word: &str| {
+            crate::text::measure_run(&mut fonts, word, 16, crate::font::FontWeight::Regular)
+        };
         let space = measure(" ");
         // Content width fits "Hello wrapped" but not the third word.
         let content = measure("Hello") + space + measure("wrapped");
@@ -891,9 +737,10 @@ mod tests {
         let viewport = Viewport::try_new(400, 400, 1.0).unwrap();
         let (root, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
         // The text run's color equals the outer div's color.
-        assert!(!list.texts.is_empty());
+        let runs = list.text_runs();
+        assert!(!runs.is_empty());
         let expected = Color::from_hex("#102030").unwrap();
-        assert!(list.texts.iter().all(|t| t.color == expected));
+        assert!(runs.iter().all(|t| t.color == expected));
         let mut facts = LayoutFacts {
             schema_version: 0,
             viewport_width: 0,
@@ -932,8 +779,9 @@ mod tests {
         let mut fonts = FontStore::bundled();
         let viewport = Viewport::try_new(400, 200, 1.0).unwrap();
         let (_, list) = layout_document(&dom, viewport, &mut cascade, &mut fonts).unwrap();
-        let run = &list.texts[0];
-        let run_width = text::measure_run(&mut fonts, "hi", 16, crate::font::FontWeight::Regular);
+        let run = &list.text_runs()[0];
+        let run_width =
+            crate::text::measure_run(&mut fonts, "hi", 16, crate::font::FontWeight::Regular);
         assert!((run.x - (8.0 + (300.0 - run_width) / 2.0)).abs() < 1.0);
     }
 
@@ -943,5 +791,16 @@ mod tests {
         assert_eq!(facts.schema_version, LAYOUT_FACTS_SCHEMA_VERSION);
         assert_eq!((facts.viewport_width, facts.viewport_height), (200, 200));
         assert_eq!(facts.scale, 1.0);
+    }
+
+    #[test]
+    fn probe_body_geometry() {
+        let facts = facts_for(
+            "<body data-vv-test=b><div data-vv-test=a>one</div></body>",
+            "",
+            400,
+            400,
+        );
+        eprintln!("PROBE facts: {:#?}", facts.nodes);
     }
 }

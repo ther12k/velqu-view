@@ -7,7 +7,10 @@ css = ["examples/hello/app.css"]
 viewport = { width = 1600, height = 1200, scale = 2.0 }
 
 [expect]
-pixels_sha256 = "43a27e3fbda894af3901c8c367507e276a1781b91e3e4a825b0546e8d4e0e0b4"
+# Regenerated for the M2b Taffy migration: 1x stayed byte-identical; 2x
+# baselines moved because Taffy lays out in unrounded f32 (ADR 0007) and
+# glyph rasterization at 2x font sizes is not exactly 2x the 1x ink.
+pixels_sha256 = "2f49acbacb13908bb2de0fe79692097964286f7ed4a74fa97a243e0a6704a63c"
 
 # Exact-color probes at 2x the 1x coordinates (page bg, card fill, border).
 [[expect.pixel]]

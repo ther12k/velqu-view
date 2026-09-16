@@ -1,7 +1,10 @@
 //! CPU rasterizer for display lists produced by the layout pass.
 //!
 //! The painter makes **no layout decisions** (ADR 0005): it consumes a
-//! finished [`DisplayList`] plus a background color and produces pixels.
+//! finished [`DisplayList`] — fills, text runs, clip scoping — plus a
+//! background color and produces pixels. Clip scopes
+//! ([`DisplayItem::PushClip`]/[`DisplayItem::PopClip`]) intersect with the
+//! running clip stack; every item is bounded by the innermost clip.
 //!
 //! Determinism rules (fixture hashes depend on them):
 //! * rectangles are solid fills snapped to device-pixel edges — no
@@ -11,7 +14,7 @@
 //! * frame buffers are pixel-bounded upstream and allocated fallibly.
 
 use crate::color::Color;
-use crate::display_list::{DisplayList, DisplayRect, DisplayText};
+use crate::display_list::{DisplayItem, DisplayList, Rect};
 use crate::font::FontStore;
 use crate::viewport::Viewport;
 use crate::{Frame, VelquError};
@@ -52,19 +55,44 @@ pub(crate) fn paint_document(
         height: viewport.height(),
         rgba: &mut rgba,
         glyphs: 0,
+        items: 0,
+        clip: None,
     };
 
-    let mut items = 0;
-    for DisplayRect { rect, color } in &list.rects {
-        ctx.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
-        items += 1;
-    }
-    for text in &list.texts {
-        ctx.draw_text(fonts, text);
-        items += 1;
+    for item in &list.items {
+        match item {
+            DisplayItem::FillRect { rect, color } => {
+                ctx.fill_rect(rect.x, rect.y, rect.w, rect.h, *color);
+                ctx.items += 1;
+            }
+            DisplayItem::TextRun {
+                x,
+                y,
+                text,
+                px,
+                bold,
+                color,
+            } => {
+                ctx.draw_text(
+                    fonts,
+                    &TextRunPlacement {
+                        x: *x,
+                        baseline_y: *y,
+                        text,
+                        px: *px,
+                        bold: *bold,
+                        color: *color,
+                    },
+                );
+                ctx.items += 1;
+            }
+            DisplayItem::PushClip(rect) => ctx.push_clip(*rect),
+            DisplayItem::PopClip => ctx.pop_clip(),
+        }
     }
 
     let glyphs = ctx.glyphs;
+    let items = ctx.items;
     Ok((
         Frame::from_parts(viewport.width(), viewport.height(), rgba),
         items,
@@ -77,9 +105,38 @@ struct PaintCtx<'a> {
     height: u32,
     rgba: &'a mut [u8],
     glyphs: usize,
+    items: usize,
+    /// Innermost active clip, or `None` (whole surface).
+    clip: Option<Rect>,
 }
 
 impl PaintCtx<'_> {
+    /// Intersects the pushed rect with the running clip.
+    fn push_clip(&mut self, rect: Rect) {
+        let clipped = match self.clip {
+            None => rect,
+            Some(outer) => intersect(outer, rect),
+        };
+        self.clip = Some(clipped);
+    }
+
+    /// Ends the innermost clip scope. M2b emission is balanced; a stray
+    /// PopClip is a harmless no-op.
+    fn pop_clip(&mut self) {
+        self.clip = None;
+    }
+
+    fn clip_contains(&self, x: i64, y: i64) -> bool {
+        match self.clip {
+            None => true,
+            Some(clip) => {
+                let cx = clip.x as i64;
+                let cy = clip.y as i64;
+                x >= cx && x < cx + clip.w as i64 && y >= cy && y < cy + clip.h as i64
+            }
+        }
+    }
+
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
         let i = (y * self.width as usize + x) * 4;
         let dst = Color::from_rgba8(
@@ -103,25 +160,29 @@ impl PaintCtx<'_> {
         let y1 = (y + h).round().clamp(0.0, self.height as f32) as u32;
         for py in y0..y1 {
             for px in x0..x1 {
-                self.blend_pixel(px as usize, py as usize, color);
+                if self.clip_contains(px as i64, py as i64) {
+                    self.blend_pixel(px as usize, py as usize, color);
+                }
             }
         }
     }
 
     /// Draws one run: glyphs are placed so the run's *baseline* sits at
-    /// `text.y`, matching the layout pass's line-box centering.
-    fn draw_text(&mut self, fonts: &mut FontStore, text: &DisplayText) {
-        let weight = if text.bold {
+    /// `run.baseline_y`, matching the layout pass's line-box centering.
+    /// Pixels outside the active clip are skipped.
+    fn draw_text(&mut self, fonts: &mut FontStore, run: &TextRunPlacement<'_>) {
+        let weight = if run.bold {
             crate::font::FontWeight::Bold
         } else {
             crate::font::FontWeight::Regular
         };
-        let mut pen_x = text.x.round();
-        for ch in text.text.chars() {
-            let glyph = fonts.glyph(weight, ch, text.px);
+        let mut pen_x = run.x.round();
+        for ch in run.text.chars() {
+            let glyph = fonts.glyph(weight, ch, run.px);
             let advance = glyph.advance;
             let bitmap_left = pen_x as i64 + glyph.xmin as i64;
-            let bitmap_top = text.y.round() as i64 - glyph.ymin as i64 - glyph.height as i64;
+            let bitmap_top =
+                run.baseline_y.round() as i64 - glyph.ymin as i64 - glyph.height as i64;
             for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
                 let dy = bitmap_top + row as i64;
                 if dy < 0 || dy >= self.height as i64 {
@@ -132,11 +193,14 @@ impl PaintCtx<'_> {
                     if dx < 0 || dx >= self.width as i64 || *alpha == 0 {
                         continue;
                     }
+                    if !self.clip_contains(dx, dy) {
+                        continue;
+                    }
                     let shade = Color::from_rgba8(
-                        text.color.r,
-                        text.color.g,
-                        text.color.b,
-                        scale_u8(*alpha, text.color.a),
+                        run.color.r,
+                        run.color.g,
+                        run.color.b,
+                        scale_u8(*alpha, run.color.a),
                     );
                     self.blend_pixel(dx as usize, dy as usize, shade);
                 }
@@ -144,6 +208,29 @@ impl PaintCtx<'_> {
             self.glyphs += 1;
             pen_x += advance;
         }
+    }
+}
+
+/// Borrowed view of one [`DisplayItem::TextRun`] for painting.
+struct TextRunPlacement<'a> {
+    x: f32,
+    baseline_y: f32,
+    text: &'a str,
+    px: u16,
+    bold: bool,
+    color: Color,
+}
+
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let right = (a.x + a.w).min(b.x + b.w);
+    let bottom = (a.y + a.h).min(b.y + b.h);
+    Rect {
+        x,
+        y,
+        w: (right - x).max(0.0),
+        h: (bottom - y).max(0.0),
     }
 }
 
