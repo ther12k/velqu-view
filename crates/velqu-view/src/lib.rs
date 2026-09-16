@@ -62,6 +62,7 @@ mod display_list;
 mod dom;
 mod font;
 mod html;
+mod image;
 mod layout;
 mod painter;
 mod source;
@@ -76,6 +77,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 pub use color::{Color, ColorParseError};
+pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
