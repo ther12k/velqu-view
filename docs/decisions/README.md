@@ -17,6 +17,7 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0011](0011-m4b-interaction-styling.md) | M4b: interaction styling (:hover/:focus/:active frozen to paint) — interactive state never lays out | accepted |
 | [0012](0012-m4c1-editable-controls.md) | M4c1: editable controls — opaque element identity, runtime control state, grapheme-safe editing | accepted |
 | [0013](0013-m4c2-clipboard.md) | M4c2: clipboard — Copy/Cut/Paste through a host `ClipboardProvider`; arboard confined to the shell | accepted |
+| [0014](0014-m4c3-ime.md) | M4c3: IME — preedit is presentation state, commit the only value mutation; session-scoped composition; shell owns enablement | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how

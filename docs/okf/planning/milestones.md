@@ -46,8 +46,9 @@ presentation-only repaint, cursor, focus origin — ADR 0011, done);
 element identity, runtime input/textarea values, grapheme-safe editing,
 pointer-capture selection, scroll-to-caret — ADR 0012, done), M4c2
 clipboard (Copy/Cut/Paste through a host `ClipboardProvider`, arboard
-confined to the shell — ADR 0013, done), M4c3 IME treated as a
-platform-integration milestone with dedicated platform verification.
+confined to the shell — ADR 0013, done), M4c3 IME (preedit
+presentation + atomic commit, session-scoped composition, shell-side
+enablement — ADR 0014, done; interactive platform smoke pending).
 
 Exit: forms/input fixture passes.
 
