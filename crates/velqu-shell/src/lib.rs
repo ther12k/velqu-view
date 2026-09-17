@@ -28,8 +28,14 @@
 //! transactional. Routing is AltGr-safe (ADR 0013): Alt disqualifies
 //! shortcut chords and text suppression, so Ctrl+Alt chords (e.g. `@` =
 //! Ctrl+Alt+Q on German layouts) insert their produced text. The
-//! clipboard adapter is torn down explicitly at loop exit. IME stays
-//! deferred to M4c3.
+//! clipboard adapter is torn down explicitly at loop exit. M4c3 adds
+//! IME: winit's `Ime` events translate onto the view's backend-
+//! independent composition API, and the shell owns enablement —
+//! `set_ime_allowed` follows the focused control and
+//! `set_ime_cursor_area` tracks the caret rect in physical pixels
+//! through focus changes, caret/selection movement, scrolling, resizes,
+//! and composition updates (ADR 0014). Window blur cancels an active
+//! composition.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -39,7 +45,7 @@ use velqu_view::{
     CursorStyle, FrameResult, KeyCommand, KeyModifiers, VelquError, VelquView, Viewport,
 };
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -196,6 +202,8 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
         started: Instant::now(),
         frames: 0,
         modifiers: ModifiersState::default(),
+        ime_allowed: false,
+        ime_rect: None,
         error: None,
     };
     let loop_result = event_loop.run_app(&mut app);
@@ -229,6 +237,12 @@ struct ShellApp<'a> {
     started: Instant,
     frames: u64,
     modifiers: ModifiersState,
+    /// The IME enablement last pushed to the window, so state changes are
+    /// the only `set_ime_allowed` calls (M4c3).
+    ime_allowed: bool,
+    /// The candidate rect last pushed to the window, deduplicating
+    /// `set_ime_cursor_area` calls (M4c3).
+    ime_rect: Option<velqu_view::ControlRect>,
     error: Option<ShellError>,
 }
 
@@ -311,6 +325,60 @@ impl ShellApp<'_> {
                 window.set_cursor(cursor_icon(cursor));
             }
         }
+    }
+
+    /// Pushes IME enablement and the candidate-rect anchor to the window
+    /// (M4c3, ADR 0014). Called after anything that can move the caret or
+    /// change focus: keyboard/pointer input, wheel scrolling, redraws,
+    /// window focus, and IME events themselves. Both calls are
+    /// change-gated; the rect is in physical pixels, matching the
+    /// renderer's device-space geometry.
+    fn update_ime(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let allowed = self.view.wants_ime();
+        if allowed != self.ime_allowed {
+            self.ime_allowed = allowed;
+            window.set_ime_allowed(allowed);
+        }
+        if !allowed {
+            self.ime_rect = None;
+            return;
+        }
+        let Some(viewport) = self.input_viewport() else {
+            return;
+        };
+        let Some(rect) = self.view.ime_cursor_rect(viewport) else {
+            return;
+        };
+        if self.ime_rect != Some(rect) {
+            self.ime_rect = Some(rect);
+            window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(rect.x.round() as i32, rect.y.round() as i32),
+                winit::dpi::PhysicalSize::new(
+                    rect.width.round().max(1.0) as u32,
+                    rect.height.round().max(1.0) as u32,
+                ),
+            );
+        }
+    }
+
+    /// Translates winit's window-level IME events onto the view's
+    /// backend-independent composition API (M4c3, ADR 0014).
+    fn ime_event(&mut self, event: Ime) {
+        let changed = match event {
+            Ime::Preedit(text, cursor) => self.view.ime_preedit(&text, cursor),
+            Ime::Commit(text) => self.view.ime_commit(&text),
+            // The platform IME went away mid-composition.
+            Ime::Disabled => self.view.ime_cancel(),
+            Ime::Enabled => false,
+        };
+        if changed {
+            self.dirty = true;
+            self.request_redraw();
+        }
+        self.update_ime();
     }
 
     fn key_modifiers(&self) -> KeyModifiers {
@@ -430,6 +498,18 @@ impl ApplicationHandler for ShellApp<'_> {
             }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
                 self.keyboard_input(event_loop, &event);
+                self.update_ime();
+            }
+            winit::event::WindowEvent::Ime(event) => {
+                self.ime_event(event);
+            }
+            winit::event::WindowEvent::Focused(focused) => {
+                if !focused {
+                    // Window blur cancels any active composition (M4c3);
+                    // the platform IME loses our context with it.
+                    self.view.ime_cancel();
+                }
+                self.update_ime();
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_moved(position);
@@ -454,6 +534,7 @@ impl ApplicationHandler for ShellApp<'_> {
                     self.dirty = true;
                     self.request_redraw();
                 }
+                self.update_ime();
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
                 let Some(viewport) = self.input_viewport() else {
@@ -474,10 +555,14 @@ impl ApplicationHandler for ShellApp<'_> {
                 // re-renders from the baked offsets with zero relayout.
                 self.dirty = true;
                 self.request_redraw();
+                // Ancestor scrolling moves the candidate anchor (M4c3).
+                self.update_ime();
             }
             winit::event::WindowEvent::RedrawRequested => {
                 self.redraw(event_loop);
                 self.dirty = false;
+                // Caret geometry may have moved (scroll-to-caret etc.).
+                self.update_ime();
             }
             _ => {}
         }

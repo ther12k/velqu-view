@@ -48,6 +48,13 @@
 //!   is deleted only after its clipboard write succeeded — and pasted text
 //!   goes through the same filter as direct insertion, with CRLF
 //!   normalization ([ADR 0013](docs/decisions/0013-m4c2-clipboard.md)).
+//! * **M4c3 (done):** IME — preedit is presentation state (it paints with
+//!   an underline and moves the caret, but only `ime_commit` ever mutates
+//!   the value, atomically through the shared text filter); composition
+//!   is session-scoped so stale commits and stray keyboard input cannot
+//!   edit the wrong control; the shell owns enablement via `wants_ime`
+//!   and `ime_cursor_rect`
+//!   ([ADR 0014](docs/decisions/0014-m4c3-ime.md)).
 //!
 //! # Example
 //!
@@ -403,6 +410,11 @@ pub struct VelquView {
     pointer_capture: Option<dom::NodeId>,
     /// Selection anchor recorded at pointer press for the captured control.
     pointer_anchor: Option<usize>,
+    /// The active IME session (M4c3, ADR 0014): which control owns the
+    /// composition and in which document. Window-level IME events carry no
+    /// element identity, so ownership is captured at composition start and
+    /// every later event is checked against it.
+    ime_session: Option<(dom::NodeId, u64)>,
     /// Monotonic document identity used to scope public element handles.
     document_generation: u64,
     /// The element under the pointer (for `:hover`), if any.
@@ -475,6 +487,7 @@ impl VelquView {
             pointer_pos: None,
             pointer_capture: None,
             pointer_anchor: None,
+            ime_session: None,
             hover: None,
             focus: None,
             focus_origin: None,
@@ -732,6 +745,7 @@ impl VelquView {
         self.pointer_pos = None;
         self.pointer_capture = None;
         self.pointer_anchor = None;
+        self.ime_session = None;
         self.hover = None;
         self.focus = None;
         self.pressed = None;
@@ -1622,6 +1636,12 @@ impl VelquView {
     }
 
     fn set_focus_node_with(&mut self, to: Option<dom::NodeId>, origin: input::FocusOrigin) {
+        // Focus transfer cancels an active composition without committing
+        // (M4c3, ADR 0014): a later Commit for the old owner must be a
+        // stale no-op, never an edit of the newly focused control.
+        if self.ime_session.is_some() && to != self.focus {
+            self.ime_cancel();
+        }
         if to.is_some_and(|node| {
             self.controls
                 .get(&node)
@@ -1653,6 +1673,13 @@ impl VelquView {
     /// names before calling this method. Returns whether the runtime state
     /// changed. Editing never mutates the DOM or runs document layout.
     pub fn key_command(&mut self, command: KeyCommand, modifiers: KeyModifiers) -> bool {
+        // While an IME composition is active it owns the input: keyboard
+        // commands are ignored so a platform that still delivers
+        // KeyboardInput during preedit (an open winit/Windows issue)
+        // cannot mutate the value behind the IME's back (M4c3, ADR 0014).
+        if self.ime_session.is_some() {
+            return false;
+        }
         let Some(node) = self.focus else {
             return false;
         };
@@ -1744,6 +1771,13 @@ impl VelquView {
     /// control characters and newlines for single-line inputs (the same
     /// filter paste applies, ADR 0013).
     pub fn insert_text(&mut self, text: &str) -> bool {
+        // During an active composition, `Ime::Commit` is the only text
+        // insertion source (M4c3, ADR 0014): stray `KeyEvent.text` from a
+        // platform that still delivers keyboard input while preediting
+        // must not double-insert.
+        if self.ime_session.is_some() {
+            return false;
+        }
         let Some(node) = self.focus else {
             return false;
         };
@@ -1761,6 +1795,189 @@ impl VelquView {
         let before_selection = state.selection();
         state.editor.insert_text(&filtered);
         self.finish_control_change(node, before_value, before_selection)
+    }
+
+    // -- IME (M4c3, ADR 0014) ---------------------------------------------
+
+    /// Whether the platform IME should be enabled for the current focus:
+    /// true exactly when an editable (non-readonly, non-disabled) control
+    /// holds focus. The shell polls this and drives `set_ime_allowed`.
+    pub fn wants_ime(&self) -> bool {
+        self.focus.is_some_and(|node| {
+            self.controls
+                .get(&node)
+                .is_some_and(|state| !state.disabled && !state.readonly)
+        })
+    }
+
+    /// The rectangle the platform candidate window should anchor to, in
+    /// **viewport device pixels** — the caret (or composition cursor) rect
+    /// mapped through the document and ancestor scroll transforms.
+    ///
+    /// `None` when no editable control is focused or no layout is cached
+    /// for `viewport` (the no-implicit-layout rule). Re-read after caret/
+    /// selection movement, internal or ancestor scrolling, resize,
+    /// scale-factor change, or composition updates.
+    pub fn ime_cursor_rect(&self, viewport: Viewport) -> Option<ControlRect> {
+        let node = match self.ime_session {
+            Some((node, generation)) if generation == self.document_generation => node,
+            _ => self.focus?,
+        };
+        if !self.wants_ime() {
+            return None;
+        }
+        let laid = self.cached_layout(viewport)?;
+        let geometry = self.control_geometry.get(&node)?;
+        let (offset_x, offset_y) =
+            input::accumulated_scroll_offset(&laid.root, laid.root_offset, node)?;
+        Some(ControlRect {
+            x: geometry.caret.x - offset_x,
+            y: geometry.caret.y - offset_y,
+            width: geometry.caret.w.max(1.0),
+            height: geometry.caret.h,
+        })
+    }
+
+    /// Feeds an `Ime::Preedit` event: shows or updates the composition in
+    /// the focused editable control.
+    ///
+    /// The preedit text is **presentation state** — it paints (with an
+    /// underline, caret at the composition cursor) but never enters the
+    /// runtime value and emits no events; zero layout passes run. An update
+    /// replaces the previous composition rather than appending. `cursor`
+    /// byte offsets are clamped to valid UTF-8 boundaries before use
+    /// (platform indexes are never trusted). Empty `text` clears the
+    /// composition presentation while the session stays live for the
+    /// commit winit delivers next.
+    ///
+    /// Starting a composition captures the session owner: later preedit/
+    /// commit events apply only to that control of that document.
+    /// Readonly or disabled controls never start a session.
+    pub fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) -> bool {
+        let node = match self.ime_session {
+            Some((node, generation)) if generation == self.document_generation => node,
+            _ => {
+                let Some(node) = self.focus else {
+                    return false;
+                };
+                if !self.focus_is_editable(node) {
+                    return false;
+                }
+                self.ime_session = Some((node, self.document_generation));
+                node
+            }
+        };
+        let Some(state) = self.controls.get_mut(&node) else {
+            self.ime_session = None;
+            return false;
+        };
+        if state.disabled || state.readonly {
+            state.composition = None;
+            self.ime_session = None;
+            return false;
+        }
+        if text.is_empty() {
+            if state.composition.take().is_some() {
+                self.rebuild_control_presentation();
+                return true;
+            }
+            return false;
+        }
+        // The replaced range is fixed at composition start (the selection
+        // captured then); updates keep it.
+        let range = state.composition.as_ref().map_or_else(
+            || {
+                let (anchor, focus) = state.selection();
+                (anchor.min(focus), anchor.max(focus))
+            },
+            |composition| composition.range,
+        );
+        state.composition = Some(control::CompositionState::new(
+            text.to_owned(),
+            cursor,
+            range,
+        ));
+        self.rebuild_control_presentation();
+        true
+    }
+
+    /// Feeds an `Ime::Commit` event: one atomic edit of the focused
+    /// control.
+    ///
+    /// The active composition's range (or, without one, the current
+    /// selection) is replaced by the committed text filtered through the
+    /// same [`VelquView::insert_text`] filter — no fourth normalization
+    /// path — and the composition clears. `ValueChanged` then
+    /// `SelectionChanged` fire exactly once. A commit whose session owner
+    /// is no longer the focused editable control (stale commit after
+    /// focus transfer, reload, or readonly/disable) is a safe no-op.
+    pub fn ime_commit(&mut self, text: &str) -> bool {
+        let Some((node, generation)) = self.ime_session.take() else {
+            return false;
+        };
+        if generation != self.document_generation {
+            return false;
+        }
+        if self.focus != Some(node) {
+            // Stale commit: the session died with the focus move; nothing
+            // may land in whatever is focused now.
+            if let Some(state) = self.controls.get_mut(&node) {
+                state.composition = None;
+            }
+            return false;
+        }
+        let Some(state) = self.controls.get_mut(&node) else {
+            return false;
+        };
+        if state.disabled || state.readonly {
+            state.composition = None;
+            return false;
+        }
+        let before_value = state.value().to_owned();
+        let before_selection = state.selection();
+        let range = state.composition.take().map_or_else(
+            || {
+                let (anchor, focus) = state.selection();
+                (anchor.min(focus), anchor.max(focus))
+            },
+            |composition| composition.range,
+        );
+        let filtered = state.kind.filter_text(text);
+        if !filtered.is_empty() {
+            state.editor.replace_range(range.0, range.1, &filtered);
+        } else {
+            // Nothing insertable (e.g. a lone newline into an input): the
+            // replaced selection still clears, collapsed to range start.
+            state.editor.set_selection(range.0, range.0);
+        }
+        self.finish_control_change(node, before_value, before_selection)
+    }
+
+    /// Cancels the active composition without committing (window blur,
+    /// `Ime::Disabled`). The preedit presentation disappears; the value
+    /// never changes.
+    pub fn ime_cancel(&mut self) -> bool {
+        let Some((node, generation)) = self.ime_session.take() else {
+            return false;
+        };
+        let mut changed = false;
+        if generation == self.document_generation {
+            if let Some(state) = self.controls.get_mut(&node) {
+                changed = state.composition.take().is_some();
+            }
+        }
+        if changed {
+            self.rebuild_control_presentation();
+        }
+        changed
+    }
+
+    /// Whether the focused node is an editable (non-readonly,
+    /// non-disabled) control.
+    fn focus_is_editable(&self, node: dom::NodeId) -> bool {
+        self.controls
+            .get(&node)
+            .is_some_and(|state| !state.disabled && !state.readonly)
     }
 
     fn finish_control_change(
@@ -3735,6 +3952,292 @@ mod tests {
         assert_eq!(
             view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
             Some("precious")
+        );
+    }
+
+    // -- M4c3 IME (ADR 0014; gate pre-registered in
+    // docs/evidence/m4c3-gate.md) ---------------------------------------
+
+    fn ime_view(html: &str) -> VelquView {
+        let mut view = VelquView::new();
+        view.load_html(html).unwrap();
+        view
+    }
+
+    fn value_of<'a>(view: &'a VelquView, id: &str) -> Option<&'a str> {
+        view.control_value(view.node_target(view.element_node(id).unwrap()).handle)
+    }
+
+    #[test]
+    fn m4c3_preedit_paints_without_touching_the_value() {
+        // Gate scenarios 1 and 10: pixels change, value does not; an
+        // update replaces the composition instead of appending; zero
+        // Taffy passes; no events.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abc></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.wants_ime(), "an editable control is focused");
+        assert!(view.ime_cursor_rect(vp).is_some());
+        // Baseline AFTER focus: a focused control paints its caret, so the
+        // comparison isolates the composition's pixels.
+        let before = view.render(vp).unwrap();
+        let hash_before = before.frame.sha256_hex();
+
+        // Cursor after both glyphs (6 bytes): the caret sits right of the
+        // whole composition.
+        assert!(view.ime_preedit("にほ", Some((6, 6))));
+        assert_eq!(
+            value_of(&view, "box"),
+            Some("abc"),
+            "preedit never mutates value"
+        );
+        assert!(view.take_events().is_empty(), "preedit emits nothing");
+        let composed = view.render(vp).unwrap();
+        assert_ne!(
+            composed.frame.sha256_hex(),
+            hash_before,
+            "the composition paints"
+        );
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "composition costs zero passes"
+        );
+        let facts = view.control_facts(vp).unwrap();
+        let caret_mid = facts.controls[0].caret_rect;
+
+        // Updating the preedit replaces it: "ほ" instead of "にほ".
+        assert!(view.ime_preedit("ほ", Some((3, 3))));
+        let replaced = view.render(vp).unwrap();
+        assert_ne!(
+            replaced.frame.sha256_hex(),
+            composed.frame.sha256_hex(),
+            "the shorter composition paints differently"
+        );
+        let facts = view.control_facts(vp).unwrap();
+        assert!(
+            facts.controls[0].caret_rect.x < caret_mid.x,
+            "the caret follows the replaced composition"
+        );
+        assert_eq!(value_of(&view, "box"), Some("abc"));
+
+        // Cancelling restores the pre-composition pixels exactly.
+        assert!(view.ime_cancel());
+        let restored = view.render(vp).unwrap();
+        assert_eq!(
+            restored.frame.sha256_hex(),
+            hash_before,
+            "cancel returns to the value-only raster"
+        );
+    }
+
+    #[test]
+    fn m4c3_commit_inserts_exactly_once_and_clears_the_composition() {
+        // Gate scenario 2.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abc></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("にほ", Some((3, 3))));
+
+        assert!(view.ime_commit("日本"));
+        assert_eq!(value_of(&view, "box"), Some("日本abc"));
+        let target = view.node_target(view.element_node("box").unwrap());
+        assert_eq!(
+            view.take_events(),
+            vec![
+                Event::ValueChanged {
+                    target: target.clone(),
+                    value: "日本abc".to_owned(),
+                },
+                Event::SelectionChanged {
+                    target,
+                    anchor: "日本".len(),
+                    focus: "日本".len(),
+                },
+            ],
+            "commit fires the standard event pair exactly once"
+        );
+        // The session ended: another commit is inert.
+        assert!(!view.ime_commit("二"));
+        assert_eq!(value_of(&view, "box"), Some("日本abc"));
+    }
+
+    #[test]
+    fn m4c3_composition_over_a_selection_replaces_it() {
+        // Gate scenario 3: the selection captured at composition start is
+        // the range a commit replaces.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abcdef></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("ニホン", None));
+        assert!(view.ime_commit("語"));
+        assert_eq!(value_of(&view, "box"), Some("語"));
+    }
+
+    #[test]
+    fn m4c3_blur_cancels_and_a_stale_commit_cannot_touch_the_new_control() {
+        // Gate scenarios 4 and 5.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=a value=one><input id=b value=two></body></html>",
+        );
+        let vp = Viewport::try_new(300, 160, 1.0).unwrap();
+        view.render(vp).unwrap();
+        // Baseline with the *destination* control focused: the caret moves
+        // with focus, so comparing against an unfocused raster would not
+        // isolate the composition.
+        view.set_focus(Some("b"));
+        let _ = view.take_events();
+        let clean = view.render(vp).unwrap();
+        let hash_clean = clean.frame.sha256_hex();
+
+        view.set_focus(Some("a"));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("か", Some((3, 3))));
+
+        // Focus transfer cancels the composition without committing.
+        view.set_focus(Some("b"));
+        let _ = view.take_events();
+        let restored = view.render(vp).unwrap();
+        assert_eq!(
+            restored.frame.sha256_hex(),
+            hash_clean,
+            "the cancelled composition leaves no pixels"
+        );
+
+        // The stale commit is inert: neither control changes.
+        assert!(!view.ime_commit("か"));
+        assert_eq!(value_of(&view, "a"), Some("one"));
+        assert_eq!(value_of(&view, "b"), Some("two"));
+
+        // Window-level blur (focus cleared) cancels the same way.
+        view.set_focus(Some("a"));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("き", Some((3, 3))));
+        view.set_focus(None);
+        assert!(!view.ime_commit("き"));
+        assert_eq!(value_of(&view, "a"), Some("one"));
+    }
+
+    #[test]
+    fn m4c3_preedit_cursor_indexes_are_clamped_not_trusted() {
+        // Gate scenarios 6 and 7: out-of-range and non-boundary platform
+        // indexes cannot panic and land on valid UTF-8 boundaries.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abc></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        let facts_before = view.control_facts(vp).unwrap();
+        let caret_at_zero = facts_before.controls[0].caret_rect.x;
+
+        // "にほ": に is 3 bytes. Offset 1 is not a boundary → clamps to 0;
+        // 99 is out of range → clamps to len; (5, 3) orders to (3, 5).
+        assert!(view.ime_preedit("にほ", Some((1, 1))));
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            facts.controls[0].caret_rect.x, caret_at_zero,
+            "a non-boundary cursor clamps down to the preceding boundary"
+        );
+        assert!(view.ime_preedit("にほ", Some((99, 0))));
+        assert!(view.ime_preedit("にほ", Some((5, 3))));
+        assert_eq!(value_of(&view, "box"), Some("abc"));
+        assert!(view.render(vp).is_ok(), "no panic anywhere in the pipeline");
+    }
+
+    #[test]
+    fn m4c3_readonly_controls_never_start_a_composition() {
+        // Gate scenario 8.
+        let mut view = ime_view(
+            "<!doctype html><html><body><input id=ro value=frozen readonly></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("ro"));
+        let _ = view.take_events();
+        assert!(!view.wants_ime(), "readonly is not IME-editable");
+        assert!(!view.ime_preedit("か", None), "no composition starts");
+        assert!(!view.ime_commit("か"));
+        assert_eq!(value_of(&view, "ro"), Some("frozen"));
+        assert!(view.ime_cursor_rect(vp).is_none());
+    }
+
+    #[test]
+    fn m4c3_ancestor_scrolling_moves_the_candidate_rect() {
+        // Gate scenario 9: the IME anchor is viewport-space, so an
+        // ancestor scroll (not the control's own geometry) moves it.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=pane style=\"overflow: auto; width: 200px; height: 100px\">\
+             <div style=\"height: 300px\"></div>\
+             <input id=box value=abc>\
+             </div></body></html>",
+        );
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        let before = view.ime_cursor_rect(vp).expect("anchor before scrolling");
+
+        // Wheel inside the pane scrolls it 40px down; the input rides up.
+        view.wheel(vp, 100.0, 50.0, 0.0, 40.0);
+        let _ = view.take_events();
+        let after = view.ime_cursor_rect(vp).expect("anchor after scrolling");
+        assert!(
+            after.y < before.y,
+            "the candidate anchor follows the ancestor scroll: {before:?} → {after:?}"
+        );
+    }
+
+    #[test]
+    fn m4c3_stray_keyboard_input_during_composition_cannot_double_insert() {
+        // Gate scenario 11: the Windows-shape bug — KeyboardInput still
+        // arriving while preediting. Commit must be the only insertion.
+        let mut view = ime_view(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abc></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("a", Some((1, 1))));
+        assert!(!view.insert_text("a"), "stray text is suppressed");
+        assert!(!view.key_command(KeyCommand::Backspace, KeyModifiers::default()));
+        assert!(!view.key_command(KeyCommand::Enter, KeyModifiers::default()));
+        assert!(!view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        assert!(view.ime_commit("あ"));
+        assert_eq!(
+            value_of(&view, "box"),
+            Some("あabc"),
+            "exactly one insertion"
         );
     }
 

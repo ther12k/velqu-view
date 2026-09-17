@@ -125,6 +125,29 @@ pub(crate) fn point_in_node(
     walk(root, target, x + document_scroll.0, y + document_scroll.1)
 }
 
+/// The translation `point_in_node` would apply for `target`: the document
+/// scroll plus every ancestor's applied scroll. Subtracting it from a
+/// node-space point yields viewport space (M4c3: the IME candidate rect).
+pub(crate) fn accumulated_scroll_offset(
+    root: &BoxNode,
+    document_scroll: (f32, f32),
+    target: NodeId,
+) -> Option<(f32, f32)> {
+    fn walk(node: &BoxNode, target: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+        if node.node == target {
+            return Some((x, y));
+        }
+        let (ox, oy) = node.applied_scroll;
+        for child in &node.children {
+            if let Some(found) = walk(child, target, x + ox, y + oy) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(root, target, document_scroll.0, document_scroll.1)
+}
+
 /// Recursive hit walk in the given coordinate space. `(x, y)` is in the
 /// space the node's own geometry lives in; scrolling translates the point
 /// only when *descending into children* (their geometry is content-space),

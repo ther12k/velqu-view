@@ -37,7 +37,7 @@ native lightweight application UI
 | M4b | interaction styling: :hover/:focus/:active frozen to paint, presentation-only repaint, cursor, focus origin ([ADR 0011](docs/decisions/0011-m4b-interaction-styling.md)) | **done** |
 | M4c1 | editable controls: opaque element identity, runtime input/textarea values, grapheme-safe editing, pointer-capture selection, scroll-to-caret ([ADR 0012](docs/decisions/0012-m4c1-editable-controls.md)) | **done** |
 | M4c2 | clipboard: Copy/Cut/Paste through a host `ClipboardProvider`, arboard in the shell ([ADR 0013](docs/decisions/0013-m4c2-clipboard.md)) | **done** |
-| M4c3 | IME: preedit/commit as a platform-integration milestone | next |
+| M4c3 | IME: preedit presentation + atomic commit, session-scoped composition, shell-side enablement ([ADR 0014](docs/decisions/0014-m4c3-ime.md)) | **done** |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) | |
 | M6 | VelquView Lab inspector + reload | |
 | M7 | reference Tailwind dashboard | |

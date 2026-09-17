@@ -169,7 +169,9 @@ impl EditorState {
         }
     }
 
-    fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
+    /// Replaces `start..end` with `replacement`, collapsing the caret to
+    /// the replacement's end (M4c3 commit path; ranges are normalized).
+    pub(crate) fn replace_range(&mut self, start: usize, end: usize, replacement: &str) {
         let start = self.normalize_boundary(start);
         let end = self.normalize_boundary(end).max(start);
         self.value.replace_range(start..end, replacement);

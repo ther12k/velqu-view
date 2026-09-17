@@ -58,7 +58,10 @@ impl ControlKind {
     }
 }
 
-/// A control's runtime value, selection, and internal scroll state.
+/// A control's runtime value, selection, internal scroll, and IME
+/// composition state (M4c3, ADR 0014). The composition is presentation
+/// state: it never enters `editor`'s value — only an explicit commit
+/// converts it into text.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ControlState {
     pub(crate) kind: ControlKind,
@@ -67,6 +70,7 @@ pub(crate) struct ControlState {
     pub(crate) disabled: bool,
     pub(crate) dirty: bool,
     pub(crate) scroll_offset: (f32, f32),
+    pub(crate) composition: Option<CompositionState>,
 }
 
 impl ControlState {
@@ -78,6 +82,7 @@ impl ControlState {
             disabled,
             dirty: false,
             scroll_offset: (0.0, 0.0),
+            composition: None,
         }
     }
 
@@ -87,6 +92,68 @@ impl ControlState {
 
     pub(crate) fn selection(&self) -> (usize, usize) {
         (self.editor.anchor(), self.editor.focus())
+    }
+
+    /// The text the editor *paints*: the real value with the composition
+    /// spliced over the range it replaces. Layout of this text is
+    /// presentation-only; the value stays untouched until commit.
+    pub(crate) fn effective_text(&self) -> String {
+        match &self.composition {
+            None => self.value().to_owned(),
+            Some(composition) => format!(
+                "{}{}{}",
+                &self.value()[..composition.range.0],
+                composition.text,
+                &self.value()[composition.range.1..]
+            ),
+        }
+    }
+
+    /// Where the visual caret sits in `effective_text` byte offsets: the
+    /// composition cursor while composing, the editor caret otherwise.
+    pub(crate) fn effective_caret(&self) -> usize {
+        match &self.composition {
+            None => self.editor.focus(),
+            Some(composition) => composition.range.0 + composition.cursor.1,
+        }
+    }
+}
+
+/// An active IME composition (M4c3, ADR 0014). All offsets are valid
+/// UTF-8 byte offsets; platform-supplied indexes are clamped here —
+/// never trusted (the gate's scenario 6/7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompositionState {
+    /// The preedit text. Never written into the control value.
+    pub(crate) text: String,
+    /// Cursor/selection within the preedit text, as clamped byte offsets.
+    pub(crate) cursor: (usize, usize),
+    /// The value range (captured from the selection at composition start)
+    /// that a commit will replace.
+    pub(crate) range: (usize, usize),
+}
+
+impl CompositionState {
+    /// Clamps `cursor` into `text` on valid UTF-8 boundaries, ordered.
+    pub(crate) fn new(text: String, cursor: Option<(usize, usize)>, range: (usize, usize)) -> Self {
+        let clamp = |offset: usize| {
+            let mut offset = offset.min(text.len());
+            while offset > 0 && !text.is_char_boundary(offset) {
+                offset -= 1;
+            }
+            offset
+        };
+        let (mut start, mut end) = cursor.unwrap_or((text.len(), text.len()));
+        start = clamp(start);
+        end = clamp(end);
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        Self {
+            text,
+            cursor: (start, end),
+            range,
+        }
     }
 }
 
@@ -280,8 +347,16 @@ fn paint_control(
     let weight = crate::text::face_weight(style.font_weight);
     let line_height = line_height(style, scale);
     let content = node.content;
-    let value = state.value().to_owned();
-    let caret = state.editor.focus();
+    // The editor paints its effective text: value + composition (M4c3,
+    // ADR 0014). The real value and selection are untouched by preedit.
+    let value = state.effective_text();
+    let caret = state.effective_caret();
+    let composition_span = state.composition.as_ref().map(|composition| {
+        (
+            composition.range.0,
+            composition.range.0 + composition.text.len(),
+        )
+    });
     let lines = line_spans(&value, state.kind);
     let caret_line = line_for_offset(&lines, caret);
     let caret_line_start = lines[caret_line].0;
@@ -387,7 +462,35 @@ fn paint_control(
         }
     }
     paint.push(crate::display_list::DisplayItem::PushClip(content));
-    let selection = state.editor.selected_range();
+    // While composing, the selection is suspended — the composition owns
+    // the replaced range — so only paint the composition underline.
+    let selection = if composition_span.is_none() {
+        state.editor.selected_range()
+    } else {
+        None
+    };
+    if let Some((composition_start, composition_end)) = composition_span {
+        // Composition underline: a thin rule under each painted line the
+        // composition touches (fixed profile styling, like the M4c1 chrome).
+        for (line_index, (start, end, _)) in lines.iter().enumerate() {
+            let from = composition_start.max(*start).min(*end);
+            let to = composition_end.max(*start).min(*end);
+            if from >= to {
+                continue;
+            }
+            let x0 = prefix_width(&value, *start, from, fonts, px, weight);
+            let x1 = prefix_width(&value, *start, to, fonts, px, weight);
+            paint.push(crate::display_list::DisplayItem::FillRect {
+                rect: Rect {
+                    x: content.x + x0 - scroll_x,
+                    y: content.y + line_index as f32 * line_height - scroll_y + line_height - 2.0,
+                    w: (x1 - x0).max(1.0),
+                    h: 2.0,
+                },
+                color: Color::from_rgb8(0x25, 0x62, 0xb9),
+            });
+        }
+    }
     if let Some((selection_start, selection_end)) = selection {
         for (line_index, (start, end, _)) in lines.iter().enumerate() {
             let from = selection_start.max(*start).min(*end);
