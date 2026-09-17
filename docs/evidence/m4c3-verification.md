@@ -77,4 +77,7 @@ into `velqu-view`.
   platform evidence this automation cannot synthesize, per the
   pre-registered gate.
 
-Landing: see the CI evidence in the commit history.
+Landing: `2da9d6c` (implementation + gate battery) + `0fa77cf` (docs)
+pushed to `main`; GitHub CI green — run
+[35227952541](https://github.com/ther12k/velqu-view/actions/runs/35227952541)
+(fmt/clippy/test/build + MSRV 1.87).
