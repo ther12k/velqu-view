@@ -72,5 +72,6 @@ into the derived promise (asserted via capture, not a job exception).
   check --workspace --all-targets --locked`; headless dashboard smoke
   digest unchanged (`770b933b…`).
 
-Landing: implementation + docs pushed to `main`; GitHub CI green (run
-recorded in the evidence addendum).
+Landing: `8dff4b8` pushed to `main`; GitHub CI green — run
+[35276425306](https://github.com/ther12k/velqu-view/actions/runs/35276425306)
+(fmt/clippy/test/build + MSRV 1.87).
