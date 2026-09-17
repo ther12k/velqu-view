@@ -56,6 +56,15 @@ Exit: forms/input fixture passes.
 
 UI QuickJS runtime, v0 directives/events/bindings, state inspector.
 
+Executed in slices: **M5a** runtime gate (bounded isolated QuickJS per
+document generation — heap/stack/deadline/job budgets, deterministic
+clock/random, no ambient I/O, hostile-script battery — ADR 0015,
+done); **M5b** binding compiler (vx-* surface → Rust-owned binding
+plan; static docs stay byte-identical), **M5c** state + events (M4
+events → JS turn → transactional mutation batch), **M5d**
+invalidation/batching (presentation → zero Taffy, structural → one
+pass) next.
+
 Exit: counter/forms/tabs examples pass reactive conformance.
 
 ## M6 - VelquView Lab

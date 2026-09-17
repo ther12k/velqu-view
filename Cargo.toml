@@ -43,6 +43,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 winit = "0.30"
 softbuffer = "0.4"
 
+# QuickJS bindings for Velqu Reactive (M5, ADR 0015). Feature set is
+# deliberate: no "rust-alloc"/"allocator" (either silently disables
+# set_memory_limit), no "loader"/"dyn-load" (no module/native loading).
+rquickjs = { version = "0.13", default-features = false, features = ["std"] }
+
 # Tooling / fixtures.
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"

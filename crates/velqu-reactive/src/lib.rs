@@ -9,15 +9,28 @@
 //! silently ignored; that is what lets tooling and AI agents catch typos
 //! before runtime.
 //!
-//! **M5 scope (not built yet):** state scopes, the isolated UI QuickJS
-//! expression context, the binding/invalidation graph, and native fast paths.
-//! The runtime will live here without changing the names below.
+//! **M5a scope (done, ADR 0015):** the isolated QuickJS runtime gate —
+//! one [`ReactiveRuntime`] per document generation under hard
+//! [`JsLimits`] (heap, stack, execution deadline, source/payload sizes,
+//! output strings, pending jobs), a sanctioned global surface with a
+//! deterministic clock (`Date`) and seeded randomness (`Math.random`),
+//! and a capped diagnostic sink. Hostile scripts terminate as
+//! classified, host-safe failures; no ambient I/O exists.
+//!
+//! **M5b–M5d scope (next):** the binding compiler (the `vx-*` surface →
+//! a Rust-owned binding plan), state + events (M4 events → JS turn →
+//! transactional mutation batch), and invalidation batching
+//! (presentation → zero Taffy passes, structural → one pass).
 //!
 //! The UI QuickJS context receives no browser APIs — no `document`, `window`,
 //! `navigator`, storage, network, or filesystem — and never owns the DOM:
 //! expressions mutate reactive state; Rust applies resulting DOM changes.
 
 use std::fmt;
+
+mod runtime;
+
+pub use runtime::{InvalidJsLimits, JsFailure, JsLimits, LOGICAL_EPOCH_MS, ReactiveRuntime};
 
 /// v0 directives (`vx-*` attribute names), per the Velqu Reactive v0 spec.
 pub const DIRECTIVES: &[&str] = &[
