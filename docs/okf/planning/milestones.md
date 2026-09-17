@@ -42,10 +42,12 @@ Executed in slices: **M4a** input gate (hit testing, pointer/focus
 events, wheel scrolling with zero relayout — ADR 0010, done); **M4b**
 interaction styling (`:hover`/`:focus`/`:active` frozen to paint-only,
 presentation-only repaint, cursor, focus origin — ADR 0011, done);
-**M4c** editing, split internally: M4c1 editable controls (value, caret,
-keyboard editing, selection), M4c2 clipboard behind a shell interface,
-M4c3 IME treated as a platform-integration milestone with dedicated
-platform verification.
+**M4c** editing, split internally: M4c1 editable controls (opaque
+element identity, runtime input/textarea values, grapheme-safe editing,
+pointer-capture selection, scroll-to-caret — ADR 0012, done), M4c2
+clipboard (Copy/Cut/Paste through a host `ClipboardProvider`, arboard
+confined to the shell — ADR 0013, done), M4c3 IME treated as a
+platform-integration milestone with dedicated platform verification.
 
 Exit: forms/input fixture passes.
 

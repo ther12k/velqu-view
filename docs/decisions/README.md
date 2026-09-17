@@ -15,6 +15,8 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0009](0009-m3-tailwind-pipeline.md) | M3: v0 Tailwind-compatible pipeline (utilities → CSS → cascade) in velqu-tailwind | accepted |
 | [0010](0010-m4a-input-gate.md) | M4a: input gate — hit testing as inverse of paint, runtime interaction state, browser-signed wheel with zero relayout | accepted |
 | [0011](0011-m4b-interaction-styling.md) | M4b: interaction styling (:hover/:focus/:active frozen to paint) — interactive state never lays out | accepted |
+| [0012](0012-m4c1-editable-controls.md) | M4c1: editable controls — opaque element identity, runtime control state, grapheme-safe editing | accepted |
+| [0013](0013-m4c2-clipboard.md) | M4c2: clipboard — Copy/Cut/Paste through a host `ClipboardProvider`; arboard confined to the shell | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how
