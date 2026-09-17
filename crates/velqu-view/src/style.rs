@@ -284,6 +284,21 @@ impl Sides<Length> {
     }
 }
 
+/// The CSS `cursor` property's v0 values (M4b, ADR 0011). Inherited and
+/// presentation-only: a cursor change never lays out or repaints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorStyle {
+    /// UA default (the shell maps this to the platform arrow).
+    #[default]
+    Auto,
+    /// The platform's default arrow.
+    Default,
+    /// A hand, over clickable things.
+    Pointer,
+    /// An I-beam, over selectable text.
+    Text,
+}
+
 /// Fully computed style for one element (M2a profile properties).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
@@ -336,6 +351,8 @@ pub(crate) struct ComputedStyle {
     /// M3: which box `width`/`height` size (Tailwind preflight sets
     /// border-box document-wide via the generated utility sheet).
     pub box_sizing: BoxSizing,
+    /// M4b: pointer cursor over the element (inherited).
+    pub cursor: CursorStyle,
 }
 
 impl ComputedStyle {
@@ -382,6 +399,7 @@ impl ComputedStyle {
             justify_items: AlignItems::Stretch,
             justify_self: AlignSelf::Auto,
             box_sizing: BoxSizing::ContentBox,
+            cursor: CursorStyle::Auto,
         }
     }
 }
@@ -569,6 +587,7 @@ impl ComputedStyle {
         self.line_height = parent.line_height;
         self.text_align = parent.text_align;
         self.white_space = parent.white_space;
+        self.cursor = parent.cursor;
         self.background_color = Color::TRANSPARENT; // backgrounds do not inherit
     }
 }
@@ -952,6 +971,13 @@ fn apply_declaration(
         "color" => match parse_color(&declaration.value) {
             Some(c) => style.color = c,
             None => diagnostics.push(unsupported("color")),
+        },
+        "cursor" => match declaration.value.trim() {
+            "auto" => style.cursor = CursorStyle::Auto,
+            "default" => style.cursor = CursorStyle::Default,
+            "pointer" => style.cursor = CursorStyle::Pointer,
+            "text" => style.cursor = CursorStyle::Text,
+            _ => diagnostics.push(unsupported("cursor value")),
         },
         "background-color" | "background" => match parse_color(&declaration.value) {
             Some(c) => style.background_color = c,

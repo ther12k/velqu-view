@@ -208,6 +208,19 @@ pub enum ScrollTarget {
     },
 }
 
+/// Why focus moved (M4b, ADR 0011): keyboard-only focus rings,
+/// accessibility behavior, and native-feeling text controls all need the
+/// origin — which is unrecoverable after the event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusOrigin {
+    /// The pointer clicked the element.
+    Pointer,
+    /// Keyboard navigation (Tab / Shift+Tab).
+    Keyboard,
+    /// A programmatic `set_focus` call.
+    Programmatic,
+}
+
 /// One interaction event, in the order they occurred. Drained through
 /// [`crate::VelquView::take_events`].
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +247,8 @@ pub enum Event {
         from: Option<String>,
         /// Newly focused element id.
         to: Option<String>,
+        /// What moved focus.
+        origin: FocusOrigin,
     },
     /// A scroll container's clamped offset changed (wheel input or
     /// programmatic).

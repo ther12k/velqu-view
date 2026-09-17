@@ -81,12 +81,13 @@ use std::rc::Rc;
 
 pub use color::{Color, ColorParseError};
 pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
-pub use input::{Event, HitTarget, ScrollTarget};
+pub use input::{Event, FocusOrigin, HitTarget, ScrollTarget};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
     SourceId, StylesheetSource,
 };
+pub use style::CursorStyle;
 pub use viewport::{InvalidViewport, InvalidViewportReason, MAX_PIXELS, Viewport};
 
 use crate::image::ImageStore;
@@ -367,6 +368,8 @@ pub struct VelquView {
     hover: Option<dom::NodeId>,
     /// Focused element (for `:focus`), if any.
     focus: Option<dom::NodeId>,
+    /// Why focus last moved (M4b).
+    focus_origin: Option<input::FocusOrigin>,
     /// The pressed element (for `:active` chain + click tracking).
     pressed: Option<dom::NodeId>,
     /// Interaction events since the last [`VelquView::take_events`].
@@ -424,6 +427,7 @@ impl VelquView {
             pointer_pos: None,
             hover: None,
             focus: None,
+            focus_origin: None,
             pressed: None,
             events: Vec::new(),
         }
@@ -1129,9 +1133,11 @@ impl VelquView {
     /// and emits [`Event::PointerLeave`]/[`Event::PointerEnter`] when the
     /// hovered element changed. The position is remembered so scrolling
     /// can re-derive hover when content moves underneath (ADR 0011).
-    pub fn pointer_move(&mut self, viewport: Viewport, x: f32, y: f32) {
+    pub fn pointer_move(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
         self.pointer_pos = Some((x, y));
+        let before = self.hover;
         self.update_hover(viewport, x, y);
+        before != self.hover
     }
 
     /// Re-derives hover from the remembered pointer position — after a
@@ -1178,21 +1184,23 @@ impl VelquView {
     /// target for click tracking and `:active` styling; a later
     /// [`VelquView::pointer_release`] over the same element emits
     /// [`Event::Click`].
-    pub fn pointer_press(&mut self, viewport: Viewport, x: f32, y: f32) {
+    pub fn pointer_press(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
+        let before = self.pressed;
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
         self.pressed = self
             .cached_layout(viewport)
             .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
             .map(|node| node.node);
+        before != self.pressed
     }
 
     /// Releases at `(x, y)` (viewport device px). If the press and release
     /// hit the same element, emits [`Event::Click`]; elements with an `id`
     /// also take focus on click.
-    pub fn pointer_release(&mut self, viewport: Viewport, x: f32, y: f32) {
+    pub fn pointer_release(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
         let Some(pressed) = self.pressed.take() else {
-            return;
+            return false;
         };
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
@@ -1205,9 +1213,11 @@ impl VelquView {
                 element: self.node_element_id(pressed).map(str::to_owned),
             });
             if self.node_element_id(pressed).is_some() {
-                self.set_focus_node(Some(pressed));
+                self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
             }
+            return true;
         }
+        false
     }
 
     /// Scrolls the wheel at `(x, y)` (viewport device px): the gesture
@@ -1298,20 +1308,23 @@ impl VelquView {
             },
             None => nodes.first().copied(),
         };
-        self.set_focus_node(next);
+        self.set_focus_node_with(next, input::FocusOrigin::Keyboard);
     }
 
     /// Sets focus by element `id` (`None` clears it) and emits
     /// [`Event::FocusChanged`] when it moved. Unknown ids are ignored —
     /// focus targets resolve against the loaded document.
     pub fn set_focus(&mut self, element: Option<&str>) {
-        self.set_focus_node(match element {
-            None => None,
-            Some(id) => self.element_node(id),
-        });
+        self.set_focus_node_with(
+            match element {
+                None => None,
+                Some(id) => self.element_node(id),
+            },
+            input::FocusOrigin::Programmatic,
+        );
     }
 
-    fn set_focus_node(&mut self, to: Option<dom::NodeId>) {
+    fn set_focus_node_with(&mut self, to: Option<dom::NodeId>, origin: input::FocusOrigin) {
         if to == self.focus {
             return;
         }
@@ -1320,10 +1333,28 @@ impl VelquView {
             .take()
             .and_then(|node| self.node_element_id(node).map(str::to_owned));
         self.focus = to;
+        self.focus_origin = Some(origin);
         self.events.push(Event::FocusChanged {
             from,
             to: to.and_then(|node| self.node_element_id(node).map(str::to_owned)),
+            origin,
         });
+    }
+
+    /// Why focus last moved, if it ever did (M4b).
+    pub fn focus_origin(&self) -> Option<input::FocusOrigin> {
+        self.focus_origin
+    }
+
+    /// The `cursor` in effect under the pointer (M4b): the hovered
+    /// element's computed (inherited) cursor, or `Auto` when nothing is
+    /// under the pointer or no layout is cached. Reading it never lays
+    /// out and never repaints.
+    pub fn cursor_under(&self, viewport: Viewport, x: f32, y: f32) -> CursorStyle {
+        self.cached_layout(viewport)
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .map(|node| node.style.cursor)
+            .unwrap_or_default()
     }
 
     /// Reports the pointer leaving the window: clears hover and emits
@@ -1917,7 +1948,8 @@ mod tests {
         }));
         assert!(events.contains(&Event::FocusChanged {
             from: None,
-            to: Some("b".into())
+            to: Some("b".into()),
+            origin: FocusOrigin::Pointer,
         }));
         assert_eq!(view.focused(), Some("b"));
 
@@ -2491,6 +2523,70 @@ mod tests {
     }
 
     #[test]
+    fn cursor_is_inherited_and_read_under_the_pointer() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>\
+             body { margin: 0 }\
+             .card { cursor: pointer; width: 120px; height: 120px }\
+             </style></head><body>\
+             <div class=card><span id=inner>x</span></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        // Over the span (no cursor of its own): the card's pointer cursor
+        // inherits through the computed style (ADR 0011).
+        assert_eq!(view.cursor_under(vp, 20.0, 20.0), CursorStyle::Pointer);
+        // Over the card's own chrome: pointer as well.
+        assert_eq!(view.cursor_under(vp, 100.0, 100.0), CursorStyle::Pointer);
+        // Outside: UA default.
+        assert_eq!(view.cursor_under(vp, 180.0, 180.0), CursorStyle::Auto);
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "reading the cursor never lays out"
+        );
+    }
+
+    #[test]
+    fn focus_origin_tracks_why_focus_moved() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div id=a></div><div id=b></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(100, 100, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        assert_eq!(view.focus_origin(), None);
+        view.focus_next();
+        assert_eq!(view.focus_origin(), Some(FocusOrigin::Keyboard));
+        view.set_focus(Some("b"));
+        assert_eq!(view.focus_origin(), Some(FocusOrigin::Programmatic));
+
+        // A click focuses with pointer origin.
+        let mut click_view = VelquView::new();
+        click_view
+            .load_html(
+                "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=x style=\"width: 100px; height: 100px\"></div>\
+             </body></html>",
+            )
+            .unwrap();
+        click_view.render(vp).unwrap();
+        click_view.pointer_press(vp, 50.0, 50.0);
+        click_view.pointer_release(vp, 50.0, 50.0);
+        assert_eq!(click_view.focused(), Some("x"));
+        assert_eq!(click_view.focus_origin(), Some(FocusOrigin::Pointer));
+    }
+
+    #[test]
     fn focus_cycles_and_reports() {
         let mut view = VelquView::new();
         view.load_html(
@@ -2516,15 +2612,18 @@ mod tests {
             vec![
                 Event::FocusChanged {
                     from: None,
-                    to: Some("first".into())
+                    to: Some("first".into()),
+                    origin: FocusOrigin::Keyboard,
                 },
                 Event::FocusChanged {
                     from: Some("first".into()),
-                    to: Some("second".into())
+                    to: Some("second".into()),
+                    origin: FocusOrigin::Keyboard,
                 },
                 Event::FocusChanged {
                     from: Some("second".into()),
-                    to: Some("first".into())
+                    to: Some("first".into()),
+                    origin: FocusOrigin::Keyboard,
                 },
             ]
         );

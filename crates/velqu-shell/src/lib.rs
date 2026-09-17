@@ -10,18 +10,20 @@
 //! later GPU backend swap does not touch this crate's contract beyond how
 //! frames reach the surface.
 //!
-//! Input is forwarded to the renderer's input gate (M4a, ADR 0010):
-//! pointer move/press/release, wheel scrolling, and Tab focus cycling are
-//! handed to [`VelquView`], which answers from the cached layout with zero
-//! additional layout passes; a wheel that changes the scroll offset marks
-//! the window dirty for a redraw. Escape still closes. Text editing, IME,
-//! selection, and hover/focus *painting* land in later M4 slices.
+//! Input is forwarded to the renderer's input gate (M4a/M4b, ADR
+//! 0010/0011): pointer move/press/release, wheel scrolling, and Tab focus
+//! cycling are handed to [`VelquView`], which answers from the cached
+//! layout with zero additional layout passes. Interaction styling is real
+//! now: when hover/active/focus state changes pixels the view says so and
+//! the shell schedules a repaint (presentation-only, no relayout); the
+//! CSS `cursor` maps onto the platform cursor. Escape still closes.
+//! Text editing, IME, and selection land in M4c.
 
 use std::fmt;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use velqu_view::{FrameResult, VelquError, VelquView, Viewport};
+use velqu_view::{CursorStyle, FrameResult, VelquError, VelquView, Viewport};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -163,6 +165,7 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
         // NaN until the first CursorMoved: every containment comparison
         // against NaN is false, so early presses hit nothing.
         pointer: (f32::NAN, f32::NAN),
+        last_cursor: None,
         started: Instant::now(),
         frames: 0,
         error: None,
@@ -181,6 +184,9 @@ struct ShellApp<'a> {
     dirty: bool,
     /// Last pointer position in viewport device px (physical window px).
     pointer: (f32, f32),
+    /// The cursor icon currently installed on the window, so repeat moves
+    /// over the same cursor region cost nothing.
+    last_cursor: Option<CursorStyle>,
     started: Instant,
     frames: u64,
     error: Option<ShellError>,
@@ -241,15 +247,30 @@ impl ShellApp<'_> {
     }
 
     /// Feeds the pointer position to the view (viewport device px are
-    /// physical window px). Hover alone changes no pixels yet, so no
-    /// redraw is scheduled.
+    /// physical window px). A hover change means interaction-styled
+    /// pixels changed: the repaint is presentation-only (no relayout).
+    /// The CSS cursor maps onto the platform cursor - a cursor change
+    /// alone neither repaints nor lays out.
     fn pointer_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
         let Some(viewport) = self.input_viewport() else {
             return;
         };
         self.pointer = (position.x as f32, position.y as f32);
-        self.view
+        let hover_changed = self
+            .view
             .pointer_move(viewport, self.pointer.0, self.pointer.1);
+        if hover_changed {
+            self.dirty = true;
+        }
+        let cursor = self
+            .view
+            .cursor_under(viewport, self.pointer.0, self.pointer.1);
+        if self.last_cursor != Some(cursor) {
+            self.last_cursor = Some(cursor);
+            if let Some(window) = &self.window {
+                window.set_cursor(cursor_icon(cursor));
+            }
+        }
     }
 
     /// Renders one frame and presents it. Errors end the loop.
@@ -327,9 +348,11 @@ impl ApplicationHandler for ShellApp<'_> {
                     && !event.repeat
                     && event.physical_key == PhysicalKey::Code(KeyCode::Tab)
                 {
-                    // Focus is runtime presentation state; it paints with
-                    // the M4b styling slice, so no redraw yet.
+                    // Focus is runtime presentation state; if focus styling
+                    // exists the pixels change: presentation-only repaint.
                     self.view.focus_next();
+                    self.dirty = true;
+                    self.request_redraw();
                 }
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
@@ -346,9 +369,14 @@ impl ApplicationHandler for ShellApp<'_> {
                     return;
                 }
                 let (x, y) = self.pointer;
-                match state {
+                let changed = match state {
                     ElementState::Pressed => self.view.pointer_press(viewport, x, y),
                     ElementState::Released => self.view.pointer_release(viewport, x, y),
+                };
+                if changed {
+                    // :active / focus styling may have changed pixels.
+                    self.dirty = true;
+                    self.request_redraw();
                 }
             }
             winit::event::WindowEvent::MouseWheel { delta, .. } => {
@@ -388,5 +416,15 @@ impl ApplicationHandler for ShellApp<'_> {
         if self.dirty {
             self.request_redraw();
         }
+    }
+}
+
+/// Maps the CSS `cursor` value onto the platform cursor (M4b). `Auto`
+/// means "the UA decides" - the shell's UA default is the plain arrow.
+fn cursor_icon(style: CursorStyle) -> winit::window::CursorIcon {
+    match style {
+        CursorStyle::Auto | CursorStyle::Default => winit::window::CursorIcon::Default,
+        CursorStyle::Pointer => winit::window::CursorIcon::Pointer,
+        CursorStyle::Text => winit::window::CursorIcon::Text,
     }
 }
