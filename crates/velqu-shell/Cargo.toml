@@ -12,6 +12,7 @@ publish.workspace = true
 velqu-view = { workspace = true }
 winit = { workspace = true }
 softbuffer = { workspace = true }
+arboard = { version = "3.6", default-features = false, features = ["wayland-data-control"] }
 
 [lints]
 workspace = true

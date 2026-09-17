@@ -17,11 +17,50 @@ use crate::dom::NodeId;
 use crate::layout::{BoxNode, ScrollExtent};
 use crate::viewport::Viewport;
 
+/// Opaque identity for an element in the currently loaded document.
+///
+/// A handle is stable across resize/restyle layout rebuilds, but is invalid
+/// after the document is replaced. Its fields and constructor stay private so
+/// callers cannot manufacture a handle for another document or node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ElementHandle {
+    generation: u64,
+    node: NodeId,
+}
+
+impl ElementHandle {
+    pub(crate) fn new(generation: u64, node: NodeId) -> Self {
+        Self { generation, node }
+    }
+
+    pub(crate) fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn node(self) -> NodeId {
+        self.node
+    }
+}
+
+/// A public element reference carrying both opaque identity and author id.
+///
+/// The id is descriptive and optional; the handle is the identity that stays
+/// unambiguous for id-less elements and across author-id collisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementTarget {
+    /// Opaque identity valid for the current document only.
+    pub handle: ElementHandle,
+    /// The element's HTML `id`, if any.
+    pub id: Option<String>,
+}
+
 /// The public result of a hit test: what the pointer is over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HitTarget {
-    /// The element's HTML `id`, if any — the public interaction identity
-    /// (matching scroll targets, ADR 0008).
+    /// Opaque identity valid for the current document only.
+    pub handle: ElementHandle,
+    /// The element's HTML `id`, if any — a descriptive public attribute,
+    /// not the interaction identity.
     pub element_id: Option<String>,
     /// The element's tag name.
     pub tag: String,
@@ -30,8 +69,10 @@ pub struct HitTarget {
 }
 
 impl HitTarget {
-    /// The scroll target key for this element: its `id`, or `None` (the
-    /// document-level scroller) when it has none.
+    /// The author-provided HTML `id`, when present.
+    ///
+    /// This is a convenience lookup only. Use [`HitTarget::handle`] as the
+    /// unambiguous identity, especially for id-less elements.
     pub fn scroll_key(&self) -> Option<&str> {
         self.element_id.as_deref()
     }
@@ -56,6 +97,32 @@ pub(crate) fn hit_at(
 ) -> Option<&BoxNode> {
     // Enter the page in content space (undo the document scroll).
     hit_in(root, x + document_scroll.0, y + document_scroll.1)
+}
+
+/// Maps a viewport point into the target node's own geometry space by
+/// reversing the same document and nested-scroll transforms used by hit test.
+/// It intentionally ignores clipping so an active pointer capture can keep
+/// updating selection after the pointer leaves the control.
+pub(crate) fn point_in_node(
+    root: &BoxNode,
+    document_scroll: (f32, f32),
+    target: NodeId,
+    x: f32,
+    y: f32,
+) -> Option<(f32, f32)> {
+    fn walk(node: &BoxNode, target: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+        if node.node == target {
+            return Some((x, y));
+        }
+        let (ox, oy) = node.applied_scroll;
+        for child in &node.children {
+            if let Some(point) = walk(child, target, x + ox, y + oy) {
+                return Some(point);
+            }
+        }
+        None
+    }
+    walk(root, target, x + document_scroll.0, y + document_scroll.1)
 }
 
 /// Recursive hit walk in the given coordinate space. `(x, y)` is in the
@@ -126,6 +193,7 @@ pub(crate) struct WheelContext<'a> {
     pub document_offset: (f32, f32),
     pub document_extent: ScrollExtent,
     pub viewport: Viewport,
+    pub generation: u64,
 }
 
 /// What a wheel gesture (or any scroll change) targets: the
@@ -136,6 +204,8 @@ pub(crate) struct WheelContext<'a> {
 pub(crate) struct WheelResult {
     /// `None` = the document-level scroller; `Some(node)` = the container.
     pub node: Option<NodeId>,
+    /// The container's opaque public identity, when it has one.
+    pub handle: Option<ElementHandle>,
     /// The container's HTML `id`, when it has one.
     pub element_id: Option<String>,
     /// The new clamped offset.
@@ -172,6 +242,7 @@ pub(crate) fn wheel_target(
             );
             Some(WheelResult {
                 node: Some(container.node),
+                handle: Some(ElementHandle::new(ctx.generation, container.node)),
                 element_id: container.element_id.clone(),
                 offset,
                 previous_applied: container.applied_scroll,
@@ -185,6 +256,7 @@ pub(crate) fn wheel_target(
             );
             Some(WheelResult {
                 node: None,
+                handle: None,
                 element_id: None,
                 offset,
                 previous_applied: ctx.document_offset,
@@ -195,7 +267,7 @@ pub(crate) fn wheel_target(
 
 /// What a scroll change targets (ADR 0011): the document-level scroller
 /// or one scroll container. Runtime state is keyed by node identity; this
-/// public shape carries the element's HTML `id` when it has one.
+/// public shape carries the opaque element identity and its optional HTML id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScrollTarget {
     /// The document-level scroller (the viewport).
@@ -203,6 +275,8 @@ pub enum ScrollTarget {
     /// A scroll container element — id-less containers are first-class
     /// targets too.
     Element {
+        /// Opaque identity valid for the current document only.
+        handle: ElementHandle,
         /// The container's HTML `id`, when it has one.
         id: Option<String>,
     },
@@ -225,28 +299,27 @@ pub enum FocusOrigin {
 /// [`crate::VelquView::take_events`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The pointer moved off an element (`None` = the element had no id).
+    /// The pointer moved off an element.
     PointerLeave {
-        /// The element id just left.
-        element: Option<String>,
+        /// The element's opaque identity.
+        target: ElementTarget,
     },
-    /// The pointer moved onto an element (`None` = under no element or
-    /// the element has no id).
+    /// The pointer moved onto an element.
     PointerEnter {
-        /// The element id now under the pointer.
-        element: Option<String>,
+        /// The element's opaque identity.
+        target: ElementTarget,
     },
     /// A pressed-then-released click on the same element.
     Click {
-        /// The clicked element's id (`None` if it has none).
-        element: Option<String>,
+        /// The clicked element's opaque identity.
+        target: ElementTarget,
     },
     /// Focus moved between focusable elements (`None` = nothing focused).
     FocusChanged {
-        /// Previously focused element id.
-        from: Option<String>,
-        /// Newly focused element id.
-        to: Option<String>,
+        /// Previously focused element.
+        from: Option<ElementTarget>,
+        /// Newly focused element.
+        to: Option<ElementTarget>,
         /// What moved focus.
         origin: FocusOrigin,
     },
@@ -259,5 +332,21 @@ pub enum Event {
         x: f32,
         /// Clamped y offset in device px.
         y: f32,
+    },
+    /// A control's current runtime value changed.
+    ValueChanged {
+        /// The edited control's opaque identity and optional HTML id.
+        target: ElementTarget,
+        /// Current value, never written into the DOM.
+        value: String,
+    },
+    /// A control's selection or caret moved.
+    SelectionChanged {
+        /// The control whose selection changed.
+        target: ElementTarget,
+        /// Selection anchor as a valid UTF-8 byte offset.
+        anchor: usize,
+        /// Selection focus/caret as a valid UTF-8 byte offset.
+        focus: usize,
     },
 }

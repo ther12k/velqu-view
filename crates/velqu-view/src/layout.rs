@@ -145,6 +145,9 @@ pub(crate) struct BoxNode {
     /// layout leaf measured by intrinsic size (ADR 0008) — it is never
     /// flattened into inline words.
     pub replaced: Option<std::rc::Rc<DecodedImage>>,
+    /// Editable control marker. Controls are replaced outer boxes whose live
+    /// editor state is kept by `VelquView`, not in this structural tree.
+    pub control: Option<crate::control::ControlKind>,
     /// Scrollable content extent for scroll containers (`overflow: auto`/
     /// `scroll`): content width/height measured from the padding box. Set
     /// after layout; `None` for non-scroll boxes.
@@ -258,9 +261,16 @@ pub(crate) fn build_boxes(
         words: Vec::new(),
         text_origin: None,
         replaced,
+        control: crate::control::kind_for_node(dom, root),
         scroll: None,
         applied_scroll: (0.0, 0.0),
     };
+
+    // Editable controls are replaced leaves: their initial DOM value is
+    // runtime state, and their internal editor is not part of document flow.
+    if box_node.control.is_some() {
+        return Some(box_node);
+    }
 
     let mut pending_space_before = false;
     for &child in &dom.node(root).children {
@@ -503,8 +513,20 @@ pub(crate) fn build_display_list(
     scale: f32,
     document_offset: (f32, f32),
 ) -> DisplayList {
+    build_display_list_with_controls(root, scale, document_offset, None)
+}
+
+/// Emits a display list with runtime control paint items layered into the
+/// structural box paint order. Control items are presentation-only and never
+/// participate in layout or structural facts.
+pub(crate) fn build_display_list_with_controls(
+    root: &BoxNode,
+    scale: f32,
+    document_offset: (f32, f32),
+    controls: Option<&std::collections::HashMap<NodeId, Vec<DisplayItem>>>,
+) -> DisplayList {
     let mut list = DisplayList::default();
-    emit_display_list(root, &mut list, scale);
+    emit_box(root, &mut list, None, scale, controls);
     if document_offset != (0.0, 0.0) {
         list.items.insert(
             0,
@@ -546,11 +568,13 @@ pub(crate) fn patch_presentation_styles(root: &mut BoxNode, styles: &StyleMap) {
 /// items. Layout owns geometry; the display list owns paint ordering and
 /// clipping; the painter executes. `scale` converts logical style values
 /// (border-radius) into the device-pixel metric space.
-pub(crate) fn emit_display_list(node: &BoxNode, list: &mut DisplayList, scale: f32) {
-    emit_box(node, list, None, scale);
-}
-
-fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, scale: f32) {
+fn emit_box(
+    node: &BoxNode,
+    list: &mut DisplayList,
+    parent_clip: Option<Rect>,
+    scale: f32,
+    controls: Option<&std::collections::HashMap<NodeId, Vec<DisplayItem>>>,
+) {
     let style = &node.style;
     let _ = parent_clip;
     // `border_radius` is authored in logical px; layout runs in device px.
@@ -658,6 +682,9 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, s
             image: std::rc::Rc::clone(image),
         });
     }
+    if let Some(control_items) = controls.and_then(|items| items.get(&node.node)) {
+        list.items.extend(control_items.iter().cloned());
+    }
 
     // Inline content: anchored at the box's text origin (content origin,
     // or the anonymous words node when the backend created one).
@@ -689,7 +716,7 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, s
     match style.overflow_y {
         crate::style::Overflow::Visible => {
             for child in &node.children {
-                emit_box(child, list, parent_clip, scale);
+                emit_box(child, list, parent_clip, scale, controls);
             }
         }
         crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
@@ -702,7 +729,7 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, s
                 list.items.push(DisplayItem::PushClip(node.padding_box));
             }
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box), scale);
+                emit_box(child, list, Some(node.padding_box), scale, controls);
             }
             list.items.push(DisplayItem::PopClip);
         }
@@ -719,7 +746,7 @@ fn emit_box(node: &BoxNode, list: &mut DisplayList, parent_clip: Option<Rect>, s
             list.items
                 .push(DisplayItem::PushTransform { x: -ox, y: -oy });
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box), scale);
+                emit_box(child, list, Some(node.padding_box), scale, controls);
             }
             list.items.push(DisplayItem::PopTransform);
             list.items.push(DisplayItem::PopClip);

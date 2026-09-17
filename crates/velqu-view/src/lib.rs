@@ -28,11 +28,26 @@
 //!   box tree, Taffy-backed block/flex/grid layout, deterministic text and
 //!   images, display list, paint-side scrolling, and pixel-hash fixtures
 //!   (`docs/decisions/0005`–`0008`).
-//! * **M3 (current, phase 1 complete):** the Tailwind-compatible utility
-//!   pipeline ([ADR 0009](docs/decisions/0009-m3-tailwind-pipeline.md)) —
+//! * **M3 (done):** the Tailwind-compatible utility pipeline
+//!   ([ADR 0009](docs/decisions/0009-m3-tailwind-pipeline.md)) —
 //!   `enable_tailwind()` compiles the document's utility classes into a
 //!   generated stylesheet, so plain HTML with Tailwind classes renders with
 //!   no CSS files, no node, and no network.
+//! * **M4a–M4b (done):** the input gate and interaction styling — hit
+//!   testing, pointer/focus/click events, wheel scrolling, `:hover`/
+//!   `:focus`/`:active` frozen to paint, cursor, focus origin — all with
+//!   zero relayout ([ADR 0010](docs/decisions/0010-m4a-input-gate.md),
+//!   [ADR 0011](docs/decisions/0011-m4b-interaction-styling.md)).
+//! * **M4c1 (done):** editable controls — opaque document-scoped element
+//!   identity on every event, runtime `<input>`/`<textarea>` values with
+//!   grapheme-safe editing, pointer-capture selection, scroll-to-caret
+//!   ([ADR 0012](docs/decisions/0012-m4c1-editable-controls.md)).
+//! * **M4c2 (done):** clipboard — Copy/Cut/Paste commands resolved through
+//!   a fallible host-installed [`ClipboardProvider`] (null by default; the
+//!   shell installs an OS-backed one). Cut is transactional — the selection
+//!   is deleted only after its clipboard write succeeded — and pasted text
+//!   goes through the same filter as direct insertion, with CRLF
+//!   normalization ([ADR 0013](docs/decisions/0013-m4c2-clipboard.md)).
 //!
 //! # Example
 //!
@@ -58,14 +73,18 @@
 //! assert_eq!(result.frame.pixels(), again.frame.pixels());
 //! ```
 
+mod clipboard;
 mod color;
+mod control;
 mod css;
 mod display_list;
 mod dom;
+mod editor;
 mod font;
 mod html;
 mod image;
 mod input;
+mod keyboard;
 mod layout;
 mod painter;
 mod source;
@@ -79,9 +98,12 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::rc::Rc;
 
+pub use clipboard::{ClipboardError, ClipboardProvider, NullClipboardProvider};
 pub use color::{Color, ColorParseError};
+pub use control::{ControlFact, ControlFacts, ControlKind, ControlRect};
 pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
-pub use input::{Event, FocusOrigin, HitTarget, ScrollTarget};
+pub use input::{ElementHandle, ElementTarget, Event, FocusOrigin, HitTarget, ScrollTarget};
+pub use keyboard::{KeyCommand, KeyModifiers};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
@@ -321,6 +343,10 @@ pub struct VelquView {
     fonts: FontStore,
     assets: SharedAssetResolver,
     custom_assets: bool,
+    /// Host-provided clipboard (M4c2, ADR 0013); the null default keeps the
+    /// renderer hermetic — copy/cut writes go nowhere, paste reads nothing.
+    clipboard: Rc<dyn clipboard::ClipboardProvider>,
+    custom_clipboard: bool,
     /// Decoded `<img>` assets for the current document (ADR 0008), keyed by
     /// the `src` reference as written. Cleared when the document changes.
     images: ImageStore,
@@ -351,6 +377,14 @@ pub struct VelquView {
     tailwind_diagnostics_list: Vec<String>,
     /// `<style>` block text extracted from the document, in order.
     style_blocks: Vec<String>,
+    /// Runtime state for supported editable controls. Keys are current-
+    /// document DOM nodes; the store is cleared on document replacement.
+    controls: std::collections::HashMap<dom::NodeId, control::ControlState>,
+    /// Deterministic diagnostics for controls outside the M4c1 profile.
+    control_diagnostics_list: Vec<String>,
+    /// Runtime editor geometry keyed by current-document DOM node. This is
+    /// presentation state, rebuilt from the cached outer layout without Taffy.
+    control_geometry: std::collections::HashMap<dom::NodeId, control::EditorGeometry>,
     // Input gate state (M4a/M4b, ADR 0010/0011). Interaction state is
     // runtime presentation state — it never changes layout facts; it is
     // keyed by DOM node and reaches only pixels (via stateful selectors).
@@ -364,6 +398,13 @@ pub struct VelquView {
     /// Last pointer position (viewport device px) from input; hover is
     /// re-derived from it when scrolling moves content underneath.
     pointer_pos: Option<(f32, f32)>,
+    /// Captured editable control during pointer selection. Capture is
+    /// independent of hover and survives pointer movement outside the box.
+    pointer_capture: Option<dom::NodeId>,
+    /// Selection anchor recorded at pointer press for the captured control.
+    pointer_anchor: Option<usize>,
+    /// Monotonic document identity used to scope public element handles.
+    document_generation: u64,
     /// The element under the pointer (for `:hover`), if any.
     hover: Option<dom::NodeId>,
     /// Focused element (for `:focus`), if any.
@@ -390,6 +431,7 @@ impl fmt::Debug for VelquView {
             .field("frame_index", &self.frame_index)
             .field("fonts", &self.fonts)
             .field("custom_asset_resolver", &self.custom_assets)
+            .field("custom_clipboard_provider", &self.custom_clipboard)
             .finish()
     }
 }
@@ -408,6 +450,8 @@ impl VelquView {
             fonts: FontStore::bundled(),
             assets: Rc::new(NullAssetResolver),
             custom_assets: false,
+            clipboard: Rc::new(clipboard::NullClipboardProvider),
+            custom_clipboard: false,
             images: ImageStore::new(),
             image_limits: ImageLimits::default(),
             image_diagnostics: Vec::new(),
@@ -421,10 +465,16 @@ impl VelquView {
             tailwind_css: None,
             tailwind_diagnostics_list: Vec::new(),
             style_blocks: Vec::new(),
+            controls: std::collections::HashMap::new(),
+            control_diagnostics_list: Vec::new(),
+            control_geometry: std::collections::HashMap::new(),
             last_laid: None,
             last_viewport: None,
             structure_dirty: true,
+            document_generation: 0,
             pointer_pos: None,
+            pointer_capture: None,
+            pointer_anchor: None,
             hover: None,
             focus: None,
             focus_origin: None,
@@ -441,6 +491,18 @@ impl VelquView {
     pub fn set_asset_resolver(&mut self, resolver: SharedAssetResolver) {
         self.assets = resolver;
         self.custom_assets = true;
+    }
+
+    /// Installs the host's clipboard provider (M4c2, ADR 0013).
+    ///
+    /// The renderer has no clipboard of its own: copy/cut write through this
+    /// provider and paste reads from it. The default
+    /// [`NullClipboardProvider`] reads nothing and drops writes, so a
+    /// hostless view stays hermetic. Installing is a host action — e.g.
+    /// `velqu-shell` installs an OS-backed provider.
+    pub fn set_clipboard_provider(&mut self, provider: Rc<dyn clipboard::ClipboardProvider>) {
+        self.clipboard = provider;
+        self.custom_clipboard = true;
     }
 
     /// Resolves one relative asset reference through the installed resolver,
@@ -490,6 +552,39 @@ impl VelquView {
     /// compile, in first-use order (ADR 0009).
     pub fn tailwind_diagnostics(&self) -> Vec<String> {
         self.tailwind_diagnostics_list.clone()
+    }
+
+    /// Deterministic diagnostics for controls outside the M4c1 profile.
+    pub fn control_diagnostics(&self) -> Vec<String> {
+        self.control_diagnostics_list.clone()
+    }
+
+    /// Returns the current runtime value for a supported control handle.
+    ///
+    /// The value is never read from a mutated DOM attribute or text child;
+    /// the optional HTML id is only descriptive metadata. Stale handles and
+    /// non-control elements return `None`.
+    pub fn control_value(&self, handle: ElementHandle) -> Option<&str> {
+        let node = self.resolve_handle(handle)?;
+        self.controls.get(&node).map(control::ControlState::value)
+    }
+
+    /// Returns control facts from the most recently cached layout.
+    ///
+    /// This read does not trigger layout. Before the first render/layout pass,
+    /// or when the viewport does not match the cache, the result is empty.
+    /// Current values and selection offsets come from runtime control state;
+    /// `LayoutFacts` remains structural and state-free.
+    pub fn control_facts(&mut self, viewport: Viewport) -> Result<ControlFacts, VelquError> {
+        if self.document.is_none() {
+            return Err(VelquError::DocumentNotLoaded);
+        }
+        let Some(laid) = self.cached_layout(viewport).cloned() else {
+            return Ok(ControlFacts::default());
+        };
+        let mut facts = ControlFacts::default();
+        collect_control_facts(self, &laid.root, &mut facts.controls);
+        Ok(facts)
     }
 
     /// Re-compiles the utility classes of the loaded document. Runs on
@@ -610,14 +705,33 @@ impl VelquView {
         }
         self.dom = html::parse(&source.html);
         self.document = Some(source);
+        self.document_generation = self.document_generation.wrapping_add(1).max(1);
         // Image identity is per-document, like the DOM: a new document
         // invalidates every decoded asset — and the input state belongs to
         // the old tree (M4a/M4b).
         self.images.clear();
+        self.controls.clear();
+        self.control_diagnostics_list.clear();
+        self.control_geometry.clear();
+        let (control_inits, control_diagnostics) = control::discover(&self.dom);
+        for init in control_inits {
+            self.controls.insert(
+                init.node,
+                control::ControlState::new(
+                    init.kind,
+                    init.initial_value,
+                    init.readonly,
+                    init.disabled,
+                ),
+            );
+        }
+        self.control_diagnostics_list = control_diagnostics;
         self.last_laid = None;
         self.last_viewport = None;
         self.structure_dirty = true;
         self.pointer_pos = None;
+        self.pointer_capture = None;
+        self.pointer_anchor = None;
         self.hover = None;
         self.focus = None;
         self.pressed = None;
@@ -872,24 +986,47 @@ impl VelquView {
         // clone-free).
         self.last_viewport = Some(viewport);
         self.last_laid = laid;
+        self.rebuild_control_presentation();
     }
 
     /// Presentation-only repaint (M4b, ADR 0011): recompute styles with
     /// the current interaction state, patch the cached box tree's
     /// paint-only fields, and re-emit the display list. Layout geometry,
     /// scroll extents, and the Taffy pass count are untouched.
-    fn repaint_presentation(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
+    fn repaint_presentation(&mut self, _viewport: Viewport, cascade: &mut style::Cascade<'_>) {
         let interaction = self.interaction_state();
         let root_element = layout::layout_root(&self.dom);
         let styles =
             layout::compute_all_styles(&self.dom, root_element, cascade, Some(&interaction));
         if let Some(laid) = self.last_laid.as_mut() {
-            let offset = laid.root_offset;
             layout::patch_presentation_styles(&mut laid.root, &styles);
-            laid.display_list =
-                layout::build_display_list(&laid.root, viewport.scale_factor(), offset);
         }
+        self.rebuild_control_presentation();
         self.repaint_passes += 1;
+    }
+
+    /// Rebuilds runtime control paint from the cached outer layout. This is a
+    /// presentation-only operation: it never invokes Taffy or changes layout
+    /// facts.
+    fn rebuild_control_presentation(&mut self) {
+        let Some(viewport) = self.last_viewport else {
+            return;
+        };
+        let Some(laid) = self.last_laid.as_mut() else {
+            return;
+        };
+        let scale = viewport.scale_factor();
+        let (items, geometry) = control::build_paint_items(
+            &laid.root,
+            &mut self.controls,
+            self.focus,
+            &mut self.fonts,
+            scale,
+        );
+        let offset = laid.root_offset;
+        laid.display_list =
+            layout::build_display_list_with_controls(&laid.root, scale, offset, Some(&items));
+        self.control_geometry = geometry;
     }
 
     /// Snapshots the node-keyed interaction state for the cascade.
@@ -1123,6 +1260,7 @@ impl VelquView {
         let laid = self.cached_layout(viewport)?;
         let node = input::hit_at(&laid.root, laid.root_offset, x, y)?;
         Some(HitTarget {
+            handle: self.node_handle(node.node),
             element_id: node.element_id.clone(),
             tag: node.tag.clone(),
             scroll_container: node.style.overflow_y.is_scroll_container(),
@@ -1133,11 +1271,17 @@ impl VelquView {
     /// and emits [`Event::PointerLeave`]/[`Event::PointerEnter`] when the
     /// hovered element changed. The position is remembered so scrolling
     /// can re-derive hover when content moves underneath (ADR 0011).
+    ///
+    /// While an editable control holds pointer capture (a press inside it),
+    /// movement also extends its selection — even outside the control's
+    /// border box. Returns whether interaction presentation changed (hover
+    /// or captured selection); never triggers layout.
     pub fn pointer_move(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
         self.pointer_pos = Some((x, y));
         let before = self.hover;
         self.update_hover(viewport, x, y);
-        before != self.hover
+        let selection_changed = self.extend_control_selection(viewport, x, y);
+        before != self.hover || selection_changed
     }
 
     /// Re-derives hover from the remembered pointer position — after a
@@ -1158,18 +1302,46 @@ impl VelquView {
         }
         if let Some(old) = self.hover.take() {
             self.events.push(Event::PointerLeave {
-                element: self.node_element_id(old).map(str::to_owned),
+                target: self.node_target(old),
             });
         }
         if let Some(node) = hit {
             self.events.push(Event::PointerEnter {
-                element: self.node_element_id(node).map(str::to_owned),
+                target: self.node_target(node),
             });
         }
         self.hover = hit;
     }
 
-    /// The element's HTML `id` attribute value, if any (event identity).
+    /// Builds the opaque public handle for a current-document DOM node.
+    fn node_handle(&self, node: dom::NodeId) -> ElementHandle {
+        ElementHandle::new(self.document_generation, node)
+    }
+
+    /// Resolves a public handle only when it belongs to this document.
+    fn resolve_handle(&self, handle: ElementHandle) -> Option<dom::NodeId> {
+        (handle.generation() == self.document_generation)
+            .then_some(handle.node())
+            .filter(|&node| {
+                node < self.dom.node_count()
+                    && matches!(self.dom.node(node).data, dom::NodeData::Element { .. })
+            })
+    }
+
+    /// Sets focus using an opaque handle from this document.
+    ///
+    /// Handles from another document, or handles that do not name an
+    /// element, are ignored safely. This is the stable counterpart to the
+    /// id-based convenience method [`VelquView::set_focus`].
+    pub fn set_focus_handle(&mut self, handle: Option<ElementHandle>) {
+        let node = handle.and_then(|handle| self.resolve_handle(handle));
+        if handle.is_some() && node.is_none() {
+            return;
+        }
+        self.set_focus_node_with(node, input::FocusOrigin::Programmatic);
+    }
+
+    /// The element's HTML `id` attribute value, if any (descriptive metadata).
     fn node_element_id(&self, node: dom::NodeId) -> Option<&str> {
         match &self.dom.node(node).data {
             dom::NodeData::Element { attrs, .. } => attrs
@@ -1180,25 +1352,45 @@ impl VelquView {
         }
     }
 
+    /// The public identity for a current-document node.
+    fn node_target(&self, node: dom::NodeId) -> ElementTarget {
+        ElementTarget {
+            handle: self.node_handle(node),
+            id: self.node_element_id(node).map(str::to_owned),
+        }
+    }
+
     /// Presses at `(x, y)` (viewport device px). Remembers the press
     /// target for click tracking and `:active` styling; a later
     /// [`VelquView::pointer_release`] over the same element emits
     /// [`Event::Click`].
+    ///
+    /// Pressing an enabled editable control also focuses it, places the
+    /// caret at the nearest grapheme boundary, and captures the pointer for
+    /// drag selection (M4c1).
     pub fn pointer_press(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
         let before = self.pressed;
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
-        self.pressed = self
+        let hit = self
             .cached_layout(viewport)
             .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
             .map(|node| node.node);
+        self.pressed = hit;
+        if let Some(node) = hit {
+            if self.controls.contains_key(&node) {
+                self.begin_control_selection(viewport, node, x, y);
+            }
+        }
         before != self.pressed
     }
 
     /// Releases at `(x, y)` (viewport device px). If the press and release
     /// hit the same element, emits [`Event::Click`]; elements with an `id`
-    /// also take focus on click.
+    /// also take focus on click. Any active pointer capture ends (M4c1).
     pub fn pointer_release(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
+        self.pointer_capture = None;
+        self.pointer_anchor = None;
         let Some(pressed) = self.pressed.take() else {
             return false;
         };
@@ -1210,7 +1402,7 @@ impl VelquView {
             .map(|node| node.node);
         if Some(pressed) == released {
             self.events.push(Event::Click {
-                element: self.node_element_id(pressed).map(str::to_owned),
+                target: self.node_target(pressed),
             });
             if self.node_element_id(pressed).is_some() {
                 self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
@@ -1218,6 +1410,92 @@ impl VelquView {
             return true;
         }
         false
+    }
+
+    /// Focuses an enabled control, places the caret under the press point,
+    /// and captures the pointer for drag selection (M4c1). Disabled
+    /// controls are ignored; readonly controls are selectable.
+    fn begin_control_selection(&mut self, viewport: Viewport, node: dom::NodeId, x: f32, y: f32) {
+        if self.controls.get(&node).is_some_and(|state| state.disabled) {
+            return;
+        }
+        self.set_focus_node_with(Some(node), input::FocusOrigin::Pointer);
+        let Some(offset) = self.control_offset_at_point(viewport, node, x, y) else {
+            return;
+        };
+        if let Some(state) = self.controls.get_mut(&node) {
+            state.editor.collapse_to(offset);
+        }
+        self.pointer_capture = Some(node);
+        self.pointer_anchor = Some(offset);
+        self.events.push(Event::SelectionChanged {
+            target: self.node_target(node),
+            anchor: offset,
+            focus: offset,
+        });
+        self.rebuild_control_presentation();
+    }
+
+    /// Extends the captured control's selection to the pointer position.
+    /// Mapping ignores clipping (capture deliberately survives leaving the
+    /// box); the offset clamps to the nearest line's grapheme boundaries.
+    fn extend_control_selection(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
+        let Some(node) = self.pointer_capture else {
+            return false;
+        };
+        let Some(anchor) = self.pointer_anchor else {
+            return false;
+        };
+        let Some(offset) = self.control_offset_at_point(viewport, node, x, y) else {
+            return false;
+        };
+        let Some(state) = self.controls.get_mut(&node) else {
+            return false;
+        };
+        if state.editor.anchor() == anchor && state.editor.focus() == offset {
+            return false;
+        }
+        state.editor.set_selection(anchor, offset);
+        self.events.push(Event::SelectionChanged {
+            target: self.node_target(node),
+            anchor,
+            focus: offset,
+        });
+        self.rebuild_control_presentation();
+        true
+    }
+
+    /// Maps a viewport point into a control's editor space using the cached
+    /// layout (document scroll plus enclosing scroll transforms), then
+    /// resolves the nearest grapheme boundary. Pure read of cached geometry
+    /// plus font measurement — no layout pass.
+    fn control_offset_at_point(
+        &mut self,
+        viewport: Viewport,
+        node: dom::NodeId,
+        x: f32,
+        y: f32,
+    ) -> Option<usize> {
+        let scale = viewport.scale_factor();
+        let laid = {
+            let last = self.last_laid.as_ref()?;
+            let cached = self.last_viewport?;
+            (cached.width() == viewport.width()
+                && cached.height() == viewport.height()
+                && cached.scale_factor() == viewport.scale_factor())
+            .then_some(last)?
+        };
+        let (point_x, point_y) = input::point_in_node(&laid.root, laid.root_offset, node, x, y)?;
+        let box_node = layout::find_box(&laid.root, node)?.clone();
+        let state = self.controls.get(&node)?;
+        Some(control::offset_at_point(
+            &box_node,
+            state,
+            &mut self.fonts,
+            scale,
+            point_x,
+            point_y,
+        ))
     }
 
     /// Scrolls the wheel at `(x, y)` (viewport device px): the gesture
@@ -1242,6 +1520,7 @@ impl VelquView {
             document_offset: laid.root_offset,
             document_extent: laid.document_scroll,
             viewport,
+            generation: self.document_generation,
         };
         let Some(result) = input::wheel_target(&ctx, x, y, dx, dy) else {
             return;
@@ -1278,6 +1557,9 @@ impl VelquView {
             target: match result.node {
                 None => ScrollTarget::Document,
                 Some(_) => ScrollTarget::Element {
+                    handle: result
+                        .handle
+                        .expect("element wheel target always has a handle"),
                     id: result.element_id,
                 },
             },
@@ -1289,18 +1571,11 @@ impl VelquView {
         self.refresh_hover(viewport);
     }
 
-    /// Moves focus to the next element with an `id` in document order,
-    /// wrapping around (Tab semantics). Emits
-    /// [`Event::FocusChanged`] when focus moved.
+    /// Moves focus to the next focusable element in document order, wrapping
+    /// around (Tab semantics). Supported controls participate even when they
+    /// have no HTML `id`; disabled controls are skipped.
     pub fn focus_next(&mut self) {
-        let mut nodes: Vec<dom::NodeId> = Vec::new();
-        self.dom.walk(|id, node| {
-            if let dom::NodeData::Element { attrs, .. } = &node.data {
-                if attrs.iter().any(|a| a.name == "id") && !nodes.contains(&id) {
-                    nodes.push(id);
-                }
-            }
-        });
+        let nodes = self.focusable_nodes();
         let next: Option<dom::NodeId> = match self.focus {
             Some(current) => match nodes.iter().position(|&id| id == current) {
                 Some(index) => nodes.get((index + 1) % nodes.len().max(1)).copied(),
@@ -1311,32 +1586,58 @@ impl VelquView {
         self.set_focus_node_with(next, input::FocusOrigin::Keyboard);
     }
 
+    fn focusable_nodes(&self) -> Vec<dom::NodeId> {
+        let mut nodes = Vec::new();
+        self.dom.walk(|id, node| {
+            let dom::NodeData::Element { attrs, .. } = &node.data else {
+                return;
+            };
+            let has_id = attrs.iter().any(|attribute| attribute.name == "id");
+            let is_control = self.controls.contains_key(&id);
+            let disabled = self
+                .controls
+                .get(&id)
+                .is_some_and(|control| control.disabled);
+            if (has_id || is_control) && !disabled {
+                nodes.push(id);
+            }
+        });
+        nodes
+    }
+
     /// Sets focus by element `id` (`None` clears it) and emits
     /// [`Event::FocusChanged`] when it moved. Unknown ids are ignored —
     /// focus targets resolve against the loaded document.
     pub fn set_focus(&mut self, element: Option<&str>) {
-        self.set_focus_node_with(
-            match element {
-                None => None,
-                Some(id) => self.element_node(id),
-            },
-            input::FocusOrigin::Programmatic,
-        );
+        let to = match element {
+            None => None,
+            Some(id) => {
+                let Some(node) = self.element_node(id) else {
+                    return;
+                };
+                Some(node)
+            }
+        };
+        self.set_focus_node_with(to, input::FocusOrigin::Programmatic);
     }
 
     fn set_focus_node_with(&mut self, to: Option<dom::NodeId>, origin: input::FocusOrigin) {
+        if to.is_some_and(|node| {
+            self.controls
+                .get(&node)
+                .is_some_and(|control| control.disabled)
+        }) {
+            return;
+        }
         if to == self.focus {
             return;
         }
-        let from = self
-            .focus
-            .take()
-            .and_then(|node| self.node_element_id(node).map(str::to_owned));
+        let from = self.focus.take().map(|node| self.node_target(node));
         self.focus = to;
         self.focus_origin = Some(origin);
         self.events.push(Event::FocusChanged {
             from,
-            to: to.and_then(|node| self.node_element_id(node).map(str::to_owned)),
+            to: to.map(|node| self.node_target(node)),
             origin,
         });
     }
@@ -1344,6 +1645,157 @@ impl VelquView {
     /// Why focus last moved, if it ever did (M4b).
     pub fn focus_origin(&self) -> Option<input::FocusOrigin> {
         self.focus_origin
+    }
+
+    /// Applies one named keyboard command to the focused control.
+    ///
+    /// Commands are backend-independent; the shell translates platform key
+    /// names before calling this method. Returns whether the runtime state
+    /// changed. Editing never mutates the DOM or runs document layout.
+    pub fn key_command(&mut self, command: KeyCommand, modifiers: KeyModifiers) -> bool {
+        let Some(node) = self.focus else {
+            return false;
+        };
+        let Some(state) = self.controls.get_mut(&node) else {
+            return false;
+        };
+        if state.disabled {
+            return false;
+        }
+        let before_value = state.value().to_owned();
+        let before_selection = state.selection();
+        match command {
+            // Clipboard commands (M4c2, ADR 0013) resolve through the
+            // installed provider. The provider is fallible and cut is
+            // transactional: a write that did not land (contention, null
+            // host) leaves the selection and value untouched.
+            KeyCommand::Copy => {
+                if let Some(text) = state.editor.selected_text() {
+                    // Copy never blocks on failure: the editor is
+                    // untouched either way, so the error is not load-
+                    // bearing here.
+                    let _ = self.clipboard.write(text);
+                }
+                // Copy changes no runtime state (and needs no repaint).
+                return false;
+            }
+            KeyCommand::Cut => {
+                if state.readonly || state.editor.selected_range().is_none() {
+                    // Browsers ignore cut on readonly fields and on
+                    // collapsed selections.
+                    return false;
+                }
+                let text = state.editor.selected_text().unwrap_or_default().to_owned();
+                if self.clipboard.write(&text).is_ok() {
+                    state.editor.delete_selection();
+                } else {
+                    // The selection never left the control: destroying it
+                    // now would lose user data with no undo (ADR 0013).
+                    return false;
+                }
+            }
+            KeyCommand::Paste => {
+                if state.readonly {
+                    return false;
+                }
+                let text = match self.clipboard.read() {
+                    Ok(Some(text)) => text,
+                    // No text on the clipboard, or the clipboard could
+                    // not be reached: pasting nothing is the safe move.
+                    Ok(None) | Err(_) => return false,
+                };
+                let filtered = state.kind.filter_text(&text);
+                if filtered.is_empty() {
+                    return false;
+                }
+                state.editor.insert_text(&filtered);
+            }
+            KeyCommand::Backspace if !state.readonly => {
+                state.editor.backspace();
+            }
+            KeyCommand::Delete if !state.readonly => {
+                state.editor.delete();
+            }
+            KeyCommand::Left => state.editor.move_left(modifiers.shift),
+            KeyCommand::Right => state.editor.move_right(modifiers.shift),
+            KeyCommand::Up if state.kind == ControlKind::Textarea => {
+                state.editor.move_vertical(-1, modifiers.shift)
+            }
+            KeyCommand::Down if state.kind == ControlKind::Textarea => {
+                state.editor.move_vertical(1, modifiers.shift)
+            }
+            KeyCommand::Home => state.editor.move_home(modifiers.shift),
+            KeyCommand::End => state.editor.move_end(modifiers.shift),
+            KeyCommand::SelectAll if modifiers.select_all() => state.editor.select_all(),
+            KeyCommand::Enter if !state.readonly && state.kind.accepts_newline() => {
+                state.editor.insert_text("\n");
+            }
+            KeyCommand::Tab | KeyCommand::Escape | KeyCommand::Up | KeyCommand::Down => {
+                return false;
+            }
+            _ => return false,
+        }
+        self.finish_control_change(node, before_value, before_selection)
+    }
+
+    /// Inserts direct text from a platform text event into the focused control.
+    ///
+    /// Callers must filter named commands first; this method defensively drops
+    /// control characters and newlines for single-line inputs (the same
+    /// filter paste applies, ADR 0013).
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        let Some(node) = self.focus else {
+            return false;
+        };
+        let Some(state) = self.controls.get_mut(&node) else {
+            return false;
+        };
+        if state.disabled || state.readonly {
+            return false;
+        }
+        let filtered = state.kind.filter_text(text);
+        if filtered.is_empty() {
+            return false;
+        }
+        let before_value = state.value().to_owned();
+        let before_selection = state.selection();
+        state.editor.insert_text(&filtered);
+        self.finish_control_change(node, before_value, before_selection)
+    }
+
+    fn finish_control_change(
+        &mut self,
+        node: dom::NodeId,
+        before_value: String,
+        before_selection: (usize, usize),
+    ) -> bool {
+        let Some(state) = self.controls.get_mut(&node) else {
+            return false;
+        };
+        let after_value = state.value().to_owned();
+        let after_selection = state.selection();
+        let value_changed = after_value != before_value;
+        let selection_changed = after_selection != before_selection;
+        if value_changed {
+            state.dirty = true;
+            self.events.push(Event::ValueChanged {
+                target: self.node_target(node),
+                value: after_value,
+            });
+        }
+        if selection_changed {
+            self.events.push(Event::SelectionChanged {
+                target: self.node_target(node),
+                anchor: after_selection.0,
+                focus: after_selection.1,
+            });
+        }
+        if value_changed || selection_changed {
+            // Editor paint (value/selection/caret/scroll) is presentation:
+            // rebuilt from the cached outer box, never a Taffy pass.
+            self.rebuild_control_presentation();
+        }
+        value_changed || selection_changed
     }
 
     /// The `cursor` in effect under the pointer (M4b): the hovered
@@ -1363,7 +1815,7 @@ impl VelquView {
         self.pointer_pos = None;
         if let Some(old) = self.hover.take() {
             self.events.push(Event::PointerLeave {
-                element: self.node_element_id(old).map(str::to_owned),
+                target: self.node_target(old),
             });
         }
     }
@@ -1398,6 +1850,40 @@ fn bake_scroll(node: &mut layout::BoxNode, id: dom::NodeId, offset: (f32, f32)) 
     node.children
         .iter_mut()
         .any(|child| bake_scroll(child, id, offset))
+}
+
+fn collect_control_facts(view: &VelquView, node: &layout::BoxNode, out: &mut Vec<ControlFact>) {
+    if let Some(kind) = node.control {
+        if let Some(state) = view.controls.get(&node.node) {
+            let (anchor, focus) = state.selection();
+            let geometry = view.control_geometry.get(&node.node);
+            out.push(ControlFact {
+                target: view.node_target(node.node),
+                kind,
+                value_length: state.value().len(),
+                selection_anchor: anchor,
+                selection_focus: focus,
+                caret_rect: geometry
+                    .map(|g| ControlRect {
+                        x: g.caret.x,
+                        y: g.caret.y,
+                        width: g.caret.w,
+                        height: g.caret.h,
+                    })
+                    .unwrap_or(ControlRect {
+                        x: node.content.x,
+                        y: node.content.y,
+                        width: 1.0,
+                        height: node.content.h.max(1.0),
+                    }),
+                visible_text_range: geometry.map_or((0, state.value().len()), |g| g.visible_range),
+                scroll_offset: geometry.map_or(state.scroll_offset, |g| g.scroll_offset),
+            });
+        }
+    }
+    for child in &node.children {
+        collect_control_facts(view, child, out);
+    }
 }
 
 /// The author-declared page background: `html`'s, then `body`'s, then white
@@ -1918,12 +2404,13 @@ mod tests {
         let vp = Viewport::try_new(300, 300, 1.0).unwrap();
         view.render(vp).unwrap();
 
+        let b_target = view.node_target(view.element_node("b").unwrap());
         view.pointer_move(vp, 50.0, 150.0); // over pane b
         let events = view.take_events();
         assert_eq!(
             events,
             vec![Event::PointerEnter {
-                element: Some("b".into())
+                target: b_target.clone()
             }]
         );
 
@@ -1935,7 +2422,7 @@ mod tests {
         assert_eq!(
             events,
             vec![Event::PointerLeave {
-                element: Some("b".into())
+                target: b_target.clone()
             }]
         );
 
@@ -1944,11 +2431,11 @@ mod tests {
         view.pointer_release(vp, 50.0, 150.0);
         let events = view.take_events();
         assert!(events.contains(&Event::Click {
-            element: Some("b".into())
+            target: b_target.clone()
         }));
         assert!(events.contains(&Event::FocusChanged {
             from: None,
-            to: Some("b".into()),
+            to: Some(b_target),
             origin: FocusOrigin::Pointer,
         }));
         assert_eq!(view.focused(), Some("b"));
@@ -1998,10 +2485,12 @@ mod tests {
         let _ = view.take_events();
         view.wheel(vp, 100.0, 50.0, 40.0, 0.0);
         let events = view.take_events();
+        let pane_a = view.node_target(view.element_node("a").unwrap());
         assert_eq!(
             events,
             vec![Event::Scrolled {
                 target: ScrollTarget::Element {
+                    handle: pane_a.handle,
                     id: Some("a".into())
                 },
                 x: 40.0,
@@ -2128,6 +2617,7 @@ mod tests {
         view.render(vp).unwrap();
         view.wheel(vp, 50.0, 50.0, 0.0, 40.0); // pane a → 40
         let _ = view.take_events();
+        let pane_a = view.node_target(view.element_node("a").unwrap());
 
         // A new stylesheet forces a full relayout (the box tree is
         // rebuilt); the pane still exists, so its offset transplants.
@@ -2139,6 +2629,7 @@ mod tests {
             view.take_events(),
             vec![Event::Scrolled {
                 target: ScrollTarget::Element {
+                    handle: pane_a.handle,
                     id: Some("a".into())
                 },
                 x: 0.0,
@@ -2174,21 +2665,37 @@ mod tests {
             view.render(vp).unwrap();
         }
         let events = view.take_events();
+        let first_handle = match &events[0] {
+            Event::Scrolled {
+                target: ScrollTarget::Element { handle, .. },
+                ..
+            } => *handle,
+            other => panic!("unexpected first event: {other:?}"),
+        };
         assert_eq!(
             events,
             vec![
                 Event::Scrolled {
-                    target: ScrollTarget::Element { id: None },
+                    target: ScrollTarget::Element {
+                        handle: first_handle,
+                        id: None
+                    },
                     x: 0.0,
                     y: 40.0,
                 },
                 Event::Scrolled {
-                    target: ScrollTarget::Element { id: None },
+                    target: ScrollTarget::Element {
+                        handle: first_handle,
+                        id: None
+                    },
                     x: 0.0,
                     y: 80.0,
                 },
                 Event::Scrolled {
-                    target: ScrollTarget::Element { id: None },
+                    target: ScrollTarget::Element {
+                        handle: first_handle,
+                        id: None
+                    },
                     x: 0.0,
                     y: 120.0,
                 },
@@ -2198,10 +2705,21 @@ mod tests {
         // The second pane is untouched by the first pane's scroll.
         view.wheel(vp, 50.0, 200.0, 0.0, 40.0); // second pane (y 150..250)
         let events = view.take_events();
+        let second_handle = match &events[0] {
+            Event::Scrolled {
+                target: ScrollTarget::Element { handle, .. },
+                ..
+            } => *handle,
+            other => panic!("unexpected second event: {other:?}"),
+        };
+        assert_ne!(first_handle, second_handle);
         assert_eq!(
             events,
             vec![Event::Scrolled {
-                target: ScrollTarget::Element { id: None },
+                target: ScrollTarget::Element {
+                    handle: second_handle,
+                    id: None
+                },
                 x: 0.0,
                 y: 40.0,
             }]
@@ -2411,16 +2929,14 @@ mod tests {
         // Wheel down without moving the pointer: #b slides under it.
         view.wheel(vp, 50.0, 150.0, 0.0, 100.0);
         let events = view.take_events();
+        let a_target = view.node_target(view.element_node("a").unwrap());
+        let b_target = view.node_target(view.element_node("b").unwrap());
         assert!(
-            events.contains(&Event::PointerLeave {
-                element: Some("a".into())
-            }),
+            events.contains(&Event::PointerLeave { target: a_target }),
             "{events:?}"
         );
         assert!(
-            events.contains(&Event::PointerEnter {
-                element: Some("b".into())
-            }),
+            events.contains(&Event::PointerEnter { target: b_target }),
             "{events:?}"
         );
         let frame = view.render(vp).unwrap().frame;
@@ -2606,23 +3122,25 @@ mod tests {
         view.focus_next();
         assert_eq!(view.focused(), Some("first"), "wraps around");
 
+        let first_target = view.node_target(view.element_node("first").unwrap());
+        let second_target = view.node_target(view.element_node("second").unwrap());
         let events = view.take_events();
         assert_eq!(
             events,
             vec![
                 Event::FocusChanged {
                     from: None,
-                    to: Some("first".into()),
+                    to: Some(first_target.clone()),
                     origin: FocusOrigin::Keyboard,
                 },
                 Event::FocusChanged {
-                    from: Some("first".into()),
-                    to: Some("second".into()),
+                    from: Some(first_target.clone()),
+                    to: Some(second_target.clone()),
                     origin: FocusOrigin::Keyboard,
                 },
                 Event::FocusChanged {
-                    from: Some("second".into()),
-                    to: Some("first".into()),
+                    from: Some(second_target),
+                    to: Some(first_target),
                     origin: FocusOrigin::Keyboard,
                 },
             ]
@@ -2633,6 +3151,591 @@ mod tests {
         assert!(view.take_events().is_empty());
         view.set_focus(None);
         assert_eq!(view.take_events().len(), 1);
+    }
+
+    #[test]
+    fn m4c1_editing_keeps_runtime_value_out_of_dom_and_layout_facts() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=editor type=text value=abc></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        let facts_before = view.layout_facts(vp).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("editor"));
+        let _ = view.take_events();
+        let passes = view.layout_stats().passes;
+
+        assert!(view.insert_text("é"));
+        assert_eq!(view.layout_stats().passes, passes);
+        let target = view.node_target(view.element_node("editor").unwrap());
+        assert_eq!(view.control_value(target.handle), Some("éabc"));
+        assert_eq!(
+            view.dom
+                .attribute(view.element_node("editor").unwrap(), "value"),
+            Some("abc")
+        );
+        assert_eq!(view.layout_facts(vp).unwrap(), facts_before);
+        assert_eq!(
+            view.take_events(),
+            vec![
+                Event::ValueChanged {
+                    target: target.clone(),
+                    value: "éabc".to_owned(),
+                },
+                Event::SelectionChanged {
+                    target,
+                    anchor: "é".len(),
+                    focus: "é".len(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn m4c1_commands_filter_named_text_and_allow_textarea_newlines() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=input type=text value=abc><textarea id=area>one</textarea></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(400, 240, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        view.set_focus(Some("input"));
+        let _ = view.take_events();
+        assert!(view.key_command(KeyCommand::End, KeyModifiers::default()));
+        assert!(
+            !view.insert_text("\r"),
+            "Enter text must not reach an input"
+        );
+        assert!(view.key_command(KeyCommand::Backspace, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("input").unwrap()).handle),
+            Some("ab")
+        );
+
+        view.set_focus(Some("area"));
+        let _ = view.take_events();
+        assert!(view.key_command(KeyCommand::End, KeyModifiers::default()));
+        assert!(view.key_command(KeyCommand::Enter, KeyModifiers::default()));
+        assert!(view.insert_text("two\nthree"));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("area").unwrap()).handle),
+            Some("one\ntwo\nthree")
+        );
+    }
+
+    #[test]
+    fn m4c1_readonly_and_disabled_controls_reject_value_changes() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body><input id=ro value=abc readonly><input id=off value=xyz disabled><input id=ok value=q></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(500, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        view.set_focus(Some("ro"));
+        let _ = view.take_events();
+        assert!(!view.insert_text("x"));
+        assert!(view.key_command(KeyCommand::Right, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("ro").unwrap()).handle),
+            Some("abc")
+        );
+
+        view.focus_next();
+        assert_eq!(view.focused(), Some("ok"), "disabled control is skipped");
+        view.set_focus(Some("off"));
+        assert_eq!(
+            view.focused(),
+            Some("ok"),
+            "disabled control cannot receive focus"
+        );
+    }
+
+    #[test]
+    fn m4c1_click_places_caret_and_focuses_the_control() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=hello></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        // Caret geometry comes from facts: caret at offset 0 sits at the
+        // content origin; its height is the editor line height.
+        let facts = view.control_facts(vp).unwrap();
+        let caret = facts.controls[0].caret_rect;
+        assert_eq!(view.focused(), None);
+
+        // Press near the text start, then release: focus (pointer origin),
+        // a collapsed caret near offset 0, and a click.
+        view.pointer_press(vp, caret.x + 1.0, caret.y + caret.height / 2.0);
+        view.pointer_release(vp, caret.x + 1.0, caret.y + caret.height / 2.0);
+        assert_eq!(view.focused(), Some("box"));
+        assert_eq!(view.focus_origin(), Some(FocusOrigin::Pointer));
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "caret placement never lays out"
+        );
+
+        let events = view.take_events();
+        let target = view.node_target(view.element_node("box").unwrap());
+        assert!(
+            events.contains(&Event::Click {
+                target: target.clone()
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::SelectionChanged {
+                target,
+                anchor: 0,
+                focus: 0,
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ValueChanged { .. })),
+            "clicking must not edit the value"
+        );
+
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(facts.controls[0].selection_anchor, 0);
+        assert_eq!(facts.controls[0].selection_focus, 0);
+    }
+
+    #[test]
+    fn m4c1_drag_selects_with_capture_even_outside_the_control() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=hello></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+        let facts = view.control_facts(vp).unwrap();
+        let caret = facts.controls[0].caret_rect;
+        let target = view.node_target(view.element_node("box").unwrap());
+
+        // Press at the text start, then drag far past the control's right
+        // edge (the input is 200px wide): capture keeps updating selection.
+        view.pointer_press(vp, caret.x + 1.0, caret.y + caret.height / 2.0);
+        let _ = view.take_events();
+        let moved = view.pointer_move(vp, caret.x + 400.0, caret.y + caret.height / 2.0);
+        assert!(moved, "the selection drag changed presentation");
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "dragging never lays out"
+        );
+        assert_eq!(
+            view.hovered(),
+            None,
+            "hover follows the real pointer, not capture"
+        );
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![
+                Event::PointerLeave {
+                    target: target.clone()
+                },
+                Event::SelectionChanged {
+                    target: target.clone(),
+                    anchor: 0,
+                    focus: 5,
+                },
+            ],
+            "{events:?}"
+        );
+
+        // Release outside the box ends capture: later moves hover normally
+        // but never touch the selection.
+        view.pointer_release(vp, caret.x + 400.0, caret.y + caret.height / 2.0);
+        let _ = view.take_events();
+        view.pointer_move(vp, caret.x + 1.0, caret.y + caret.height / 2.0);
+        let events = view.take_events();
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, Event::PointerEnter { .. })),
+            "only hover events remain: {events:?}"
+        );
+
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            (
+                facts.controls[0].selection_anchor,
+                facts.controls[0].selection_focus
+            ),
+            (0, 5)
+        );
+    }
+
+    #[test]
+    fn m4c1_control_facts_report_caret_and_scroll_to_caret() {
+        let long = "abcdefghij".repeat(8);
+        let html = format!(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=long data-vv-test=long value={long}></body></html>"
+        );
+        let mut view = VelquView::new();
+        view.load_html(&html).unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let structural = view.layout_facts(vp).unwrap();
+        let node_fact = structural
+            .nodes
+            .iter()
+            .find(|fact| fact.fixture_id == "long")
+            .expect("input in layout facts");
+        let (content_x, content_width) = (node_fact.content_x, node_fact.content_width);
+        let _ = view.render(vp).unwrap();
+
+        view.set_focus(Some("long"));
+        let _ = view.take_events();
+        view.key_command(KeyCommand::Home, KeyModifiers::default());
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(facts.controls[0].scroll_offset, (0.0, 0.0));
+        assert_eq!(facts.controls[0].visible_text_range.0, 0);
+        assert_eq!(facts.controls[0].value_length, long.len());
+
+        // End: the caret moves to the value end and the editor scrolls
+        // horizontally to keep it visible.
+        view.key_command(KeyCommand::End, KeyModifiers::default());
+        let facts = view.control_facts(vp).unwrap();
+        let fact = &facts.controls[0];
+        assert!(
+            fact.scroll_offset.0 > 0.0,
+            "scroll-to-caret engaged: {fact:?}"
+        );
+        assert_eq!(fact.visible_text_range, (0, long.len()));
+        assert!(fact.caret_rect.x >= content_x);
+        assert!(fact.caret_rect.x <= content_x + content_width);
+        assert!(fact.caret_rect.y >= content_x - content_x); // trivially within the box vertically
+        assert!(fact.caret_rect.height > 0.0);
+    }
+
+    #[test]
+    fn m4c1_editing_repaints_presentation_without_layout() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\"><input id=box value=abc></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        let before = view.render(vp).unwrap();
+        let hash_before = before.frame.sha256_hex();
+        let stats_before = view.layout_stats();
+
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.insert_text("Z"));
+
+        let after = view.render(vp).unwrap();
+        assert_ne!(
+            after.frame.sha256_hex(),
+            hash_before,
+            "the edited value paints"
+        );
+        let stats_after = view.layout_stats();
+        assert_eq!(stats_after.passes, stats_before.passes, "no Taffy pass");
+        assert!(
+            stats_after.repaints > stats_before.repaints,
+            "a repaint pass ran"
+        );
+    }
+
+    // -- M4c2 clipboard (ADR 0013) ----------------------------------------
+
+    /// A recording host clipboard: writes are captured, reads hand out one
+    /// preloaded value (like a clipboard the user primed externally).
+    #[derive(Default)]
+    struct RecordingClipboard {
+        written: RefCell<Vec<String>>,
+        next_read: RefCell<Option<String>>,
+    }
+
+    impl ClipboardProvider for RecordingClipboard {
+        fn read(&self) -> Result<Option<String>, ClipboardError> {
+            Ok(self.next_read.borrow_mut().take())
+        }
+
+        fn write(&self, text: &str) -> Result<(), ClipboardError> {
+            self.written.borrow_mut().push(text.to_owned());
+            Ok(())
+        }
+    }
+
+    /// A host whose clipboard write always fails — the real-world shape of
+    /// clipboard contention or an unsupported environment.
+    struct FailingClipboard;
+
+    impl ClipboardProvider for FailingClipboard {
+        fn read(&self) -> Result<Option<String>, ClipboardError> {
+            Ok(None)
+        }
+
+        fn write(&self, _text: &str) -> Result<(), ClipboardError> {
+            Err(ClipboardError::new("clipboard busy"))
+        }
+    }
+
+    fn clipboard_view(html: &str) -> (VelquView, Rc<RecordingClipboard>) {
+        let mut view = VelquView::new();
+        view.load_html(html).unwrap();
+        let clipboard = Rc::new(RecordingClipboard::default());
+        view.set_clipboard_provider(clipboard.clone());
+        (view, clipboard)
+    }
+
+    #[test]
+    fn m4c2_copy_writes_the_selection_and_changes_nothing() {
+        let (mut view, clipboard) =
+            clipboard_view("<!doctype html><html><body><input id=box value=hello></body></html>");
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = view.take_events();
+        let passes = view.layout_stats().passes;
+
+        assert!(!view.key_command(KeyCommand::Copy, KeyModifiers::default()));
+        assert_eq!(
+            clipboard.written.borrow().as_slice(),
+            ["hello"],
+            "the selection reached the host clipboard"
+        );
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("hello"),
+            "copy never edits the value"
+        );
+        assert!(view.take_events().is_empty(), "copy emits nothing");
+        assert_eq!(view.layout_stats().passes, passes);
+
+        // Collapsed caret + copy: nothing selected, nothing written.
+        assert!(view.key_command(KeyCommand::Right, KeyModifiers::default()));
+        let _ = view.take_events();
+        clipboard.written.borrow_mut().clear();
+        assert!(!view.key_command(KeyCommand::Copy, KeyModifiers::default()));
+        assert!(clipboard.written.borrow().is_empty());
+    }
+
+    #[test]
+    fn m4c2_cut_deletes_and_paste_inserts_through_the_provider() {
+        let (mut view, clipboard) =
+            clipboard_view("<!doctype html><html><body><input id=box value=hello></body></html>");
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        let target = view.node_target(view.element_node("box").unwrap());
+        assert!(view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = view.take_events();
+
+        // Cut: clipboard gets the text, value empties, both events fire.
+        assert!(view.key_command(KeyCommand::Cut, KeyModifiers::default()));
+        assert_eq!(clipboard.written.borrow().as_slice(), ["hello"]);
+        assert_eq!(view.control_value(target.handle), Some(""));
+        assert_eq!(
+            view.take_events(),
+            vec![
+                Event::ValueChanged {
+                    target: target.clone(),
+                    value: String::new(),
+                },
+                Event::SelectionChanged {
+                    target: target.clone(),
+                    anchor: 0,
+                    focus: 0,
+                },
+            ]
+        );
+
+        // Paste: the provider's text replaces the (empty) selection.
+        *clipboard.next_read.borrow_mut() = Some("pasté".to_owned());
+        assert!(view.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert_eq!(view.control_value(target.handle), Some("pasté"));
+
+        // An empty clipboard pastes nothing.
+        assert!(!view.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert_eq!(view.control_value(target.handle), Some("pasté"));
+    }
+
+    #[test]
+    fn m4c2_cut_is_grapheme_safe_and_paste_normalizes_crlf() {
+        let (mut view, clipboard) = clipboard_view(
+            "<!doctype html><html><body><input id=box value=a😀b><textarea id=area>x</textarea></body></html>",
+        );
+        let vp = Viewport::try_new(400, 240, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Caret after 'a', Shift+Right selects the emoji as one grapheme.
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        view.key_command(KeyCommand::Home, KeyModifiers::default());
+        view.key_command(KeyCommand::Right, KeyModifiers::default());
+        view.key_command(
+            KeyCommand::Right,
+            KeyModifiers {
+                shift: true,
+                ..KeyModifiers::default()
+            },
+        );
+        let _ = view.take_events();
+        assert!(view.key_command(KeyCommand::Cut, KeyModifiers::default()));
+        assert_eq!(clipboard.written.borrow().as_slice(), ["😀"]);
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("ab"),
+            "the emoji is cut as one grapheme"
+        );
+
+        // CRLF pastes into a textarea arrive as plain newlines.
+        view.set_focus(Some("area"));
+        let _ = view.take_events();
+        assert!(view.key_command(KeyCommand::End, KeyModifiers::default()));
+        let _ = view.take_events();
+        *clipboard.next_read.borrow_mut() = Some("two\r\nthree".to_owned());
+        assert!(view.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("area").unwrap()).handle),
+            Some("xtwo\nthree")
+        );
+
+        // The same clipboard text into a single-line input loses the
+        // newlines entirely.
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.key_command(KeyCommand::End, KeyModifiers::default()));
+        let _ = view.take_events();
+        *clipboard.next_read.borrow_mut() = Some("one\r\ntwo".to_owned());
+        assert!(view.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("abonetwo")
+        );
+    }
+
+    #[test]
+    fn m4c2_readonly_and_null_clipboard_policies() {
+        // Readonly: copy still writes; cut and paste are no-ops.
+        let (mut view, clipboard) = clipboard_view(
+            "<!doctype html><html><body><input id=ro value=frozen readonly></body></html>",
+        );
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("ro"));
+        let _ = view.take_events();
+        assert!(view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = view.take_events();
+
+        assert!(!view.key_command(KeyCommand::Copy, KeyModifiers::default()));
+        assert_eq!(clipboard.written.borrow().as_slice(), ["frozen"]);
+        assert!(!view.key_command(KeyCommand::Cut, KeyModifiers::default()));
+        assert_eq!(
+            clipboard.written.borrow().len(),
+            1,
+            "readonly cut writes nothing"
+        );
+        *clipboard.next_read.borrow_mut() = Some("intruder".to_owned());
+        assert!(!view.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("ro").unwrap()).handle),
+            Some("frozen")
+        );
+
+        // Null host (default provider): the clipboard is unavailable, not
+        // silently lossy. Paste reads nothing, and cut refuses to delete
+        // the selection its write could not take (transactional, ADR 0013).
+        let mut bare = VelquView::new();
+        bare.load_html("<!doctype html><html><body><input id=box value=keep></body></html>")
+            .unwrap();
+        let vp2 = Viewport::try_new(300, 120, 1.0).unwrap();
+        bare.render(vp2).unwrap();
+        bare.set_focus(Some("box"));
+        let _ = bare.take_events();
+        assert!(bare.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = bare.take_events();
+        assert!(!bare.key_command(KeyCommand::Paste, KeyModifiers::default()));
+        assert!(!bare.key_command(KeyCommand::Cut, KeyModifiers::default()));
+        assert_eq!(
+            bare.control_value(bare.node_target(bare.element_node("box").unwrap()).handle),
+            Some("keep"),
+            "cut must not destroy text when no clipboard can take it"
+        );
+        assert!(format!("{:?}", bare).contains("custom_clipboard_provider: false"));
+    }
+
+    #[test]
+    fn m4c2_cut_is_transactional_when_the_clipboard_fails() {
+        // A real OS failure (contention, unsupported environment) surfaces
+        // as Err: the selection survives instead of being destroyed.
+        let mut view = VelquView::new();
+        view.load_html("<!doctype html><html><body><input id=box value=precious></body></html>")
+            .unwrap();
+        view.set_clipboard_provider(Rc::new(FailingClipboard));
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.key_command(
+            KeyCommand::SelectAll,
+            KeyModifiers {
+                ctrl: true,
+                ..KeyModifiers::default()
+            }
+        ));
+        let _ = view.take_events();
+
+        assert!(!view.key_command(KeyCommand::Cut, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("precious"),
+            "a failed cut write keeps the selection"
+        );
+        assert!(view.take_events().is_empty(), "no events without a change");
+        // Copy failing is harmless by construction: nothing is deleted.
+        assert!(!view.key_command(KeyCommand::Copy, KeyModifiers::default()));
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("precious")
+        );
     }
 
     #[test]

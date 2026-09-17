@@ -34,6 +34,7 @@ png = "0.17"
 html5ever = "0.40"
 cssparser = "0.38"
 taffy = "0.14"
+unicode-segmentation = "1.13"
 # Images: decode only, feature-scoped to the M2c profile (PNG + JPEG). No
 # default features (drops every other decoder and `rayon`), so decode is
 # single-threaded and deterministic. Bounded by `ImageLimits` before/at

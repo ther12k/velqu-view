@@ -187,7 +187,7 @@ fn project<'a>(
         &node.style,
         scale,
         PAGE_ROOT_TAGS.contains(&node.tag.as_str()),
-        node.replaced.is_some() || node.tag == "img",
+        node.replaced.is_some() || node.control.is_some() || node.tag == "img",
     );
 
     // A grid container with only inline content still needs its tracks:
@@ -553,6 +553,11 @@ fn leaf_content_size(
             height: image.height as f32 * scale,
         };
         return image_content_size(box_node, intrinsic, image.aspect_ratio(), scale);
+    }
+    if let Some(kind) = box_node.control {
+        let (width, height) = kind.intrinsic_size(scale);
+        let intrinsic = TaffySize { width, height };
+        return image_content_size(box_node, intrinsic, None, scale);
     }
     if box_node.tag == "img" {
         // Broken or missing asset (ADR 0008): no intrinsic size, no ratio —

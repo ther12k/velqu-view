@@ -17,17 +17,31 @@
 //! now: when hover/active/focus state changes pixels the view says so and
 //! the shell schedules a repaint (presentation-only, no relayout); the
 //! CSS `cursor` maps onto the platform cursor. Escape still closes.
-//! Text editing, IME, and selection land in M4c.
+//! M4c1 adds keyboard editing: named keys become backend-independent
+//! commands (arrows, Home/End, Backspace/Delete, Enter, Ctrl/Cmd+A) and
+//! only non-command `KeyEvent.text` reaches the view as text insertion —
+//! winit's `"\r"` for Enter or `"\t"` for Tab can never leak into a
+//! control. M4c2 adds the clipboard: Ctrl/Cmd+C/X/V map to Copy/Cut/
+//! Paste commands, and the shell installs an OS-backed clipboard provider
+//! (arboard) when the session has one — the renderer itself only ever
+//! sees the host `ClipboardProvider` interface, whose failures make cut
+//! transactional. Routing is AltGr-safe (ADR 0013): Alt disqualifies
+//! shortcut chords and text suppression, so Ctrl+Alt chords (e.g. `@` =
+//! Ctrl+Alt+Q on German layouts) insert their produced text. The
+//! clipboard adapter is torn down explicitly at loop exit. IME stays
+//! deferred to M4c3.
 
 use std::fmt;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
-use velqu_view::{CursorStyle, FrameResult, VelquError, VelquView, Viewport};
+use velqu_view::{
+    CursorStyle, FrameResult, KeyCommand, KeyModifiers, VelquError, VelquView, Viewport,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 /// Vertical px per wheel line notch (winit `LineDelta`); matches common
@@ -147,6 +161,19 @@ pub struct ShellStats {
 pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, ShellError> {
     let event_loop = EventLoop::new()?;
     let context = softbuffer::Context::new(event_loop.owned_display_handle())?;
+    // OS clipboard (M4c2, ADR 0013): the shell is the host that owns
+    // platform integration. When the session has no clipboard service
+    // (headless CI), the view keeps its null provider — paste reads
+    // nothing and cut refuses to destroy the selection (transactional).
+    let clipboard: Option<std::rc::Rc<dyn velqu_view::ClipboardProvider>> =
+        arboard::Clipboard::new().ok().map(|board| {
+            let provider: std::rc::Rc<dyn velqu_view::ClipboardProvider> =
+                std::rc::Rc::new(ArboardClipboard {
+                    board: std::cell::RefCell::new(board),
+                });
+            view.set_clipboard_provider(provider.clone());
+            provider
+        });
 
     // `Wait` sleeps until input; a deadline (smoke tests) needs `WaitUntil`
     // so the loop wakes up to honor `exit_after` with no other events.
@@ -168,10 +195,22 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
         last_cursor: None,
         started: Instant::now(),
         frames: 0,
+        modifiers: ModifiersState::default(),
         error: None,
     };
-    event_loop.run_app(&mut app)?;
-    app.take_result()
+    let loop_result = event_loop.run_app(&mut app);
+    let stats = app.take_result();
+    // Explicit clipboard teardown (arboard lifecycle): arboard warns that
+    // frameworks owning the event loop can keep the handle from dropping
+    // naturally at process exit, and on Wayland/X11 this application is
+    // the clipboard owner. Release both strong references here, while the
+    // process is still in control.
+    if clipboard.is_some() {
+        view.set_clipboard_provider(std::rc::Rc::new(velqu_view::NullClipboardProvider));
+    }
+    drop(clipboard);
+    loop_result.map_err(ShellError::from)?;
+    stats
 }
 
 struct ShellApp<'a> {
@@ -189,6 +228,7 @@ struct ShellApp<'a> {
     last_cursor: Option<CursorStyle>,
     started: Instant,
     frames: u64,
+    modifiers: ModifiersState,
     error: Option<ShellError>,
 }
 
@@ -273,6 +313,53 @@ impl ShellApp<'_> {
         }
     }
 
+    fn key_modifiers(&self) -> KeyModifiers {
+        KeyModifiers {
+            ctrl: self.modifiers.control_key(),
+            command: self.modifiers.super_key(),
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+        }
+    }
+
+    fn keyboard_input(&mut self, event_loop: &ActiveEventLoop, event: &winit::event::KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+
+        let modifiers = self.key_modifiers();
+        match route_keyboard_input(
+            &event.logical_key,
+            event.physical_key,
+            modifiers,
+            event.text.as_deref(),
+        ) {
+            KeyboardRoute::Command(KeyCommand::Escape) => event_loop.exit(),
+            KeyboardRoute::Command(KeyCommand::Tab) => {
+                if !event.repeat {
+                    // Focus is runtime presentation state; if focus styling
+                    // exists the pixels change: presentation-only repaint.
+                    self.view.focus_next();
+                    self.dirty = true;
+                    self.request_redraw();
+                }
+            }
+            KeyboardRoute::Command(command) => {
+                if self.view.key_command(command, modifiers) {
+                    self.dirty = true;
+                    self.request_redraw();
+                }
+            }
+            KeyboardRoute::InsertText(text) => {
+                if self.view.insert_text(text) {
+                    self.dirty = true;
+                    self.request_redraw();
+                }
+            }
+            KeyboardRoute::Ignored => {}
+        }
+    }
+
     /// Renders one frame and presents it. Errors end the loop.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let result = self.redraw_inner();
@@ -338,22 +425,11 @@ impl ApplicationHandler for ShellApp<'_> {
                 self.dirty = true;
                 self.request_redraw();
             }
+            winit::event::WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed
-                    && event.physical_key == PhysicalKey::Code(KeyCode::Escape)
-                {
-                    event_loop.exit();
-                }
-                if event.state == ElementState::Pressed
-                    && !event.repeat
-                    && event.physical_key == PhysicalKey::Code(KeyCode::Tab)
-                {
-                    // Focus is runtime presentation state; if focus styling
-                    // exists the pixels change: presentation-only repaint.
-                    self.view.focus_next();
-                    self.dirty = true;
-                    self.request_redraw();
-                }
+                self.keyboard_input(event_loop, &event);
             }
             winit::event::WindowEvent::CursorMoved { position, .. } => {
                 self.pointer_moved(position);
@@ -419,6 +495,128 @@ impl ApplicationHandler for ShellApp<'_> {
     }
 }
 
+/// The routing decision for one keyboard input (pure, testable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardRoute<'a> {
+    /// A named key or shortcut chord; dispatch as a command.
+    Command(KeyCommand),
+    /// Insert the platform's produced text verbatim.
+    InsertText(&'a str),
+    /// Nothing to do (key releases, textless keys, suppressed chords).
+    Ignored,
+}
+
+/// Routes one keyboard input (M4c2, ADR 0013):
+///
+/// 1. Named editing/navigation keys are commands before any text
+///    consideration (winit gives Enter the text `"\r"` and Tab `"\t"`).
+/// 2. An exact shortcut chord — Ctrl/Cmd + A/C/X/V — is a command.
+/// 3. A primary shortcut modifier (Ctrl/Cmd) **without Alt** suppresses
+///    text: a modified non-shortcut key must not leak its glyph.
+/// 4. Everything else — plain keys, Shift chords, and AltGr-like
+///    Ctrl+Alt chords — defers to `KeyEvent.text`, the platform's
+///    actually-produced text.
+///
+/// The Alt rule is the international-layout contract: winit 0.30 has no
+/// distinct AltGr flag (AltGr arrives as Ctrl+Alt, e.g. `@` = Ctrl+Alt+Q
+/// on German layouts), so Alt disqualifies both the chord match and the
+/// suppression, and the produced text routes.
+fn route_keyboard_input<'a>(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    modifiers: KeyModifiers,
+    text: Option<&'a str>,
+) -> KeyboardRoute<'a> {
+    if let Some(command) = named_key_command(logical_key) {
+        return KeyboardRoute::Command(command);
+    }
+    if let Some(command) = shortcut_chord(logical_key, physical_key, modifiers) {
+        return KeyboardRoute::Command(command);
+    }
+    if (modifiers.ctrl || modifiers.command) && !modifiers.alt {
+        return KeyboardRoute::Ignored;
+    }
+    match text {
+        Some(text) if !text.is_empty() => KeyboardRoute::InsertText(text),
+        _ => KeyboardRoute::Ignored,
+    }
+}
+
+/// Maps named editing/navigation keys regardless of modifiers.
+fn named_key_command(logical_key: &Key) -> Option<KeyCommand> {
+    match logical_key {
+        Key::Named(NamedKey::Backspace) => Some(KeyCommand::Backspace),
+        Key::Named(NamedKey::Delete) => Some(KeyCommand::Delete),
+        Key::Named(NamedKey::ArrowLeft) => Some(KeyCommand::Left),
+        Key::Named(NamedKey::ArrowRight) => Some(KeyCommand::Right),
+        Key::Named(NamedKey::ArrowUp) => Some(KeyCommand::Up),
+        Key::Named(NamedKey::ArrowDown) => Some(KeyCommand::Down),
+        Key::Named(NamedKey::Home) => Some(KeyCommand::Home),
+        Key::Named(NamedKey::End) => Some(KeyCommand::End),
+        Key::Named(NamedKey::Enter) => Some(KeyCommand::Enter),
+        Key::Named(NamedKey::Tab) => Some(KeyCommand::Tab),
+        Key::Named(NamedKey::Escape) => Some(KeyCommand::Escape),
+        _ => None,
+    }
+}
+
+/// Matches an exact supported shortcut chord: Ctrl/Cmd + A/C/X/V. Letters
+/// match the logical key when the layout labels them and fall back to the
+/// physical key otherwise; **Alt disqualifies** — a Ctrl+Alt chord is
+/// AltGr territory, never a shortcut.
+fn shortcut_chord(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    modifiers: KeyModifiers,
+) -> Option<KeyCommand> {
+    if (!modifiers.ctrl && !modifiers.command) || modifiers.alt {
+        return None;
+    }
+    let letter = |target: &str, code: KeyCode| {
+        matches!(logical_key, Key::Character(text) if text.eq_ignore_ascii_case(target))
+            || matches!(physical_key, PhysicalKey::Code(actual) if actual == code)
+    };
+    if letter("a", KeyCode::KeyA) {
+        Some(KeyCommand::SelectAll)
+    } else if letter("c", KeyCode::KeyC) {
+        Some(KeyCommand::Copy)
+    } else if letter("x", KeyCode::KeyX) {
+        Some(KeyCommand::Cut)
+    } else if letter("v", KeyCode::KeyV) {
+        Some(KeyCommand::Paste)
+    } else {
+        None
+    }
+}
+
+/// OS clipboard adapter (M4c2): the only piece of the shell that touches
+/// the platform clipboard. arboard's handle needs `&mut` for read/write,
+/// so it sits behind a `RefCell` (the shell is single-threaded); the
+/// renderer-facing trait stays shared, like `AssetResolver`. Platform
+/// failures (contention, non-text payload, unsupported environment)
+/// surface as `Err` so the renderer's transactional rules apply — most
+/// importantly, a failed cut write keeps the selection.
+struct ArboardClipboard {
+    board: std::cell::RefCell<arboard::Clipboard>,
+}
+
+impl velqu_view::ClipboardProvider for ArboardClipboard {
+    fn read(&self) -> Result<Option<String>, velqu_view::ClipboardError> {
+        self.board
+            .borrow_mut()
+            .get_text()
+            .map(Some)
+            .map_err(|error| velqu_view::ClipboardError::new(error.to_string()))
+    }
+
+    fn write(&self, text: &str) -> Result<(), velqu_view::ClipboardError> {
+        self.board
+            .borrow_mut()
+            .set_text(text.to_owned())
+            .map_err(|error| velqu_view::ClipboardError::new(error.to_string()))
+    }
+}
+
 /// Maps the CSS `cursor` value onto the platform cursor (M4b). `Auto`
 /// means "the UA decides" - the shell's UA default is the plain arrow.
 fn cursor_icon(style: CursorStyle) -> winit::window::CursorIcon {
@@ -426,5 +624,237 @@ fn cursor_icon(style: CursorStyle) -> winit::window::CursorIcon {
         CursorStyle::Auto | CursorStyle::Default => winit::window::CursorIcon::Default,
         CursorStyle::Pointer => winit::window::CursorIcon::Pointer,
         CursorStyle::Text => winit::window::CursorIcon::Text,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_enter_is_a_command_even_when_winit_supplies_carriage_return() {
+        // winit's KeyEvent.text for Enter is Some("\r"); the route must
+        // be the command, never the text.
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Named(NamedKey::Enter),
+                PhysicalKey::Code(KeyCode::Enter),
+                KeyModifiers::default(),
+                Some("\r"),
+            ),
+            KeyboardRoute::Command(KeyCommand::Enter)
+        );
+    }
+
+    #[test]
+    fn tab_and_escape_are_commands_not_text() {
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Named(NamedKey::Tab),
+                PhysicalKey::Code(KeyCode::Tab),
+                KeyModifiers::default(),
+                Some("\t"),
+            ),
+            KeyboardRoute::Command(KeyCommand::Tab)
+        );
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Named(NamedKey::Escape),
+                PhysicalKey::Code(KeyCode::Escape),
+                KeyModifiers::default(),
+                Some("\u{1b}"),
+            ),
+            KeyboardRoute::Command(KeyCommand::Escape)
+        );
+    }
+
+    #[test]
+    fn control_or_command_a_maps_to_select_all() {
+        let logical = Key::Character("a".into());
+        assert_eq!(
+            shortcut_chord(
+                &logical,
+                PhysicalKey::Code(KeyCode::KeyA),
+                KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                }
+            ),
+            Some(KeyCommand::SelectAll)
+        );
+        assert_eq!(
+            shortcut_chord(
+                &logical,
+                PhysicalKey::Code(KeyCode::KeyA),
+                KeyModifiers {
+                    command: true,
+                    ..KeyModifiers::default()
+                }
+            ),
+            Some(KeyCommand::SelectAll)
+        );
+        // Alt disqualifies the chord...
+        assert_eq!(
+            shortcut_chord(
+                &logical,
+                PhysicalKey::Code(KeyCode::KeyA),
+                KeyModifiers {
+                    alt: true,
+                    ..KeyModifiers::default()
+                }
+            ),
+            None
+        );
+        // ...and a textless Ctrl+Alt+A routes nowhere (an AltGr layout
+        // that did produce text would route that text instead).
+        assert_eq!(
+            route_keyboard_input(
+                &logical,
+                PhysicalKey::Code(KeyCode::KeyA),
+                KeyModifiers {
+                    ctrl: true,
+                    alt: true,
+                    ..KeyModifiers::default()
+                },
+                None,
+            ),
+            KeyboardRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn plain_character_keys_route_their_produced_text() {
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Character("é".into()),
+                PhysicalKey::Code(KeyCode::KeyE),
+                KeyModifiers::default(),
+                Some("é"),
+            ),
+            KeyboardRoute::InsertText("é")
+        );
+        // Textless plain keys (function keys etc.) do nothing.
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Character("é".into()),
+                PhysicalKey::Code(KeyCode::KeyE),
+                KeyModifiers::default(),
+                None,
+            ),
+            KeyboardRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn clipboard_shortcuts_map_to_commands() {
+        let ctrl = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        };
+        // By logical key…
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("c".into()),
+                PhysicalKey::Code(KeyCode::KeyC),
+                ctrl
+            ),
+            Some(KeyCommand::Copy)
+        );
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("X".into()),
+                PhysicalKey::Code(KeyCode::KeyX),
+                ctrl
+            ),
+            Some(KeyCommand::Cut)
+        );
+        // …and by physical key when the layout labels it differently.
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("û".into()),
+                PhysicalKey::Code(KeyCode::KeyV),
+                ctrl
+            ),
+            Some(KeyCommand::Paste)
+        );
+        // Cmd on macOS behaves like Ctrl.
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("c".into()),
+                PhysicalKey::Code(KeyCode::KeyC),
+                KeyModifiers {
+                    command: true,
+                    ..KeyModifiers::default()
+                }
+            ),
+            Some(KeyCommand::Copy)
+        );
+        // Without Ctrl/Cmd the letters stay plain text.
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("c".into()),
+                PhysicalKey::Code(KeyCode::KeyC),
+                KeyModifiers::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn modified_non_shortcut_keys_never_become_text() {
+        // Ctrl held + a non-shortcut key: no command and, critically, no
+        // fall-through that would insert the key's text.
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Character("k".into()),
+                PhysicalKey::Code(KeyCode::KeyK),
+                KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                },
+                Some("k"),
+            ),
+            KeyboardRoute::Ignored
+        );
+    }
+
+    #[test]
+    fn altgr_chords_route_produced_text_instead_of_shortcuts() {
+        // German-layout-like: @ = Ctrl+Alt+Q. The physical key would
+        // alias the Copy chord, and the logical key may come through as
+        // either the base letter or the produced glyph — either way the
+        // produced text wins and nothing is copied.
+        let modifiers = KeyModifiers {
+            ctrl: true,
+            alt: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Character("q".into()),
+                PhysicalKey::Code(KeyCode::KeyQ),
+                modifiers,
+                Some("@"),
+            ),
+            KeyboardRoute::InsertText("@")
+        );
+        assert_eq!(
+            route_keyboard_input(
+                &Key::Character("@".into()),
+                PhysicalKey::Code(KeyCode::KeyQ),
+                modifiers,
+                Some("@"),
+            ),
+            KeyboardRoute::InsertText("@")
+        );
+        // The chord matcher itself never fires under Alt.
+        assert_eq!(
+            shortcut_chord(
+                &Key::Character("q".into()),
+                PhysicalKey::Code(KeyCode::KeyQ),
+                modifiers
+            ),
+            None
+        );
     }
 }

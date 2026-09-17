@@ -81,6 +81,11 @@ impl Dom {
         &mut self.nodes[id]
     }
 
+    /// Number of allocated nodes, used to validate document-scoped handles.
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Iterates every allocated node with its id (allocation order).
     // Query surface consumed by cascade/layout in the following M2a commits;
     // until each lands, only tests reference some of these.
