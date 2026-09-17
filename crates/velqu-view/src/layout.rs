@@ -378,13 +378,16 @@ fn collect_inline_words(
 /// The complete output of one layout pass: the canonical box tree (layout
 /// truth), the paint-ready display list, and the document-level scroll
 /// state derived from it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct LaidOutDocument {
     pub root: BoxNode,
     pub display_list: DisplayList,
     /// Document scrollable extent (device px): `max(page content,
     /// viewport)` per axis; the scrollport is the viewport itself.
     pub document_scroll: ScrollExtent,
+    /// The clamped document-level scroll offset actually painted this
+    /// frame; hit testing uses it to map viewport points into page space.
+    pub root_offset: (f32, f32),
 }
 
 /// Runtime scroll offsets, keyed by scroll target: the empty key is the
@@ -478,6 +481,7 @@ pub(crate) fn layout_document(
         root,
         display_list: list,
         document_scroll,
+        root_offset: document_offset_clamped,
     })
 }
 

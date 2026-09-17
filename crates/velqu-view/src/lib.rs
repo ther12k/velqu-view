@@ -65,6 +65,7 @@ mod dom;
 mod font;
 mod html;
 mod image;
+mod input;
 mod layout;
 mod painter;
 mod source;
@@ -80,6 +81,7 @@ use std::rc::Rc;
 
 pub use color::{Color, ColorParseError};
 pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
+pub use input::{Event, HitTarget};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
@@ -336,6 +338,20 @@ pub struct VelquView {
     tailwind_diagnostics_list: Vec<String>,
     /// `<style>` block text extracted from the document, in order.
     style_blocks: Vec<String>,
+    // Input gate state (M4a, ADR 0010). Interaction state is runtime
+    // presentation state — it never changes layout facts.
+    /// The most recent layout pass, kept for hit testing. Refreshed by
+    /// every render/layout_facts call; input methods use it read-only.
+    last_laid: Option<layout::LaidOutDocument>,
+    last_viewport: Option<Viewport>,
+    /// Element `id` under the pointer (hover), if any element with an id.
+    hover: Option<String>,
+    /// Focused element `id`, if any.
+    focus: Option<String>,
+    /// Element `id` of the pointer press target (click tracking).
+    pressed: Option<Option<String>>,
+    /// Interaction events since the last [`VelquView::take_events`].
+    events: Vec<Event>,
 }
 
 impl Default for VelquView {
@@ -381,6 +397,12 @@ impl VelquView {
             tailwind_css: None,
             tailwind_diagnostics_list: Vec::new(),
             style_blocks: Vec::new(),
+            last_laid: None,
+            last_viewport: None,
+            hover: None,
+            focus: None,
+            pressed: None,
+            events: Vec::new(),
         }
     }
 
@@ -562,8 +584,14 @@ impl VelquView {
         self.dom = html::parse(&source.html);
         self.document = Some(source);
         // Image identity is per-document, like the DOM: a new document
-        // invalidates every decoded asset.
+        // invalidates every decoded asset — and the input state belongs to
+        // the old tree (M4a).
         self.images.clear();
+        self.last_laid = None;
+        self.hover = None;
+        self.focus = None;
+        self.pressed = None;
+        self.events.clear();
         // `<style>` blocks travel with the document (review fix: they were
         // silently dropped before M3's review).
         self.collect_style_blocks();
@@ -718,8 +746,8 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        let laid_out = self.run_layout(viewport, &mut cascade);
-        let Some(laid) = laid_out else {
+        self.run_layout(viewport, &mut cascade);
+        if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
             let background = document_background(&parsed_author);
@@ -738,11 +766,14 @@ impl VelquView {
                     glyphs,
                 },
             });
-        };
+        }
 
         let background = document_background(&parsed_author);
+        // Disjoint-field borrows: the laid-out display list (immutable)
+        // and the font store (mutable) never overlap.
+        let display_list = &self.last_laid.as_ref().expect("checked above").display_list;
         let (frame, items, glyphs) =
-            painter::paint_document(&laid.display_list, background, viewport, &mut self.fonts)?;
+            painter::paint_document(display_list, background, viewport, &mut self.fonts)?;
         Ok(FrameResult {
             frame,
             stats: RenderStats {
@@ -756,11 +787,7 @@ impl VelquView {
 
     /// Shared cascade+layout pass behind [`VelquView::render`] and
     /// [`VelquView::layout_facts`]; records layout instrumentation.
-    fn run_layout(
-        &mut self,
-        viewport: Viewport,
-        cascade: &mut style::Cascade<'_>,
-    ) -> Option<layout::LaidOutDocument> {
+    fn run_layout(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
         let started = std::time::Instant::now();
         let laid = layout::layout_document(
             &self.dom,
@@ -776,7 +803,11 @@ impl VelquView {
             .as_ref()
             .map(|laid| layout::count_box_tree(&laid.root))
             .unwrap_or(0);
-        laid
+        // Keep the freshest layout for input hit testing (M4a). Callers
+        // read `self.last_laid` (disjoint-field borrows keep painting
+        // clone-free).
+        self.last_viewport = Some(viewport);
+        self.last_laid = laid;
     }
 
     /// Lays the current document out and returns fixture-facing facts.
@@ -812,7 +843,8 @@ impl VelquView {
             parsed_author.push(parsed);
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        let Some(laid) = self.run_layout(viewport, &mut cascade) else {
+        self.run_layout(viewport, &mut cascade);
+        let Some(laid) = self.last_laid.as_ref() else {
             return Ok(LayoutFacts {
                 schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
                 viewport_width: viewport.width(),
@@ -867,6 +899,9 @@ impl VelquView {
             Some(slot) => slot.1 = entry.1,
             None => self.scroll_offsets.push(entry),
         }
+        // Cached geometry has stale applied offsets; the next render
+        // re-applies them with zero layout passes.
+        self.last_laid = None;
         Ok(())
     }
 
@@ -881,6 +916,244 @@ impl VelquView {
             duration_last_pass: self.layout_duration_last,
         }
     }
+
+    // -- input gate (M4a, ADR 0010) ---------------------------------------
+
+    /// Validates that the cached layout matches `viewport` (the input
+    /// geometry must correspond to the point space callers use).
+    fn cached_layout(&self, viewport: Viewport) -> Option<&layout::LaidOutDocument> {
+        let laid = self.last_laid.as_ref()?;
+        let cached = self.last_viewport?;
+        if cached.width() == viewport.width()
+            && cached.height() == viewport.height()
+            && cached.scale_factor() == viewport.scale_factor()
+        {
+            Some(laid)
+        } else {
+            None
+        }
+    }
+
+    /// Hit tests the most recent layout at `(x, y)` — **viewport** device
+    /// pixels, same space as frame pixels — returning the topmost element
+    /// under the point, or `None` when nothing is there or no layout is
+    /// cached for this viewport (render first).
+    ///
+    /// Honors paint order (later siblings on top), clip scopes, and
+    /// per-container scroll offsets; the point never triggers layout.
+    pub fn hit_test(&self, viewport: Viewport, x: f32, y: f32) -> Option<HitTarget> {
+        let laid = self.cached_layout(viewport)?;
+        let node = input::hit_at(&laid.root, laid.root_offset, x, y)?;
+        Some(HitTarget {
+            element_id: node.element_id.clone(),
+            tag: node.tag.clone(),
+            scroll_container: node.style.overflow_y.is_scroll_container(),
+        })
+    }
+
+    /// Moves the pointer to `(x, y)` (viewport device px): updates hover
+    /// and emits [`Event::PointerLeave`]/[`Event::PointerEnter`] when the
+    /// hovered element id changed.
+    pub fn pointer_move(&mut self, viewport: Viewport, x: f32, y: f32) {
+        let hit = self.hit_test(viewport, x, y);
+        let new_hover = hit.and_then(|target| target.element_id);
+        if new_hover == self.hover {
+            return;
+        }
+        if let Some(old) = self.hover.take() {
+            self.events.push(Event::PointerLeave { element: Some(old) });
+        }
+        if let Some(new) = new_hover.clone() {
+            self.events.push(Event::PointerEnter { element: Some(new) });
+        }
+        self.hover = new_hover;
+    }
+
+    /// Presses at `(x, y)` (viewport device px). Remembers the press
+    /// target for click tracking; a later [`VelquView::pointer_release`]
+    /// over the same element emits [`Event::Click`].
+    pub fn pointer_press(&mut self, viewport: Viewport, x: f32, y: f32) {
+        let hit = self.hit_test(viewport, x, y);
+        self.pressed = Some(hit.and_then(|target| target.element_id));
+    }
+
+    /// Releases at `(x, y)` (viewport device px). If the press and release
+    /// hit the same element, emits [`Event::Click`]; elements with an `id`
+    /// also take focus on click.
+    pub fn pointer_release(&mut self, viewport: Viewport, x: f32, y: f32) {
+        let Some(pressed) = self.pressed.take() else {
+            return;
+        };
+        let hit = self.hit_test(viewport, x, y);
+        let released = hit.and_then(|target| target.element_id);
+        if pressed.is_some() && pressed == released {
+            self.events.push(Event::Click {
+                element: released.clone(),
+            });
+            if let Some(id) = released {
+                self.set_focus_impl(Some(id));
+            }
+        }
+    }
+
+    /// Scrolls the wheel at `(x, y)` (viewport device px): the gesture
+    /// scrolls the nearest scrollable ancestor of the element under the
+    /// pointer, or the document-level scroller when none is found.
+    ///
+    /// `dx`/`dy` are the wheel delta in **device px**, browser-signed:
+    /// positive dy = view moves down (a standard wheel-down scrolls
+    /// forward), positive dx = view moves right. Platform shells convert
+    /// their native deltas (winit's are opposite-signed; line deltas
+    /// scale by a line height). Offsets are clamped centrally like
+    /// [`VelquView::set_scroll_offset`]; a change emits
+    /// [`Event::Scrolled`] and is baked into the cached layout, so
+    /// consecutive events accumulate between frames and the next render
+    /// paints the new offset with **zero** additional layout passes.
+    pub fn wheel(&mut self, viewport: Viewport, x: f32, y: f32, dx: f32, dy: f32) {
+        let Some(laid) = self.cached_layout(viewport) else {
+            return;
+        };
+        let ctx = input::WheelContext {
+            root: &laid.root,
+            document_offset: laid.root_offset,
+            document_extent: laid.document_scroll,
+            viewport,
+        };
+        let Some((target, new_x, new_y)) = input::wheel_target(&ctx, x, y, dx, dy) else {
+            return;
+        };
+        let changed = match self.scroll_offset_of(target.as_deref()) {
+            Some((current_x, current_y)) => {
+                (current_x - new_x).abs() > f32::EPSILON || (current_y - new_y).abs() > f32::EPSILON
+            }
+            None => (new_x.abs() + new_y.abs()) > f32::EPSILON,
+        };
+        if !changed {
+            return;
+        }
+        let key = target.clone().unwrap_or_default();
+        match self
+            .scroll_offsets
+            .iter_mut()
+            .find(|(existing, _)| *existing == key)
+        {
+            Some(slot) => slot.1 = (new_x, new_y),
+            None => self.scroll_offsets.push((key, (new_x, new_y))),
+        }
+        // Bake the clamped offset into the cached tree so consecutive
+        // wheel events (a real pointer delivers many between frames)
+        // accumulate and hit tests stay coherent — no invalidation, no
+        // relayout; the next render reproduces the same values from the
+        // stored offsets.
+        if let Some(laid) = self.last_laid.as_mut() {
+            match &target {
+                Some(id) => {
+                    bake_scroll(&mut laid.root, id, (new_x, new_y));
+                }
+                None => laid.root_offset = (new_x, new_y),
+            }
+        }
+        self.events.push(Event::Scrolled {
+            target,
+            x: new_x,
+            y: new_y,
+        });
+    }
+
+    /// The stored (raw) offset for a scroll key; `None` when never set.
+    fn scroll_offset_of(&self, key: Option<&str>) -> Option<(f32, f32)> {
+        let key = key.unwrap_or("");
+        self.scroll_offsets
+            .iter()
+            .find(|(existing, _)| existing == key)
+            .map(|(_, offset)| *offset)
+    }
+
+    /// Moves focus to the next element with an `id` in document order,
+    /// wrapping around (Tab semantics). Emits
+    /// [`Event::FocusChanged`] when focus moved.
+    pub fn focus_next(&mut self) {
+        let mut ids: Vec<String> = Vec::new();
+        self.dom.walk(|id, node| {
+            if let dom::NodeData::Element { attrs, .. } = &node.data {
+                if let Some(value) = attrs
+                    .iter()
+                    .find(|a| a.name == "id")
+                    .map(|a| a.value.clone())
+                {
+                    if !ids.contains(&value) {
+                        ids.push(value);
+                    }
+                }
+            }
+            let _ = id;
+        });
+        let next: Option<String> = match &self.focus {
+            Some(current) => match ids.iter().position(|id| id == current) {
+                Some(index) => ids
+                    .get((index + 1) % ids.len().max(1))
+                    .cloned()
+                    .or_else(|| Some(current.clone())),
+                None => ids.first().cloned(),
+            },
+            None => ids.first().cloned(),
+        };
+        self.set_focus_impl(next);
+    }
+
+    /// Sets focus directly (`None` clears it) and emits
+    /// [`Event::FocusChanged`] when it moved.
+    pub fn set_focus(&mut self, element: Option<&str>) {
+        self.set_focus_impl(element.map(str::to_owned));
+    }
+
+    fn set_focus_impl(&mut self, to: Option<String>) {
+        if to == self.focus {
+            return;
+        }
+        let from = self.focus.take();
+        self.focus = to.clone();
+        self.events.push(Event::FocusChanged { from, to });
+    }
+
+    /// Reports the pointer leaving the window: clears hover and emits
+    /// [`Event::PointerLeave`] when an element was hovered.
+    pub fn pointer_exit(&mut self) {
+        if let Some(old) = self.hover.take() {
+            self.events.push(Event::PointerLeave { element: Some(old) });
+        }
+    }
+
+    /// The currently focused element id, if any.
+    pub fn focused(&self) -> Option<&str> {
+        self.focus.as_deref()
+    }
+
+    /// The element id currently under the pointer (hover), if any.
+    pub fn hovered(&self) -> Option<&str> {
+        self.hover.as_deref()
+    }
+
+    /// Drains the interaction events accumulated since the last call, in
+    /// the order they occurred.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+}
+
+/// Bakes a clamped scroll offset into the cached box tree so input stays
+/// coherent between renders (ADR 0010): the container's applied scroll
+/// updates in place, mirroring what the next render's
+/// `apply_scroll_offsets` will compute from the stored request. Returns
+/// once the id is found.
+fn bake_scroll(node: &mut layout::BoxNode, id: &str, offset: (f32, f32)) -> bool {
+    if node.element_id.as_deref() == Some(id) {
+        node.applied_scroll = offset;
+        return true;
+    }
+    node.children
+        .iter_mut()
+        .any(|child| bake_scroll(child, id, offset))
 }
 
 /// The author-declared page background: `html`'s, then `body`'s, then white
@@ -1317,6 +1590,251 @@ mod tests {
             view.image_diagnostics(),
             ["image \"pic.png\": image data is corrupt or truncated"]
         );
+    }
+
+    // -- M4a input gate (ADR 0010) ----------------------------------------
+
+    /// A two-pane document: pane A (id "a", scrollable, with a wide child
+    /// and a late sibling that paints on top of its left edge), then pane B
+    /// (id "b") stacked below.
+    fn input_view() -> VelquView {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=a style=\"overflow: auto; width: 200px; height: 100px\">\
+             <div style=\"width: 400px; height: 60px; background-color: #ef4444\"></div>\
+             <div style=\"width: 50px; height: 40px; margin: 0; background-color: #22c55e\"></div>\
+             </div>\
+             <div id=b style=\"width: 200px; height: 100px; background-color: #3b82f6\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        view
+    }
+
+    #[test]
+    fn hit_test_reports_topmost_and_clip_scoped_elements() {
+        let mut view = input_view();
+        let vp = Viewport::try_new(300, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Inside pane A over its wide red child: the child paints above
+        // pane A's own background, so the topmost box is the child
+        // itself (no id) — not the scroll container behind it.
+        let over_red = view.hit_test(vp, 100.0, 30.0).expect("hit");
+        assert_eq!(over_red.tag, "div");
+        assert!(!over_red.scroll_container);
+
+        // Over the green sibling (later in pane A's paint order).
+        let over_green = view.hit_test(vp, 25.0, 80.0).expect("hit");
+        assert_eq!(over_green.tag, "div");
+
+        // Clipped away: (250, 30) is inside the red child's own geometry
+        // (content x=250 < 400) but outside pane A's 200px clip — the
+        // walk must not descend into the clipped subtree.
+        let clipped_out = view.hit_test(vp, 250.0, 30.0).expect("over the canvas");
+        assert!(
+            clipped_out.element_id.is_none(),
+            "clipped-away content must not be hit"
+        );
+
+        // Pane B: plain background hit.
+        let over_b = view.hit_test(vp, 50.0, 150.0).expect("hit inside b");
+        assert_eq!(over_b.element_id.as_deref(), Some("b"));
+        assert!(!over_b.scroll_container);
+
+        // Outside every content box (past the 200px document): nothing
+        // identifiable is under the pointer.
+        let past = view.hit_test(vp, 290.0, 290.0);
+        assert!(past.is_none_or(|t| t.element_id.is_none()));
+    }
+
+    #[test]
+    fn hit_test_honors_scrolled_offsets() {
+        let mut view = input_view();
+        // Scroll pane a right by 150: the green sibling (at content x=0)
+        // moves under viewport x=-150..-100 — off-clip; the point that was
+        // over green now shows the red child.
+        view.set_scroll_offset(Some("a"), 150.0, 0.0).unwrap();
+        let vp = Viewport::try_new(300, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Content x=150+60=210 → viewport x=60: red child area.
+        let target = view.hit_test(vp, 60.0, 30.0).expect("hit");
+        assert!(!target.scroll_container);
+        // Green moved left out of the clip: (210, 80) viewport now lands
+        // on content x=360 — still inside the red child (400 wide).
+        let still_red = view.hit_test(vp, 210.0, 30.0).expect("hit");
+        assert!(!still_red.scroll_container);
+    }
+
+    #[test]
+    fn pointer_events_track_hover_and_click() {
+        let mut view = input_view();
+        let vp = Viewport::try_new(300, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        view.pointer_move(vp, 50.0, 150.0); // over pane b
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![Event::PointerEnter {
+                element: Some("b".into())
+            }]
+        );
+
+        view.pointer_move(vp, 60.0, 150.0); // still over b, same id: no events
+        assert!(view.take_events().is_empty());
+
+        view.pointer_move(vp, 500.0, 500.0); // off-document: leave
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![Event::PointerLeave {
+                element: Some("b".into())
+            }]
+        );
+
+        // Press on b, release on b: click + focus (b has an id).
+        view.pointer_press(vp, 50.0, 150.0);
+        view.pointer_release(vp, 50.0, 150.0);
+        let events = view.take_events();
+        assert!(events.contains(&Event::Click {
+            element: Some("b".into())
+        }));
+        assert!(events.contains(&Event::FocusChanged {
+            from: None,
+            to: Some("b".into())
+        }));
+        assert_eq!(view.focused(), Some("b"));
+
+        // Press on b, release elsewhere: no click (and no focus change).
+        view.pointer_press(vp, 50.0, 150.0);
+        view.pointer_release(vp, 500.0, 500.0);
+        let events = view.take_events();
+        assert!(!events.iter().any(|e| matches!(e, Event::Click { .. })));
+        assert_eq!(view.focused(), Some("b"));
+    }
+
+    #[test]
+    fn wheel_scrolls_nearest_container_with_zero_layout() {
+        let mut view = input_view();
+        // Viewport shorter than the 200px document so the document-level
+        // scroller has range (extent 200 − scrollport 150 = 50 ≥ one 40px
+        // wheel step).
+        let vp = Viewport::try_new(300, 150, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes_before = view.layout_stats().passes;
+
+        // Wheel over pane b — no scrollable ancestor → document scroller.
+        // One wheel notch = 40 device px (the shell's line-height).
+        view.wheel(vp, 50.0, 150.0, 0.0, 40.0);
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![Event::Scrolled {
+                target: None,
+                x: 0.0,
+                y: 40.0
+            }]
+        );
+        // No layout pass ran for the wheel itself.
+        assert_eq!(view.layout_stats().passes, passes_before);
+        // The next render paints the new offset — still zero new passes
+        // beyond the frame's own single pass.
+        view.render(vp).unwrap();
+        assert_eq!(view.layout_stats().passes, passes_before + 1);
+
+        // Wheel over the scrollable pane a: the pane scrolls, not the page.
+        view.render(vp).unwrap(); // paint the document scroll (one pass)
+        view.pointer_move(vp, 100.0, 50.0); // hover tracking for realism
+        let _ = view.take_events();
+        view.wheel(vp, 100.0, 50.0, 40.0, 0.0);
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![Event::Scrolled {
+                target: Some("a".into()),
+                x: 40.0,
+                y: 0.0
+            }]
+        );
+
+        // Over-scroll clamps to the extent (pane a content 400 wide,
+        // scrollport 200 → max 200; 40 per tick, so 6+ ticks clamp).
+        for _ in 0..10 {
+            view.render(vp).unwrap();
+            view.wheel(vp, 100.0, 50.0, 40.0, 0.0);
+            let _ = view.take_events();
+        }
+        view.render(vp).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        // Facts stay the unscrolled truth regardless of all that scrolling.
+        assert_eq!(facts.viewport_width, 300);
+    }
+
+    #[test]
+    fn focus_cycles_and_reports() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div id=first></div><div><div id=second></div></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        assert_eq!(view.focused(), None);
+        view.focus_next();
+        assert_eq!(view.focused(), Some("first"));
+        view.focus_next();
+        assert_eq!(view.focused(), Some("second"));
+        view.focus_next();
+        assert_eq!(view.focused(), Some("first"), "wraps around");
+
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![
+                Event::FocusChanged {
+                    from: None,
+                    to: Some("first".into())
+                },
+                Event::FocusChanged {
+                    from: Some("first".into()),
+                    to: Some("second".into())
+                },
+                Event::FocusChanged {
+                    from: Some("second".into()),
+                    to: Some("first".into())
+                },
+            ]
+        );
+
+        // Direct set with no change emits nothing.
+        view.set_focus(Some("first"));
+        assert!(view.take_events().is_empty());
+        view.set_focus(None);
+        assert_eq!(view.take_events().len(), 1);
+    }
+
+    #[test]
+    fn input_state_resets_with_the_document() {
+        let mut view = input_view();
+        let vp = Viewport::try_new(300, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pointer_move(vp, 50.0, 150.0);
+        view.pointer_press(vp, 50.0, 150.0);
+        let _ = view.take_events();
+
+        view.load_html("<!doctype html><html><body>fresh</body></html>")
+            .unwrap();
+        assert_eq!(view.hovered(), None);
+        assert_eq!(view.focused(), None);
+        // Stale cache is gone: hit testing without a render finds nothing.
+        assert!(view.hit_test(vp, 50.0, 150.0).is_none());
+        assert!(view.take_events().is_empty());
     }
 
     // -- M3 Tailwind utility pipeline (ADR 0009) --------------------------
