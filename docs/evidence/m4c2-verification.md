@@ -88,5 +88,7 @@ All run and green on this slice:
 Real OS-clipboard round-trips during *editing* need interactive input;
 the deterministic battery pins the renderer through recording and
 failing providers and the shell through the pure routing tests.
-Landing: implementation + docs committed to `main` and pushed; GitHub
-CI green on the pushed commits (see the repo's Actions history).
+Landing: `25c2233` (implementation) + `a48a40e` (docs) pushed to
+`main`; GitHub CI green — run
+[35214328689](https://github.com/ther12k/velqu-view/actions/runs/35214328689)
+(fmt/clippy/test/build + MSRV 1.87).

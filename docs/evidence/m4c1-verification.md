@@ -116,3 +116,8 @@ All run and green on this slice:
   --exit-after-ms 1500` — window opened, 2 frames presented, clean
   close. Key routing itself is covered by the pure `key_command_for`
   unit tests; synthesizing real keypresses needs the M6 tooling.
+
+Landing: `25c2233` (implementation) + `a48a40e` (docs) pushed to
+`main`; GitHub CI green — run
+[35214328689](https://github.com/ther12k/velqu-view/actions/runs/35214328689)
+(fmt/clippy/test/build + MSRV 1.87).
