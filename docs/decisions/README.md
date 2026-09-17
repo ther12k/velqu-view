@@ -13,6 +13,7 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0007](0007-m2b-taffy-backend.md) | M2b: Taffy whole-tree backend; Velqu owns rounding/facts/profile | accepted |
 | [0008](0008-m2c-images-grid-scroll.md) | M2c: bounded image decoding, replaced-element sizing, frozen grid profile, paint-side scrolling | accepted |
 | [0009](0009-m3-tailwind-pipeline.md) | M3: v0 Tailwind-compatible pipeline (utilities → CSS → cascade) in velqu-tailwind | accepted |
+| [0010](0010-m4a-input-gate.md) | M4a: input gate — hit testing as inverse of paint, runtime interaction state, browser-signed wheel with zero relayout | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how
