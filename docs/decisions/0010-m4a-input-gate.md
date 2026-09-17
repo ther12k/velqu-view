@@ -97,6 +97,18 @@ viewport from the live window size. Input before the window exists or
 while minimized is dropped. Cursor shaping (pointer over links) waits
 for the CSS `cursor` property — not in the profile, so not faked.
 
+## Amendment (M4b)
+
+Section 1's permanent contract is the **visually topmost painted
+hit-testable box wins** — paint order, not DOM sibling order. The
+current implementation realizes that as later-sibling-wins because
+painting has no transforms, positioning, or z-ordering yet; if a
+paint-order index (or display-list-derived hit regions) ever becomes
+necessary, the public input semantics do not change. M4b also froze
+interaction rules to paint-only declarations and gave scroll state its
+own invariants (ADR 0011): keyed by DOM node, transplanted across
+relayouts, re-clamped centrally.
+
 ## Consequences
 
 * A document is now interactive at the granularity of ids: hover/focus/

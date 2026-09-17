@@ -38,6 +38,15 @@ Exit: dashboard usable without one-off per-component patches.
 
 Pointer, keyboard, focus, editing, selection, clipboard, IME, scrolling.
 
+Executed in slices: **M4a** input gate (hit testing, pointer/focus
+events, wheel scrolling with zero relayout — ADR 0010, done); **M4b**
+interaction styling (`:hover`/`:focus`/`:active` frozen to paint-only,
+presentation-only repaint, cursor, focus origin — ADR 0011, done);
+**M4c** editing, split internally: M4c1 editable controls (value, caret,
+keyboard editing, selection), M4c2 clipboard behind a shell interface,
+M4c3 IME treated as a platform-integration milestone with dedicated
+platform verification.
+
 Exit: forms/input fixture passes.
 
 ## M5 - Velqu Reactive

@@ -34,7 +34,10 @@ native lightweight application UI
 | M2c | bounded image decoding, replaced elements, grid profile, paint-side scrolling ([ADR 0008](docs/decisions/0008-m2c-images-grid-scroll.md)) | **done** |
 | M3 | Tailwind-compatible utility pipeline, diagnostics, dashboard demo ([ADR 0009](docs/decisions/0009-m3-tailwind-pipeline.md)) — **phase 1 complete: renders HTML with Tailwind** | **done** |
 | M4a | input gate slice: hit testing, hover/focus/click events, wheel scrolling with zero relayout ([ADR 0010](docs/decisions/0010-m4a-input-gate.md)) | **done** |
-| M4 | rest of the input milestone: hover/focus styling, text editing, selection, IME | next |
+| M4b | interaction styling: :hover/:focus/:active frozen to paint, presentation-only repaint, cursor, focus origin ([ADR 0011](docs/decisions/0011-m4b-interaction-styling.md)) | **done** |
+| M4c1 | editable controls: input/textarea value, caret, keyboard editing, selection | next |
+| M4c2 | clipboard: copy/cut/paste behind a shell interface | |
+| M4c3 | IME: preedit/commit as a platform-integration milestone | |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) | |
 | M6 | VelquView Lab inspector + reload | |
 | M7 | reference Tailwind dashboard | |
