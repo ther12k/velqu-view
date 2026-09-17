@@ -436,12 +436,15 @@ impl<'a> Cascade<'a> {
 
     /// Computes the style for one element, given its parent's computed
     /// style (for inheritance). `style_attr` is the element's inline
-    /// `style=""` value if any.
+    /// `style=""` value if any. `interaction` carries the runtime hover/
+    /// focus/active state for selector matching — `None` matches nothing
+    /// stateful (structural-truth mode).
     pub(crate) fn compute(
         &mut self,
         dom: &Dom,
         node: NodeId,
         parent: Option<&ComputedStyle>,
+        interaction: Option<&InteractionState>,
     ) -> ComputedStyle {
         // 1. Start from UA defaults specialized by tag, then inherit.
         let mut style = ua_default(dom.tag_name(node).unwrap_or("span"));
@@ -458,7 +461,7 @@ impl<'a> Cascade<'a> {
         let mut ranked: Vec<Ranked<'_>> = Vec::new();
         for rule in self.ua_rules {
             for selector in &rule.selectors {
-                if selector_matches(dom, node, selector) {
+                if selector_matches(dom, node, selector, interaction) {
                     for declaration in &rule.declarations {
                         ranked.push(Ranked {
                             declaration,
@@ -473,8 +476,31 @@ impl<'a> Cascade<'a> {
         for sheet in self.author_sheets {
             for rule in &sheet.rules {
                 for selector in &rule.selectors {
-                    if selector_matches(dom, node, selector) {
+                    if selector_matches(dom, node, selector, interaction) {
+                        // Interaction selectors are paint-only in M4b
+                        // (ADR 0011): layout-affecting declarations are
+                        // deferred with a diagnostic, so pointer motion
+                        // can never invalidate layout. Pseudo-classes
+                        // contribute class-level specificity normally.
+                        let stateful = selector.segments.iter().any(|s| {
+                            s.compound
+                                .simples
+                                .iter()
+                                .any(|simple| simple.is_interaction())
+                        });
                         for declaration in &rule.declarations {
+                            if stateful && !is_presentation_property(&declaration.property) {
+                                self.diagnostics.push(StyleDiagnostic {
+                                    source: dom.tag_name(node).unwrap_or("?").to_owned(),
+                                    line: declaration.line,
+                                    message: format!(
+                                        "interaction selector may only change paint; \
+                                         property \"{}\" deferred (M4b profile)",
+                                        declaration.property
+                                    ),
+                                });
+                                continue;
+                            }
                             ranked.push(Ranked {
                                 declaration,
                                 specificity: selector.specificity,
@@ -651,13 +677,44 @@ fn parse_inline_declarations(text: &str) -> Vec<Declaration> {
 
 // -- selector matching -------------------------------------------------------
 
+/// The runtime interaction state selectors can match against (M4b, ADR
+/// 0011). Paths run from the stateful element up through its ancestors:
+/// CSS `:hover`/`:active` apply through the ancestor chain, so a rule
+/// like `.card:hover` activates when the pointer is over any descendant
+/// of `.card`. `:focus` matches only the focused element itself
+/// (`:focus-within` is a later slice).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct InteractionState {
+    /// Nodes under the pointer, hit target first, root last.
+    pub hover_path: Vec<NodeId>,
+    /// Nodes in the pressed chain, pressed target first, root last.
+    pub active_path: Vec<NodeId>,
+    /// The focused element (exact match only).
+    pub focus: Option<NodeId>,
+}
+
+impl InteractionState {
+    /// `None`-shaped view of "no interaction at all" for truth-seeking
+    /// paths (layout facts) that must never see state.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.hover_path.is_empty() && self.active_path.is_empty() && self.focus.is_none()
+    }
+}
+
 /// Right-to-left matching: the last compound must match `node`, then walk
-/// combinators through ancestors.
-pub(crate) fn selector_matches(dom: &Dom, node: NodeId, selector: &Selector) -> bool {
+/// combinators through ancestors. Interaction pseudo-classes consult
+/// `interaction` (`None` = match nothing stateful — the structural-truth
+/// mode used by layout facts).
+pub(crate) fn selector_matches(
+    dom: &Dom,
+    node: NodeId,
+    selector: &Selector,
+    interaction: Option<&InteractionState>,
+) -> bool {
     let Some(last) = selector.segments.last() else {
         return false;
     };
-    if !compound_matches(dom, node, &last.compound) {
+    if !compound_matches(dom, node, &last.compound, interaction) {
         return false;
     }
     let mut cursor = node;
@@ -668,7 +725,7 @@ pub(crate) fn selector_matches(dom: &Dom, node: NodeId, selector: &Selector) -> 
                     return false;
                 };
                 cursor = parent;
-                if !compound_matches(dom, cursor, &segment.compound) {
+                if !compound_matches(dom, cursor, &segment.compound, interaction) {
                     return false;
                 }
             }
@@ -677,7 +734,7 @@ pub(crate) fn selector_matches(dom: &Dom, node: NodeId, selector: &Selector) -> 
                 let mut matched = false;
                 let mut ancestor = dom.node(cursor).parent;
                 while let Some(candidate) = ancestor {
-                    if compound_matches(dom, candidate, &segment.compound) {
+                    if compound_matches(dom, candidate, &segment.compound, interaction) {
                         cursor = candidate;
                         matched = true;
                         break;
@@ -693,7 +750,12 @@ pub(crate) fn selector_matches(dom: &Dom, node: NodeId, selector: &Selector) -> 
     true
 }
 
-fn compound_matches(dom: &Dom, node: NodeId, compound: &crate::css::Compound) -> bool {
+fn compound_matches(
+    dom: &Dom,
+    node: NodeId,
+    compound: &crate::css::Compound,
+    interaction: Option<&InteractionState>,
+) -> bool {
     let NodeData::Element { name, attrs, .. } = &dom.node(node).data else {
         return false;
     };
@@ -717,6 +779,20 @@ fn compound_matches(dom: &Dom, node: NodeId, compound: &crate::css::Compound) ->
                     return false;
                 }
             }
+            Simple::PseudoClass(pseudo) => {
+                let Some(state) = interaction else {
+                    return false;
+                };
+                let matched = match pseudo.as_str() {
+                    "hover" => state.hover_path.contains(&node),
+                    "active" => state.active_path.contains(&node),
+                    "focus" => state.focus == Some(node),
+                    _ => false,
+                };
+                if !matched {
+                    return false;
+                }
+            }
             Simple::Id(id) => {
                 let Some(id_attr) = attrs.iter().find(|a| a.name == "id") else {
                     return false;
@@ -731,6 +807,14 @@ fn compound_matches(dom: &Dom, node: NodeId, compound: &crate::css::Compound) ->
 }
 
 // -- declaration application -------------------------------------------------
+
+/// The properties an interaction selector (`:hover`/`:focus`/`:active`)
+/// may change in M4b: paint/presentation only (ADR 0011). The frozen list
+/// lives in velqu-tailwind next to the profile concepts, so the cascade
+/// and the checker can never drift.
+pub(crate) fn is_presentation_property(property: &str) -> bool {
+    velqu_tailwind::is_interaction_paint_property(property)
+}
 
 /// Applies one declaration to `style`; unrecognized properties/values
 /// produce a diagnostic.
@@ -1488,6 +1572,16 @@ mod tests {
         /// Computes the style for the element with `fixture_id`, walking
         /// its ancestor chain so inheritance applies.
         fn compute_for(&mut self, fixture_id: &str) -> (ComputedStyle, Vec<StyleDiagnostic>) {
+            self.compute_for_with(fixture_id, None)
+        }
+
+        /// [`Fixture::compute_for`] with explicit interaction state for
+        /// stateful-selector tests (M4b).
+        fn compute_for_with(
+            &mut self,
+            fixture_id: &str,
+            interaction: Option<&InteractionState>,
+        ) -> (ComputedStyle, Vec<StyleDiagnostic>) {
             let mut target = None;
             self.dom.walk(|id, node| {
                 if let NodeData::Element {
@@ -1511,7 +1605,7 @@ mod tests {
             let mut style = None;
             for id in chain {
                 let parent = style.clone();
-                style = Some(cascade.compute(&self.dom, id, parent.as_ref()));
+                style = Some(cascade.compute(&self.dom, id, parent.as_ref(), interaction));
             }
             (style.unwrap(), std::mem::take(&mut cascade.diagnostics))
         }
@@ -1539,6 +1633,164 @@ mod tests {
         );
         let (style, _) = fx.compute_for("p");
         assert_eq!(style.color, Color::from_hex("#000002").unwrap());
+    }
+
+    // -- M4b interaction selectors (ADR 0011) -----------------------------
+
+    impl Fixture {
+        /// The DOM node carrying `fixture_id`.
+        fn node_of(&self, fixture_id: &str) -> NodeId {
+            let mut target = None;
+            self.dom.walk(|id, node| {
+                if let NodeData::Element {
+                    fixture_id: key, ..
+                } = &node.data
+                {
+                    if key.as_deref() == Some(fixture_id) {
+                        target = Some(id);
+                    }
+                }
+            });
+            target.expect("fixture id present")
+        }
+
+        /// State matching `fixture_id` being hovered: the hover path runs
+        /// target → root, so ancestors match `:hover` too.
+        fn hover_state(&self, fixture_id: &str) -> InteractionState {
+            let mut path = Vec::new();
+            let mut cursor = Some(self.node_of(fixture_id));
+            while let Some(id) = cursor {
+                path.push(id);
+                cursor = self.dom.node(id).parent;
+            }
+            InteractionState {
+                hover_path: path,
+                active_path: Vec::new(),
+                focus: None,
+            }
+        }
+
+        /// State matching `fixture_id` being focused (exact, no chain).
+        fn focus_state(&self, fixture_id: &str) -> InteractionState {
+            InteractionState {
+                hover_path: Vec::new(),
+                active_path: Vec::new(),
+                focus: Some(self.node_of(fixture_id)),
+            }
+        }
+    }
+
+    #[test]
+    fn hover_selects_only_under_state() {
+        let mut fx = build(
+            "<div class=card><p data-vv-test=p>x</p></div>",
+            &[".card { color: #000001 }", ".card:hover { color: #000002 }"],
+        );
+        // No hover: base color.
+        let (plain, _) = fx.compute_for("p");
+        assert_eq!(plain.color, Color::from_hex("#000001").unwrap());
+        // Hovering the paragraph itself: `.card:hover` activates through
+        // the ancestor chain, and the color inherits to `p`.
+        let state = fx.hover_state("p");
+        let (hovered, _) = fx.compute_for_with("p", Some(&state));
+        assert_eq!(hovered.color, Color::from_hex("#000002").unwrap());
+    }
+
+    #[test]
+    fn parent_hover_activates_from_a_hovered_child() {
+        let mut fx = build(
+            "<div class=card data-vv-test=card><span data-vv-test=span>label</span></div>",
+            &[".card:hover { background-color: #112233 }"],
+        );
+        // Pointer over the span: the card is in the span's hover chain.
+        let state = fx.hover_state("span");
+        let (card, _) = fx.compute_for_with("card", Some(&state));
+        assert_eq!(
+            card.background_color,
+            Color::from_hex("#112233").unwrap(),
+            "an ancestor matches :hover when a descendant is hovered"
+        );
+    }
+
+    #[test]
+    fn hover_specificity_is_class_level() {
+        let mut fx = build(
+            "<p data-vv-test=p class=card>x</p>",
+            &[
+                // The :hover rule comes FIRST but has higher specificity.
+                ".card:hover { background-color: #112233 }",
+                ".card { background-color: #445566 }",
+            ],
+        );
+        let state = fx.hover_state("p");
+        let (hovered, _) = fx.compute_for_with("p", Some(&state));
+        assert_eq!(
+            hovered.background_color,
+            Color::from_hex("#112233").unwrap()
+        );
+        let (plain, _) = fx.compute_for("p");
+        assert_eq!(plain.background_color, Color::from_hex("#445566").unwrap());
+    }
+
+    #[test]
+    fn focus_matches_the_focused_element_exactly() {
+        let mut fx = build(
+            "<div class=card data-vv-test=card><button data-vv-test=btn>x</button></div>",
+            &[
+                ".card:focus { background-color: #112233 }",
+                ":focus { color: #000044 }",
+            ],
+        );
+        let state = fx.focus_state("btn");
+        // :focus does NOT chain: the card is not focused when its child is.
+        let (card, _) = fx.compute_for_with("card", Some(&state));
+        assert_eq!(card.background_color, Color::TRANSPARENT);
+        let (btn, _) = fx.compute_for_with("btn", Some(&state));
+        assert_eq!(btn.color, Color::from_hex("#000044").unwrap());
+    }
+
+    #[test]
+    fn interaction_selectors_may_only_change_paint() {
+        let mut fx = build(
+            "<div class=card data-vv-test=card>x</div>",
+            &[
+                ".card { width: 100px; background-color: #445566 }",
+                // Layout-affecting hover: deferred with a diagnostic.
+                ".card:hover { width: 500px; background-color: #112233 }",
+            ],
+        );
+        let state = fx.hover_state("card");
+        let (card, diagnostics) = fx.compute_for_with("card", Some(&state));
+        // Paint applies; layout defers.
+        assert_eq!(card.background_color, Color::from_hex("#112233").unwrap());
+        assert_eq!(card.width, Some(crate::style::Length::Px(100.0)));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("width"));
+        assert!(diagnostics[0].message.contains("deferred"));
+        // With no state the rule never matches and never diagnoses.
+        let (_, none) = fx.compute_for("card");
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn unsupported_pseudo_classes_are_diagnosed_and_skipped() {
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &["p:first-child { color: #000001 }", "p { color: #000002 }"],
+        );
+        let (style, _) = fx.compute_for("p");
+        assert_eq!(style.color, Color::from_hex("#000002").unwrap());
+        let sheet = css::parse(
+            &StylesheetSource::new("t.css", "p:first-child { color: #000001 }"),
+            0,
+        );
+        assert!(sheet.rules.is_empty(), "the rule is skipped entirely");
+        assert_eq!(sheet.diagnostics.len(), 1);
+        assert!(
+            sheet.diagnostics[0].to_string().contains("first-child"),
+            "{:?}",
+            sheet.diagnostics
+        );
     }
 
     #[test]
@@ -1612,7 +1864,7 @@ mod tests {
                 body = Some(id);
             }
         });
-        let style = cascade.compute(&dom, body.unwrap(), None);
+        let style = cascade.compute(&dom, body.unwrap(), None, None);
         assert_eq!(style.margin.top, Length::Px(8.0));
         assert_eq!(style.display, Display::Block);
     }

@@ -390,6 +390,26 @@ pub fn classify_declaration(property: &str, value: &str) -> Classification {
     }
 }
 
+/// The properties an interaction selector (`:hover`, `:focus`, `:active`)
+/// may change at runtime (M4b, ADR 0011): paint/presentation only, so a
+/// pointer move can never invalidate layout. The renderer's cascade
+/// defers everything else inside stateful rules with a diagnostic; the
+/// checker reports the same verdict.
+pub const INTERACTION_PAINT_PROPERTIES: [&str; 7] = [
+    "background-color",
+    "background",
+    "color",
+    "border-color",
+    "border-style",
+    "border-radius",
+    "cursor",
+];
+
+/// Is this property inside [`INTERACTION_PAINT_PROPERTIES`]?
+pub fn is_interaction_paint_property(property: &str) -> bool {
+    INTERACTION_PAINT_PROPERTIES.contains(&property.trim().to_ascii_lowercase().as_str())
+}
+
 /// Classifies one parsed at-rule by name (with or without `@`).
 ///
 /// ```

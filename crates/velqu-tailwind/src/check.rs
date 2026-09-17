@@ -126,24 +126,36 @@ fn check_rules(parser: &mut Parser<'_>, items: &mut Vec<CheckItem>) {
                 consume_at_rule_body(parser, &name, items);
             }
             Ok(_) => {
-                // Qualified rule: skip the prelude, then check the block.
-                if at_rule_or_rule_block(parser) {
-                    check_declarations_block(parser, items);
-                }
+                // Qualified rule: inspect the prelude for interaction
+                // selectors, then check the block.
+                let stateful = rule_prelude_is_interaction(parser);
+                check_declarations_block(parser, items, stateful);
             }
         }
     }
 }
 
 /// Consumes a qualified-rule prelude up to its `{`. Returns whether a
-/// block was found (a stray `;` or EOF returns false).
-fn at_rule_or_rule_block(parser: &mut Parser<'_>) -> bool {
+/// block was found (a stray `;` or EOF returns false) and whether the
+/// selector carries an interaction pseudo-class (`:hover`, `:focus`,
+/// `:active`) — those rules are paint-only at runtime (M4b).
+fn rule_prelude_is_interaction(parser: &mut Parser<'_>) -> bool {
+    let mut stateful = false;
     loop {
         match parser.next_including_whitespace() {
-            Err(_) => return false,
-            Ok(Token::Semicolon) => return false,
-            Ok(Token::CurlyBracketBlock) => return true,
-            Ok(Token::CloseCurlyBracket) => return false,
+            Err(_) => return stateful,
+            Ok(Token::Semicolon) => return stateful,
+            Ok(Token::CurlyBracketBlock) => return stateful,
+            Ok(Token::CloseCurlyBracket) => return stateful,
+            Ok(Token::Colon) => {
+                if let Ok(Token::Ident(name)) = parser.next_including_whitespace() {
+                    if matches!(name.as_ref(), "hover" | "focus" | "active") {
+                        stateful = true;
+                    }
+                } else {
+                    return stateful;
+                }
+            }
             Ok(_) => {}
         }
     }
@@ -179,7 +191,10 @@ fn consume_at_rule_body(parser: &mut Parser<'_>, name: &str, items: &mut Vec<Che
 }
 
 /// Checks the declarations of one rule block (the `{` was consumed).
-fn check_declarations_block(parser: &mut Parser<'_>, items: &mut Vec<CheckItem>) {
+/// `stateful` marks a rule whose selector carries an interaction
+/// pseudo-class: its declarations must be paint-only (ADR 0011), so
+/// layout-affecting ones are reported unsupported with that guidance.
+fn check_declarations_block(parser: &mut Parser<'_>, items: &mut Vec<CheckItem>, stateful: bool) {
     let _ = parser.parse_nested_block::<_, (), cssparser::BasicParseError>(|inner| {
         loop {
             match inner.next_including_whitespace() {
@@ -202,6 +217,20 @@ fn check_declarations_block(parser: &mut Parser<'_>, items: &mut Vec<CheckItem>)
                     let classification = match &value {
                         Some(text) => classify_declaration(&property, text),
                         None => Classification::tier(crate::Compatibility::Unsupported),
+                    };
+                    let classification = if stateful
+                        && classification.compatibility != crate::Compatibility::Unsupported
+                        && !crate::is_interaction_paint_property(&property)
+                    {
+                        Classification {
+                            compatibility: crate::Compatibility::Unsupported,
+                            replacement: Some(
+                                "interaction selectors (:hover/:focus/:active) may only change \
+                                 paint properties in M4b; this declaration is deferred at runtime",
+                            ),
+                        }
+                    } else {
+                        classification
                     };
                     items.push(CheckItem {
                         line: line as usize,
@@ -285,6 +314,35 @@ mod tests {
             Compatibility::Unsupported
         );
         assert_eq!(items[2].classification.replacement, None);
+    }
+
+    #[test]
+    fn interaction_rules_report_paint_only() {
+        let items = check_css(".card:hover {\n  background-color: #112233;\n  width: 500px;\n}");
+        assert_eq!(items.len(), 2, "{items:?}");
+        // Paint property: unaffected.
+        assert_eq!(
+            items[0].classification.compatibility,
+            Compatibility::Supported
+        );
+        // Layout property under an interaction selector: deferred (M4b).
+        assert_eq!(
+            items[1].classification.compatibility,
+            Compatibility::Unsupported
+        );
+        assert!(
+            items[1]
+                .classification
+                .replacement
+                .unwrap()
+                .contains("paint")
+        );
+        // The same declaration outside a stateful rule stays supported.
+        let plain = check_css(".card {\n  width: 500px;\n}");
+        assert_eq!(
+            plain[0].classification.compatibility,
+            Compatibility::Supported
+        );
     }
 
     #[test]

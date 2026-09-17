@@ -189,14 +189,18 @@ pub(crate) struct RunBox {
 /// Computed styles for every element, from one top-down cascade pass.
 pub(crate) type StyleMap = std::collections::HashMap<NodeId, ComputedStyle>;
 
-/// Runs the cascade over the whole tree once.
+/// Runs the cascade over the whole tree once. `interaction` carries the
+/// runtime hover/focus/active state for selector matching; `None` is the
+/// structural-truth mode (layout facts) where stateful selectors match
+/// nothing (M4b, ADR 0011).
 pub(crate) fn compute_all_styles(
     dom: &Dom,
     root: NodeId,
     cascade: &mut crate::style::Cascade<'_>,
+    interaction: Option<&crate::style::InteractionState>,
 ) -> StyleMap {
     let mut map = StyleMap::new();
-    walk_styles(dom, root, None, cascade, &mut map);
+    walk_styles(dom, root, None, cascade, interaction, &mut map);
     map
 }
 
@@ -205,14 +209,15 @@ fn walk_styles(
     id: NodeId,
     parent: Option<&ComputedStyle>,
     cascade: &mut crate::style::Cascade<'_>,
+    interaction: Option<&crate::style::InteractionState>,
     map: &mut StyleMap,
 ) {
     if !matches!(dom.node(id).data, NodeData::Element { .. }) {
         return;
     }
-    let style = cascade.compute(dom, id, parent);
+    let style = cascade.compute(dom, id, parent, interaction);
     for &child in &dom.node(id).children {
-        walk_styles(dom, child, Some(&style), cascade, map);
+        walk_styles(dom, child, Some(&style), cascade, interaction, map);
     }
     map.insert(id, style);
 }
@@ -432,6 +437,7 @@ pub(crate) fn layout_document(
     fonts: &mut FontStore,
     images: &ImageStore,
     scroll_offsets: &ScrollOffsets,
+    interaction: Option<&crate::style::InteractionState>,
 ) -> Option<LaidOutDocument> {
     // The layout root: <body> if present, else <html>, else the document.
     let mut root_element = None;
@@ -442,7 +448,7 @@ pub(crate) fn layout_document(
     });
     let root_element = root_element.unwrap_or_else(|| dom.document());
 
-    let styles = compute_all_styles(dom, root_element, cascade);
+    let styles = compute_all_styles(dom, root_element, cascade, interaction);
     let mut root = build_boxes(dom, root_element, &styles, images)?;
 
     crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts, scroll_offsets);
@@ -893,6 +899,7 @@ mod tests {
             &mut fonts,
             images,
             scroll_offsets,
+            None,
         )
         .unwrap();
         let mut facts = LayoutFacts {
@@ -1010,6 +1017,7 @@ mod tests {
             &mut fonts,
             &ImageStore::new(),
             &Vec::new(),
+            None,
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1064,6 +1072,7 @@ mod tests {
             &mut fonts,
             &ImageStore::new(),
             &Vec::new(),
+            None,
         )
         .unwrap();
         let list = &laid.display_list;
@@ -1176,6 +1185,7 @@ mod tests {
             &mut fonts,
             &ImageStore::new(),
             &Vec::new(),
+            None,
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1348,6 +1358,7 @@ mod tests {
             &mut fonts,
             &ImageStore::new(),
             &vec![(Some(pane_node), (500.0, -25.0))],
+            None,
         )
         .unwrap();
         let pane = &laid.root.children[0];
@@ -1361,6 +1372,7 @@ mod tests {
             &mut fonts,
             &ImageStore::new(),
             &Vec::new(),
+            None,
         )
         .unwrap();
         assert_eq!(plain.root.children[0].applied_scroll, (0.0, 0.0));

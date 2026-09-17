@@ -746,7 +746,7 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        self.run_layout(viewport, &mut cascade);
+        self.run_layout(viewport, &mut cascade, None);
         if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
@@ -787,7 +787,15 @@ impl VelquView {
 
     /// Shared cascade+layout pass behind [`VelquView::render`] and
     /// [`VelquView::layout_facts`]; records layout instrumentation.
-    fn run_layout(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
+    /// `interaction` feeds stateful-selector matching (M4b): layout facts
+    /// always pass `None` — facts are the structural truth, state only
+    /// ever reaches pixels.
+    fn run_layout(
+        &mut self,
+        viewport: Viewport,
+        cascade: &mut style::Cascade<'_>,
+        interaction: Option<&style::InteractionState>,
+    ) {
         let started = std::time::Instant::now();
         let laid = layout::layout_document(
             &self.dom,
@@ -796,6 +804,7 @@ impl VelquView {
             &mut self.fonts,
             &self.images,
             &self.scroll_offsets,
+            interaction,
         );
         self.layout_passes += 1;
         self.layout_duration_last = started.elapsed();
@@ -843,7 +852,7 @@ impl VelquView {
             parsed_author.push(parsed);
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        self.run_layout(viewport, &mut cascade);
+        self.run_layout(viewport, &mut cascade, None);
         let Some(laid) = self.last_laid.as_ref() else {
             return Ok(LayoutFacts {
                 schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,

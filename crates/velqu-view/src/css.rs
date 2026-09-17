@@ -32,6 +32,20 @@ pub(crate) enum Simple {
     Class(String),
     /// `#main` (case-sensitive).
     Id(String),
+    /// `:hover`, `:focus`, `:active` (M4b interaction selectors, ADR
+    /// 0011). Anything else is a parse diagnostic; the rule is skipped.
+    PseudoClass(String),
+}
+
+/// The interaction selectors M4b matches (the frozen set; everything else
+/// after `:` is diagnosed and the rule skipped).
+pub(crate) const INTERACTION_PSEUDO_CLASSES: [&str; 3] = ["hover", "focus", "active"];
+
+impl Simple {
+    /// Does this simple selector carry interaction state (ADR 0011)?
+    pub(crate) fn is_interaction(&self) -> bool {
+        matches!(self, Simple::PseudoClass(_))
+    }
 }
 
 /// One compound selector: simple selectors with no combinator between them.
@@ -50,7 +64,7 @@ impl Compound {
         for simple in &self.simples {
             match simple {
                 Simple::Id(_) => spec.ids += 1,
-                Simple::Class(_) => spec.classes += 1,
+                Simple::Class(_) | Simple::PseudoClass(_) => spec.classes += 1,
                 Simple::Type(_) => spec.elements += 1,
                 Simple::Universal => {}
             }
@@ -112,6 +126,9 @@ pub(crate) enum CssDiagnostic {
     SkippedAtRule { name: String, line: u32 },
     /// A selector failed to parse; the rule was skipped.
     InvalidSelector { line: u32 },
+    /// A pseudo-class outside the M4b interaction set; the rule was
+    /// skipped (ADR 0011).
+    UnsupportedPseudoClass { line: u32, name: String },
 }
 
 impl fmt::Display for CssDiagnostic {
@@ -125,6 +142,12 @@ impl fmt::Display for CssDiagnostic {
             }
             CssDiagnostic::InvalidSelector { line } => {
                 write!(f, "line {line}: selector could not be parsed; rule skipped")
+            }
+            CssDiagnostic::UnsupportedPseudoClass { line, name } => {
+                write!(
+                    f,
+                    "line {line}: pseudo-class :{name} is outside the M4b interaction profile (hover, focus, active); rule skipped"
+                )
             }
         }
     }
@@ -336,6 +359,20 @@ fn parse_selector_prelude(
                 state.push_simple(Simple::Class(class));
             }
             Token::IDHash(name) => state.push_simple(Simple::Id(name.to_string())),
+            Token::Colon => {
+                let name = match parser.next_including_whitespace() {
+                    Ok(Token::Ident(name)) => name.to_string(),
+                    _ => return Err(CssDiagnostic::InvalidSelector { line }),
+                };
+                if INTERACTION_PSEUDO_CLASSES.contains(&name.as_str()) {
+                    state.push_simple(Simple::PseudoClass(name));
+                } else {
+                    return Err(CssDiagnostic::UnsupportedPseudoClass {
+                        line,
+                        name: name.clone(),
+                    });
+                }
+            }
             Token::Ident(name) => {
                 state.push_simple(Simple::Type(name.to_string().to_ascii_lowercase()));
             }
