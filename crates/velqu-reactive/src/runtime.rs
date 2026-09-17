@@ -231,9 +231,13 @@ impl ReactiveRuntime {
         let clock = Rc::new(Cell::new(0u64));
         let rng = Rc::new(Cell::new(seed_for(generation)));
         let diagnostics = Rc::new(RefCell::new(Vec::new()));
-        // `full` enables the standard ECMAScript intrinsics (eval, Date,
-        // Promise, JSON…). QuickJS intrinsics carry no host I/O; ambient
-        // modules would need the loader feature, which is not enabled.
+        // `full` intrinsics: the host itself evaluates sources through
+        // `Ctx::eval`, which rides the same `eval_internal` hook as
+        // script-side dynamic codegen (QuickJS-NG design — dropping the
+        // Eval intrinsic kills host compilation too; ADR 0015 amendment
+        // records the probe). Dynamic codegen is instead killed at the
+        // handle level in `install_profile`: every script-reachable path
+        // to the compiler is removed or made to throw.
         let ctx =
             Context::full(&runtime).map_err(|error| JsFailure::Exception(error.to_string()))?;
         let this = Self {
@@ -429,6 +433,32 @@ impl ReactiveRuntime {
                 })();"#,
                 )
                 .map_err(|_| self.take_exception(&ctx, "date prelude failed"))?;
+                // Dynamic codegen is refused at the handle level (ADR 0015
+                // amendment): the Eval intrinsic must stay because the
+                // host's own `Ctx::eval` rides the same engine hook, so
+                // every script-reachable compiler handle is removed or
+                // made to throw instead.
+                //   - `eval` / `Function` globals: deleted (direct and
+                //     indirect eval become ReferenceErrors).
+                //   - `Function.prototype.constructor`: replaced with a
+                //     throwing stub, so `(function(){}).constructor(...)`
+                //     and class-constructor chains cannot rebuild Function.
+                //   - dynamic `import(...)`: no module loader exists
+                //     (loader feature off); the engine rejects it.
+                ctx.eval::<(), _>(
+                    r#"(() => {
+                        const refused = () => { throw new TypeError("dynamic code generation is not supported"); };
+                        // Capture before deleting: the identifiers resolve
+                        // through the globals being removed.
+                        const functionPrototype = Function.prototype;
+                        Object.defineProperty(functionPrototype, "constructor", {
+                            value: refused, writable: true, configurable: true,
+                        });
+                        delete globalThis.eval;
+                        delete globalThis.Function;
+                    })();"#,
+                )
+                .map_err(|_| self.take_exception(&ctx, "codegen refusal failed"))?;
                 Ok(())
             })
             .map_err(|failure: JsFailure| failure)?;

@@ -170,6 +170,7 @@ fn no_ambient_host_surface_exists() {
         r#"
         for (const name of ["require", "process", "window", "document",
                             "fetch", "XMLHttpRequest", "localStorage",
+                            "eval", "Function",
                             "__velquEmit", "__velquNow", "__velquClock",
                             "__velquNowInternal"]) {
             if (typeof globalThis[name] !== "undefined") {
@@ -229,4 +230,52 @@ fn output_lines_are_length_capped() {
         "{}",
         line.len()
     );
+}
+
+#[test]
+fn dynamic_code_generation_is_refused_at_every_handle() {
+    // The Eval intrinsic must stay (the host's own evaluation rides the
+    // same engine hook), so every script-reachable compiler handle is
+    // removed or made to throw by the profile prelude instead.
+    let rt = runtime();
+    for source in [
+        // Indirect and direct eval: the global is deleted.
+        "eval('1 + 1')",
+        "const q = 5; eval('q')",
+        // The Function global is deleted...
+        "new Function('return 1')",
+        // ...and every f.constructor path hits the refusing stub.
+        "(function () {}).constructor('return 1')",
+        "class C {} C.constructor('return 1')",
+    ] {
+        let failure = rt.evaluate(source).expect_err("dynamic codegen refused");
+        assert!(
+            matches!(failure, JsFailure::Exception(_)),
+            "{source} produced {failure:?}"
+        );
+    }
+    // Dynamic import() rejects (no module loader exists — the loader
+    // feature is off). A throw inside a promise reaction is absorbed by
+    // promise semantics, so the rejection is captured and asserted in a
+    // second evaluation instead.
+    rt.evaluate(
+        "globalThis.__importOutcome = 'unresolved';
+         import('data:text/javascript,1').then(
+             () => { globalThis.__importOutcome = 'resolved'; },
+             (error) => { globalThis.__importOutcome = 'rejected: ' + error; },
+         );",
+    )
+    .expect("the import call itself is a legal expression");
+    let outcome = rt
+        .ctx
+        .with(|ctx| ctx.eval::<String, _>("globalThis.__importOutcome"))
+        .expect("outcome readable");
+    assert!(
+        outcome.starts_with("rejected") && outcome.contains("could not load module"),
+        "{outcome}"
+    );
+    // Host-submitted source still compiles: the host's evaluation path
+    // is untouched by the refusal.
+    rt.evaluate("var still = 1 + 1")
+        .expect("host evaluation still works");
 }

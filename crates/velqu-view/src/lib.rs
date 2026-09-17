@@ -117,6 +117,9 @@ pub use source::{
     SourceId, StylesheetSource,
 };
 pub use style::CursorStyle;
+pub use velqu_reactive::{
+    Binding, BindingKind, EventBinding, ReactiveDiagnostic, ReactiveDocument, ScopePlan, SourceSpan,
+};
 pub use viewport::{InvalidViewport, InvalidViewportReason, MAX_PIXELS, Viewport};
 
 use crate::image::ImageStore;
@@ -384,6 +387,14 @@ pub struct VelquView {
     tailwind_diagnostics_list: Vec<String>,
     /// `<style>` block text extracted from the document, in order.
     style_blocks: Vec<String>,
+    /// Velqu Reactive (M5b, ADR 0016): when enabled, the loaded
+    /// document's `vx-*`/`:attr`/`@event` markup compiles into a
+    /// Rust-owned plan. Compilation is read-only and changes no
+    /// rendering path; the runtime that consumes the plan lands in M5c.
+    reactive_enabled: bool,
+    /// The compiled plan for the current document generation, with the
+    /// generation it was compiled against. Reload replaces it wholly.
+    reactive: Option<ReactiveState>,
     /// Runtime state for supported editable controls. Keys are current-
     /// document DOM nodes; the store is cleared on document replacement.
     controls: std::collections::HashMap<dom::NodeId, control::ControlState>,
@@ -477,6 +488,8 @@ impl VelquView {
             tailwind_css: None,
             tailwind_diagnostics_list: Vec::new(),
             style_blocks: Vec::new(),
+            reactive_enabled: false,
+            reactive: None,
             controls: std::collections::HashMap::new(),
             control_diagnostics_list: Vec::new(),
             control_geometry: std::collections::HashMap::new(),
@@ -565,6 +578,79 @@ impl VelquView {
     /// compile, in first-use order (ADR 0009).
     pub fn tailwind_diagnostics(&self) -> Vec<String> {
         self.tailwind_diagnostics_list.clone()
+    }
+
+    /// Enables the Velqu Reactive pipeline (M5b, ADR 0016): the loaded
+    /// document's reactive markup compiles into a Rust-owned plan.
+    /// Compilation is a pure read of the DOM — it changes no rendering
+    /// path, so documents with or without reactive markup render
+    /// byte-identically to a reactive-disabled view (test-pinned). The
+    /// plan-consuming runtime lands in M5c.
+    pub fn enable_reactive(&mut self) {
+        self.reactive_enabled = true;
+        self.rebuild_reactive();
+    }
+
+    /// Whether the reactive pipeline is enabled.
+    pub fn reactive_enabled(&self) -> bool {
+        self.reactive_enabled
+    }
+
+    /// The compiled reactive plan for the current document, if reactive
+    /// is enabled and a document is loaded. Pure data; the internal node
+    /// ids it carries never cross into JavaScript (ADR 0016).
+    pub fn reactive_plan(&self) -> Option<&ReactiveDocument<dom::NodeId>> {
+        self.reactive.as_ref().map(|state| &state.plan)
+    }
+
+    /// Deterministic reactive diagnostics for the current document, in
+    /// compile order.
+    pub fn reactive_diagnostics(&self) -> Vec<String> {
+        self.reactive
+            .as_ref()
+            .map(|state| {
+                state
+                    .plan
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A generation-scoped id for binding `index` of the current plan
+    /// (M5c's event/binding plumbing hands these back to the host).
+    pub fn reactive_binding_id(&self, index: usize) -> Option<ReactiveBindingId> {
+        let state = self.reactive.as_ref()?;
+        (index < state.plan.bindings.len()).then_some(ReactiveBindingId {
+            generation: state.generation,
+            index: index as u32,
+        })
+    }
+
+    /// Resolves a binding id to its element only when it belongs to the
+    /// current document generation: ids from a reloaded document are
+    /// safe no-ops (the same generation discipline as `ElementHandle`).
+    pub fn reactive_binding_target(&self, id: ReactiveBindingId) -> Option<ElementTarget> {
+        let state = self.reactive.as_ref()?;
+        if id.generation != state.generation {
+            return None;
+        }
+        let binding = state.plan.bindings.get(id.index as usize)?;
+        Some(self.node_target(binding.node))
+    }
+
+    /// Recompiles the reactive plan from the current DOM. Runs on
+    /// `enable_reactive` and on every document load while enabled.
+    fn rebuild_reactive(&mut self) {
+        if !self.reactive_enabled {
+            return;
+        }
+        self.reactive = Some(ReactiveState {
+            generation: self.document_generation,
+            plan: velqu_reactive::compile(&self.dom),
+        });
     }
 
     /// Deterministic diagnostics for controls outside the M4c1 profile.
@@ -757,6 +843,11 @@ impl VelquView {
         // `<style>` blocks travel with the document (review fix: they were
         // silently dropped before M3's review).
         self.collect_style_blocks();
+        // The reactive plan belongs to the old generation wholesale
+        // (M5b, ADR 0016): reload is the sanctioned reset, exactly like
+        // scroll/hover/focus/control state.
+        self.reactive = None;
+        self.rebuild_reactive();
         // Utility classes are per-document too: recompile when enabled.
         self.rebuild_tailwind();
         Ok(())
@@ -2052,6 +2143,24 @@ impl VelquView {
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
+}
+
+/// The compiled reactive plan plus the document generation it belongs
+/// to (M5b, ADR 0016). Private: hosts see the plan through accessors and
+/// ids, never the generation binding directly.
+struct ReactiveState {
+    generation: u64,
+    plan: ReactiveDocument<dom::NodeId>,
+}
+
+/// A generation-scoped reference to one binding in the reactive plan
+/// (M5b): resolvable only against the document generation it was
+/// compiled for. Fields stay private — ids are minted by
+/// [`VelquView::reactive_binding_id`] and die with their document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReactiveBindingId {
+    generation: u64,
+    index: u32,
 }
 
 /// Bakes a clamped scroll offset into the cached box tree so input stays
@@ -4238,6 +4347,193 @@ mod tests {
             value_of(&view, "box"),
             Some("あabc"),
             "exactly one insertion"
+        );
+    }
+
+    // -- M5b reactive binding compiler (ADR 0016) ------------------------
+
+    #[test]
+    fn m5b_static_documents_stay_byte_identical() {
+        // With reactive enabled, a document with zero reactive markup
+        // takes the exact non-reactive path: empty plan, identical facts,
+        // identical raster.
+        let static_html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=card style=\"width: 120px; height: 80px; background-color: #3b82f6\"></div>\
+             </body></html>";
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+
+        let mut plain = VelquView::new();
+        plain.load_html(static_html).unwrap();
+        let facts_plain = plain.layout_facts(vp).unwrap();
+        let hash_plain = plain.render(vp).unwrap().frame.sha256_hex();
+
+        let mut reactive = VelquView::new();
+        reactive.enable_reactive();
+        reactive.load_html(static_html).unwrap();
+        let plan = reactive.reactive_plan().expect("enabled plan exists");
+        assert!(
+            plan.is_empty(),
+            "no reactive markup, no diagnostics: {plan:?}"
+        );
+        let facts_reactive = reactive.layout_facts(vp).unwrap();
+        let hash_reactive = reactive.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(facts_plain, facts_reactive);
+        assert_eq!(hash_plain, hash_reactive);
+
+        // A document WITH reactive markup renders identically too: M5b is
+        // compile-only, and reactive attributes are inert to styling and
+        // layout (unknown attributes never enter the cascade).
+        let reactive_html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ n: 1 }\">\
+             <p vx-text=\"'n = ' + n\" vx-show=\"n > 0\">placeholder</p>\
+             <button @click.prevent=\"n = n + 1\">go</button>\
+             <input vx-model=\"n\">\
+             </div>\
+             <span vx-typo=\"boom\">x</span>\
+             </body></html>";
+        let mut a = VelquView::new();
+        a.load_html(reactive_html).unwrap();
+        let hash_a = a.render(vp).unwrap().frame.sha256_hex();
+        let mut b = VelquView::new();
+        b.enable_reactive();
+        b.load_html(reactive_html).unwrap();
+        let hash_b = b.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(hash_a, hash_b, "compiling changes no pixels");
+    }
+
+    #[test]
+    fn m5b_plan_compiles_from_the_dom_with_deterministic_shape() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div vx-state=\"{ count: 0, open: true }\">\
+             <p vx-text=\"'Count: ' + count\" vx-show=\"open\">—</p>\
+             <button @click.prevent=\"count = count + 1\">increment</button>\
+             <input vx-model=\"count\">\
+             <span vx-typo=\"boom\">x</span>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+
+        let plan = view.reactive_plan().expect("compiled");
+        assert_eq!(plan.scopes.len(), 1);
+        assert_eq!(plan.scopes[0].parent, None);
+        assert_eq!(
+            plan.scopes[0].initializer_source,
+            "{ count: 0, open: true }"
+        );
+        let kinds: Vec<BindingKind> = plan
+            .bindings
+            .iter()
+            .map(|binding| binding.kind.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            [BindingKind::Text, BindingKind::Show, BindingKind::Model,]
+        );
+        // Every binding and event resolves to the scope.
+        assert!(plan.bindings.iter().all(|b| b.scope == 0));
+        assert!(plan.events.iter().all(|e| e.scope == 0));
+        assert_eq!(plan.events.len(), 1);
+        assert_eq!(plan.events[0].handler.event, "click");
+        assert_eq!(plan.events[0].handler.modifiers, ["prevent"]);
+        assert_eq!(plan.events[0].handler_source, "count = count + 1");
+
+        // Unknown markup is a deterministic diagnostic, never silent.
+        assert_eq!(view.reactive_diagnostics().len(), 1);
+        assert!(view.reactive_diagnostics()[0].contains("vx-typo"));
+
+        // Determinism: reloading the same document compiles the same plan.
+        let first = plan.clone();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div vx-state=\"{ count: 0, open: true }\">\
+             <p vx-text=\"'Count: ' + count\" vx-show=\"open\">—</p>\
+             <button @click.prevent=\"count = count + 1\">increment</button>\
+             <input vx-model=\"count\">\
+             <span vx-typo=\"boom\">x</span>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        assert_eq!(view.reactive_plan().unwrap(), &first);
+    }
+
+    #[test]
+    fn m5b_reload_invalidates_old_binding_handles() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div vx-state=\"{ v: 'x' }\"><p vx-text=\"v\">—</p></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let id = view.reactive_binding_id(0).expect("one binding exists");
+        let _ = view.reactive_binding_target(id).expect("resolves");
+
+        // Reload: the old generation's ids are safe no-ops; the new plan
+        // mints fresh ids against the new generation.
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div vx-state=\"{ v: 'y' }\"><p vx-text=\"v\">—</p></div>\
+             </body></html>",
+        )
+        .unwrap();
+        assert!(
+            view.reactive_binding_target(id).is_none(),
+            "a stale binding id cannot address the new generation"
+        );
+        let fresh = view.reactive_binding_id(0).expect("new plan has binding 0");
+        assert!(fresh != id, "generations differ");
+        assert!(view.reactive_binding_target(fresh).is_some());
+    }
+
+    #[test]
+    fn m5b_semantic_rules_surface_as_view_diagnostics() {
+        // The compiler's semantic checks reach the public diagnostics API
+        // (vx-model on a <div>, a form event on a non-form element, a
+        // deferred directive, and the vx-model/:value conflict).
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body>\
+             <div vx-state=\"{ v: '' }\">\
+             <div vx-model=\"v\">block</div>\
+             <h1 @input=\"v = $event\">heading</h1>\
+             <ul vx-for=\"item in items\"></ul>\
+             <input vx-model=\"v\" :value=\"'literal'\">\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let diagnostics = view.reactive_diagnostics();
+        assert_eq!(diagnostics.len(), 4, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.contains("<div> is unsupported"))
+        );
+        assert!(diagnostics.iter().any(|d| d.contains("form event")));
+        assert!(diagnostics.iter().any(|d| d.contains("deferred")));
+        assert!(diagnostics.iter().any(|d| d.contains("vx-model wins")));
+        // The conflicting :value binding was dropped; the model remained.
+        let plan = view.reactive_plan().unwrap();
+        assert_eq!(
+            plan.bindings
+                .iter()
+                .filter(|b| b.kind == BindingKind::Value)
+                .count(),
+            0
+        );
+        assert_eq!(
+            plan.bindings
+                .iter()
+                .filter(|b| b.kind == BindingKind::Model)
+                .count(),
+            1
         );
     }
 

@@ -38,7 +38,7 @@ native lightweight application UI
 | M4c1 | editable controls: opaque element identity, runtime input/textarea values, grapheme-safe editing, pointer-capture selection, scroll-to-caret ([ADR 0012](docs/decisions/0012-m4c1-editable-controls.md)) | **done** |
 | M4c2 | clipboard: Copy/Cut/Paste through a host `ClipboardProvider`, arboard in the shell ([ADR 0013](docs/decisions/0013-m4c2-clipboard.md)) | **done** |
 | M4c3 | IME: preedit presentation + atomic commit, session-scoped composition, shell-side enablement ([ADR 0014](docs/decisions/0014-m4c3-ime.md)) | **done** |
-| M5 | Velqu Reactive v0 (isolated UI QuickJS) — **M5a runtime gate done**: bounded QuickJS, hostile-script battery ([ADR 0015](docs/decisions/0015-m5a-runtime-gate.md)); M5b–M5d next | in progress |
+| M5 | Velqu Reactive v0 (isolated UI QuickJS) — **M5a runtime gate** (ADR 0015) and **M5b binding compiler** (ADR 0016) done; M5c state+events and M5d invalidation next | in progress |
 | M6 | VelquView Lab inspector + reload | |
 | M7 | reference Tailwind dashboard | |
 | M8 | Mini IDE benchmark shell | |

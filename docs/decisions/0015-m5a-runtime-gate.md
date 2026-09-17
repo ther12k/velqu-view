@@ -117,3 +117,34 @@ reusable within its generation.
   the shim's own scope is in TDZ while the shim reads the original —
   the subclass is named `LogicalDate` and the original is captured
   first (the test that caught this is now part of the battery).
+
+## Amendment (M5a.1, applied before M5b at review direction)
+
+**Dynamic code generation is refused at every script-reachable handle.**
+
+The natural-looking kill — build the context without the `Eval`
+intrinsic — is not available: QuickJS-NG routes the *host's* own
+`Ctx::eval` through the same `eval_internal` hook
+(`JS_EvalThis2 → JS_EvalInternal`), so dropping the intrinsic takes
+host compilation down with it (probe: the profile prelude itself
+failed with `TypeError: eval is not supported`). The refusal is
+therefore enforced at the handle level in the profile prelude:
+
+* `eval` and `Function` globals are deleted — direct and indirect
+  `eval(...)` and `new Function(...)` become `ReferenceError`s.
+* `Function.prototype.constructor` is replaced with a throwing stub,
+  so `(function(){}).constructor("…")`, class-constructor chains, and
+  async/generator variants cannot rebuild the constructor. (Prelude
+  ordering matters: capture `Function.prototype` before deleting the
+  global.)
+* Dynamic `import(...)` rejects — no module loader exists (the
+  `loader` feature is off), and a rejected import surfaces during the
+  turn's microtask drain (`could not load module`).
+
+The battery pins every path (`dynamic_code_generation_is_refused_at_
+every_handle`), including the promise-machinery subtlety that a throw
+*inside* a reaction is absorbed into the derived promise and must be
+asserted via capture, not a job exception. The source-size budget
+consequently governs the only code that can ever run: sources the
+host submits directly.
+

@@ -2194,6 +2194,7 @@ dependencies = [
  "taffy",
  "toml",
  "unicode-segmentation",
+ "velqu-reactive",
  "velqu-tailwind",
 ]
 

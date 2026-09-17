@@ -17,9 +17,16 @@
 //! and a capped diagnostic sink. Hostile scripts terminate as
 //! classified, host-safe failures; no ambient I/O exists.
 //!
-//! **M5b–M5d scope (next):** the binding compiler (the `vx-*` surface →
-//! a Rust-owned binding plan), state + events (M4 events → JS turn →
-//! transactional mutation batch), and invalidation batching
+//! **M5b scope (done, ADR 0016):** the binding compiler — the frozen
+//! `vx-*`/`:attr`/`@event` surface lowers to a Rust-owned
+//! [`ReactiveDocument`] (scopes, typed bindings, event handlers,
+//! deterministic diagnostics) through the read-only [`ReactiveDom`]
+//! seam. **Reactive markup is compiled into a capability-limited
+//! execution plan; runtime JavaScript never discovers or traverses
+//! the DOM.** No dynamic tree creation in this slice.
+//!
+//! **M5c–M5d scope (next):** state + events (M4 events → JS turn →
+//! transactional mutation batch) and invalidation batching
 //! (presentation → zero Taffy passes, structural → one pass).
 //!
 //! The UI QuickJS context receives no browser APIs — no `document`, `window`,
@@ -28,8 +35,13 @@
 
 use std::fmt;
 
+mod plan;
 mod runtime;
 
+pub use plan::{
+    Binding, BindingKind, EventBinding, ReactiveDiagnostic, ReactiveDocument, ReactiveDom,
+    ScopePlan, SourceSpan, compile,
+};
 pub use runtime::{InvalidJsLimits, JsFailure, JsLimits, LOGICAL_EPOCH_MS, ReactiveRuntime};
 
 /// v0 directives (`vx-*` attribute names), per the Velqu Reactive v0 spec.

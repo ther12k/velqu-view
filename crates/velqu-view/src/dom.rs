@@ -46,6 +46,43 @@ pub(crate) struct Node {
     pub data: NodeData,
 }
 
+/// The reactive compiler's view of the parsed document (M5b, ADR
+/// 0016): element children in document order, tag names, and attributes
+/// as written. Nothing here mutates the tree; compilation is read-only.
+impl velqu_reactive::ReactiveDom for Dom {
+    type Node = NodeId;
+
+    fn root(&self) -> NodeId {
+        self.document
+    }
+
+    fn children(&self, node: NodeId) -> Vec<NodeId> {
+        self.nodes[node]
+            .children
+            .iter()
+            .copied()
+            .filter(|&child| matches!(self.nodes[child].data, NodeData::Element { .. }))
+            .collect()
+    }
+
+    fn tag(&self, node: NodeId) -> &str {
+        match &self.nodes[node].data {
+            NodeData::Element { name, .. } => name,
+            _ => "",
+        }
+    }
+
+    fn attributes(&self, node: NodeId) -> Vec<(String, String)> {
+        match &self.nodes[node].data {
+            NodeData::Element { attrs, .. } => attrs
+                .iter()
+                .map(|attribute| (attribute.name.clone(), attribute.value.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// A parsed document tree.
 #[derive(Debug, Clone)]
 pub(crate) struct Dom {
