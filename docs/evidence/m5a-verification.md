@@ -83,5 +83,6 @@ immediately; the fix (capture `OriginDate` before declaring
   byte-identical to M4 (the runtime is not yet wired into
   `load_html`; that lands with M5b's binding plan).
 
-Landing: implementation + docs pushed to `main`; GitHub CI green (run
-recorded in the evidence addendum).
+Landing: `0c9ff22` pushed to `main`; GitHub CI green — run
+[35241711408](https://github.com/ther12k/velqu-view/actions/runs/35241711408)
+(fmt/clippy/test/build + MSRV 1.87).
