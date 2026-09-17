@@ -390,10 +390,13 @@ pub(crate) struct LaidOutDocument {
     pub root_offset: (f32, f32),
 }
 
-/// Runtime scroll offsets, keyed by scroll target: the empty key is the
-/// document-level scroller, any other key is an element `id`. Values are
-/// raw (unclamped) requests; clamping happens centrally at apply time.
-pub(crate) type ScrollOffsets = Vec<(String, (f32, f32))>;
+/// Runtime scroll offsets, keyed by DOM node (M4b, ADR 0011): `None` is
+/// the document-level scroller, `Some(node)` an element's scroll
+/// container. Node keys are stable for one loaded document, so offsets
+/// transplant across relayouts (resize, restyle) and id-less containers
+/// get their own state; values are raw (unclamped) requests, clamped
+/// centrally at apply time.
+pub(crate) type ScrollOffsets = Vec<(Option<NodeId>, (f32, f32))>;
 
 /// Clamps a raw scroll request to `0 <= offset <= extent - scrollport`,
 /// per axis. The single place scrolling math happens (ADR 0008) — painters
@@ -454,7 +457,7 @@ pub(crate) fn layout_document(
     };
     let document_offset = scroll_offsets
         .iter()
-        .find(|(key, _)| key.is_empty())
+        .find(|(key, _)| key.is_none())
         .map(|(_, raw)| *raw)
         .unwrap_or((0.0, 0.0));
     let document_offset_clamped = clamp_scroll_offset(
@@ -848,6 +851,22 @@ mod tests {
         images: &ImageStore,
     ) -> LayoutFacts {
         facts_with(html, css, width, height, images, &Vec::new())
+    }
+
+    /// The first element carrying `id=id` (runtime scroll-state keys are
+    /// node identities, ADR 0011).
+    fn find_node_by_id(dom: &crate::dom::Dom, id: &str) -> crate::dom::NodeId {
+        let mut found = None;
+        dom.walk(|node, data| {
+            if found.is_none() {
+                if let crate::dom::NodeData::Element { attrs, .. } = &data.data {
+                    if attrs.iter().any(|a| a.name == "id" && a.value == id) {
+                        found = Some(node);
+                    }
+                }
+            }
+        });
+        found.expect("no element with that id")
     }
 
     fn facts_with(
@@ -1294,17 +1313,19 @@ mod tests {
              </div></body>";
         let css = "body { margin: 0 } .pane { overflow: auto; width: 100px; height: 40px } \
              .big { width: 300px; height: 80px }";
+        let dom = crate::html::parse(html);
+        let pane_node = find_node_by_id(&dom, "pane");
         let scrolled = facts_with(
             html,
             css,
             400,
             300,
             &ImageStore::new(),
-            &vec![("pane".to_owned(), (500.0, -25.0))],
+            &vec![(Some(pane_node), (500.0, -25.0))],
         );
-        let big = fact(&scrolled, "big");
         // Geometry is scroll-state-independent: identical with and without
         // the offset, over- and under-flowing requests alike.
+        let big = fact(&scrolled, "big");
         assert_eq!((big.x, big.y), (0.0, 0.0));
         assert_eq!(big.width, 300.0);
         let plain = facts_for(html, css, 400, 300);
@@ -1312,7 +1333,6 @@ mod tests {
 
         // The clamped offset is applied to the box tree (extent 300x80,
         // scrollport 100x40 → max (200, 40); negative clamps to 0).
-        let dom = crate::html::parse(html);
         let ua_sheet = StylesheetSource::new("velqu:ua", "");
         let ua_parsed = crate::css::parse(&ua_sheet, 0);
         let author_sheet = StylesheetSource::new("test.css", css);
@@ -1327,7 +1347,7 @@ mod tests {
             &mut cascade,
             &mut fonts,
             &ImageStore::new(),
-            &vec![("pane".to_owned(), (500.0, -25.0))],
+            &vec![(Some(pane_node), (500.0, -25.0))],
         )
         .unwrap();
         let pane = &laid.root.children[0];

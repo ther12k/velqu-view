@@ -144,12 +144,16 @@ fn compute_scroll_extents(node: &mut BoxNode) {
     });
 }
 
-/// Applies requested offsets to scroll containers by element `id`, clamped
-/// centrally. Unknown ids and non-scroll-container ids match nothing and are
-/// ignored (the offset simply never applies).
+/// Applies requested offsets to scroll containers by DOM node identity,
+/// clamped centrally (ADR 0011). Node keys survive box-tree rebuilds, so
+/// offsets transplant across relayouts; keys that name no scroll container
+/// match nothing and are ignored (the offset simply never applies).
 fn apply_scroll_offsets(node: &mut BoxNode, scroll_offsets: &crate::layout::ScrollOffsets) {
-    if let (Some(scroll), Some(element_id)) = (&node.scroll, &node.element_id) {
-        if let Some((_, raw)) = scroll_offsets.iter().find(|(key, _)| key == element_id) {
+    if let Some(scroll) = &node.scroll {
+        if let Some((_, raw)) = scroll_offsets
+            .iter()
+            .find(|(key, _)| *key == Some(node.node))
+        {
             node.applied_scroll = crate::layout::clamp_scroll_offset(
                 *raw,
                 (scroll.width, scroll.height),

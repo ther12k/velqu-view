@@ -13,6 +13,7 @@
 //! styling milestones, but it changes no layout facts.
 
 use crate::display_list::Rect;
+use crate::dom::NodeId;
 use crate::layout::{BoxNode, ScrollExtent};
 use crate::viewport::Viewport;
 
@@ -127,24 +128,41 @@ pub(crate) struct WheelContext<'a> {
     pub viewport: Viewport,
 }
 
+/// What a wheel gesture (or any scroll change) targets: the
+/// document-level scroller or one container element. Node identity is the
+/// runtime state key (ADR 0011); the HTML `id`, when present, is the
+/// public identity carried in events.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WheelResult {
+    /// `None` = the document-level scroller; `Some(node)` = the container.
+    pub node: Option<NodeId>,
+    /// The container's HTML `id`, when it has one.
+    pub element_id: Option<String>,
+    /// The new clamped offset.
+    pub offset: (f32, f32),
+    /// The offset the target was painted with before this gesture — the
+    /// change baseline (a stored raw request can exceed the current clamp
+    /// after a relayout).
+    pub previous_applied: (f32, f32),
+}
+
 /// Computes the wheel result at `(x, y)` (viewport px): hit test, find the
 /// nearest scrollable ancestor (or the document-level scroller), add the
 /// delta to that container's current clamped offset, and clamp again.
-/// Returns `(target key, new x, new y)` — `None` when nothing is under the
-/// point. No layout runs; the math reads the cached laid-out tree only.
+/// Returns `None` when nothing is under the point. No layout runs; the
+/// math reads the cached laid-out tree only.
 pub(crate) fn wheel_target(
     ctx: &WheelContext<'_>,
     x: f32,
     y: f32,
     dx: f32,
     dy: f32,
-) -> Option<(Option<String>, f32, f32)> {
+) -> Option<WheelResult> {
     let node = hit_at(ctx.root, ctx.document_offset, x, y)?;
     match nearest_scrollable_ancestor(ctx.root, node) {
         Some(container) => {
-            let key = container.element_id.clone();
             let extent = container.scroll?;
-            let clamped = crate::layout::clamp_scroll_offset(
+            let offset = crate::layout::clamp_scroll_offset(
                 (
                     container.applied_scroll.0 + dx,
                     container.applied_scroll.1 + dy,
@@ -152,17 +170,42 @@ pub(crate) fn wheel_target(
                 (extent.width, extent.height),
                 (container.padding_box.w, container.padding_box.h),
             );
-            Some((key, clamped.0, clamped.1))
+            Some(WheelResult {
+                node: Some(container.node),
+                element_id: container.element_id.clone(),
+                offset,
+                previous_applied: container.applied_scroll,
+            })
         }
         None => {
-            let clamped = crate::layout::clamp_scroll_offset(
+            let offset = crate::layout::clamp_scroll_offset(
                 (ctx.document_offset.0 + dx, ctx.document_offset.1 + dy),
                 (ctx.document_extent.width, ctx.document_extent.height),
                 (ctx.viewport.width() as f32, ctx.viewport.height() as f32),
             );
-            Some((None, clamped.0, clamped.1))
+            Some(WheelResult {
+                node: None,
+                element_id: None,
+                offset,
+                previous_applied: ctx.document_offset,
+            })
         }
     }
+}
+
+/// What a scroll change targets (ADR 0011): the document-level scroller
+/// or one scroll container. Runtime state is keyed by node identity; this
+/// public shape carries the element's HTML `id` when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrollTarget {
+    /// The document-level scroller (the viewport).
+    Document,
+    /// A scroll container element — id-less containers are first-class
+    /// targets too.
+    Element {
+        /// The container's HTML `id`, when it has one.
+        id: Option<String>,
+    },
 }
 
 /// One interaction event, in the order they occurred. Drained through
@@ -193,10 +236,10 @@ pub enum Event {
         to: Option<String>,
     },
     /// A scroll container's clamped offset changed (wheel input or
-    /// programmatic). `target` `None` = the document-level scroller.
+    /// programmatic).
     Scrolled {
-        /// Scroll target key (element id or the document scroller).
-        target: Option<String>,
+        /// What scrolled.
+        target: ScrollTarget,
         /// Clamped x offset in device px.
         x: f32,
         /// Clamped y offset in device px.

@@ -81,7 +81,7 @@ use std::rc::Rc;
 
 pub use color::{Color, ColorParseError};
 pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
-pub use input::{Event, HitTarget};
+pub use input::{Event, HitTarget, ScrollTarget};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
@@ -876,7 +876,10 @@ impl VelquView {
     /// centrally** at apply time to `0..=extent - scrollport`, so over- and
     /// under-flowing requests are safe. Scroll position is runtime
     /// presentation state: layout facts report unscrolled geometry, and
-    /// scrolling never triggers a new layout pass.
+    /// scrolling never triggers a new layout pass. Offsets are keyed by
+    /// node identity (ADR 0011), so they transplant across relayouts —
+    /// resize and restyle keep the position, re-clamped; only loading a
+    /// new document resets it.
     ///
     /// Unknown targets are accepted and simply never apply — matching the
     /// clamping philosophy that offsets are requests, not commands.
@@ -889,7 +892,14 @@ impl VelquView {
         if !x.is_finite() || !y.is_finite() {
             return Err(VelquError::InvalidScrollOffset { x, y });
         }
-        let key = target.unwrap_or("").to_owned();
+        let key = match target {
+            None => None,
+            Some(id) => match self.element_node(id) {
+                Some(node) => Some(node),
+                // Unknown ids match nothing, by contract.
+                None => return Ok(()),
+            },
+        };
         let entry = (key, (x.max(0.0), y.max(0.0)));
         match self
             .scroll_offsets
@@ -903,6 +913,22 @@ impl VelquView {
         // re-applies them with zero layout passes.
         self.last_laid = None;
         Ok(())
+    }
+
+    /// Resolves an element `id` attribute to its DOM node (document
+    /// order, first match) — the runtime state key (ADR 0011).
+    fn element_node(&self, id: &str) -> Option<dom::NodeId> {
+        let mut found = None;
+        self.dom.walk(|node, data| {
+            if found.is_none() {
+                if let dom::NodeData::Element { attrs, .. } = &data.data {
+                    if attrs.iter().any(|a| a.name == "id" && a.value == id) {
+                        found = Some(node);
+                    }
+                }
+            }
+        });
+        found
     }
 
     /// Layout instrumentation (ADR 0008): how many layout passes this
@@ -1019,26 +1045,23 @@ impl VelquView {
             document_extent: laid.document_scroll,
             viewport,
         };
-        let Some((target, new_x, new_y)) = input::wheel_target(&ctx, x, y, dx, dy) else {
+        let Some(result) = input::wheel_target(&ctx, x, y, dx, dy) else {
             return;
         };
-        let changed = match self.scroll_offset_of(target.as_deref()) {
-            Some((current_x, current_y)) => {
-                (current_x - new_x).abs() > f32::EPSILON || (current_y - new_y).abs() > f32::EPSILON
-            }
-            None => (new_x.abs() + new_y.abs()) > f32::EPSILON,
-        };
+        // Change is measured against what the target was painted with —
+        // not the stored raw request, which can exceed the current clamp
+        // after a relayout.
+        let changed = result.offset != result.previous_applied;
         if !changed {
             return;
         }
-        let key = target.clone().unwrap_or_default();
         match self
             .scroll_offsets
             .iter_mut()
-            .find(|(existing, _)| *existing == key)
+            .find(|(existing, _)| *existing == result.node)
         {
-            Some(slot) => slot.1 = (new_x, new_y),
-            None => self.scroll_offsets.push((key, (new_x, new_y))),
+            Some(slot) => slot.1 = result.offset,
+            None => self.scroll_offsets.push((result.node, result.offset)),
         }
         // Bake the clamped offset into the cached tree so consecutive
         // wheel events (a real pointer delivers many between frames)
@@ -1046,27 +1069,23 @@ impl VelquView {
         // relayout; the next render reproduces the same values from the
         // stored offsets.
         if let Some(laid) = self.last_laid.as_mut() {
-            match &target {
-                Some(id) => {
-                    bake_scroll(&mut laid.root, id, (new_x, new_y));
+            match result.node {
+                Some(node) => {
+                    bake_scroll(&mut laid.root, node, result.offset);
                 }
-                None => laid.root_offset = (new_x, new_y),
+                None => laid.root_offset = result.offset,
             }
         }
         self.events.push(Event::Scrolled {
-            target,
-            x: new_x,
-            y: new_y,
+            target: match result.node {
+                None => ScrollTarget::Document,
+                Some(_) => ScrollTarget::Element {
+                    id: result.element_id,
+                },
+            },
+            x: result.offset.0,
+            y: result.offset.1,
         });
-    }
-
-    /// The stored (raw) offset for a scroll key; `None` when never set.
-    fn scroll_offset_of(&self, key: Option<&str>) -> Option<(f32, f32)> {
-        let key = key.unwrap_or("");
-        self.scroll_offsets
-            .iter()
-            .find(|(existing, _)| existing == key)
-            .map(|(_, offset)| *offset)
     }
 
     /// Moves focus to the next element with an `id` in document order,
@@ -1144,10 +1163,10 @@ impl VelquView {
 /// Bakes a clamped scroll offset into the cached box tree so input stays
 /// coherent between renders (ADR 0010): the container's applied scroll
 /// updates in place, mirroring what the next render's
-/// `apply_scroll_offsets` will compute from the stored request. Returns
-/// once the id is found.
-fn bake_scroll(node: &mut layout::BoxNode, id: &str, offset: (f32, f32)) -> bool {
-    if node.element_id.as_deref() == Some(id) {
+/// `apply_scroll_offsets` will compute from the stored request. Keys are
+/// DOM node identity (ADR 0011). Returns once the node is found.
+fn bake_scroll(node: &mut layout::BoxNode, id: dom::NodeId, offset: (f32, f32)) -> bool {
+    if node.node == id {
         node.applied_scroll = offset;
         return true;
     }
@@ -1733,7 +1752,7 @@ mod tests {
         assert_eq!(
             events,
             vec![Event::Scrolled {
-                target: None,
+                target: ScrollTarget::Document,
                 x: 0.0,
                 y: 40.0
             }]
@@ -1754,7 +1773,9 @@ mod tests {
         assert_eq!(
             events,
             vec![Event::Scrolled {
-                target: Some("a".into()),
+                target: ScrollTarget::Element {
+                    id: Some("a".into())
+                },
                 x: 40.0,
                 y: 0.0
             }]
@@ -1771,6 +1792,203 @@ mod tests {
         let facts = view.layout_facts(vp).unwrap();
         // Facts stay the unscrolled truth regardless of all that scrolling.
         assert_eq!(facts.viewport_width, 300);
+    }
+
+    // -- M4b: scroll-state invariants (ADR 0011) --------------------------
+
+    /// Pane "a" (100px scrollport, 300px red content) over a 300px blue
+    /// block: the document is 400px tall, so the document scroller has
+    /// range in a 200px viewport.
+    fn transplant_view() -> VelquView {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=a style=\"overflow: auto; width: 200px; height: 100px\">\
+             <div style=\"width: 100px; height: 300px; background-color: #ef4444\"></div>\
+             </div>\
+             <div style=\"width: 200px; height: 300px; background-color: #3b82f6\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        view
+    }
+
+    #[test]
+    fn scroll_leaves_layout_facts_untouched() {
+        let mut view = transplant_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let before = view.layout_facts(vp).unwrap();
+
+        view.set_scroll_offset(Some("a"), 0.0, 250.0).unwrap();
+        view.render(vp).unwrap();
+        view.wheel(vp, 50.0, 150.0, 0.0, 40.0); // document scroller
+        let _ = view.take_events();
+
+        let after = view.layout_facts(vp).unwrap();
+        assert_eq!(before, after, "facts are the unscrolled truth");
+    }
+
+    #[test]
+    fn scroll_applies_once_and_stays_across_repeated_renders() {
+        let mut view = transplant_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.wheel(vp, 50.0, 150.0, 0.0, 40.0); // document scroller
+        let _ = view.take_events();
+
+        let first = view.render(vp).unwrap().frame.sha256_hex();
+        let second = view.render(vp).unwrap().frame.sha256_hex();
+        let third = view.render(vp).unwrap().frame.sha256_hex();
+        // Neither lost (second render reverts) nor applied twice (each
+        // render shifts another 40px).
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+
+        // And it differs from the unscrolled page: the offset is real.
+        let mut fresh = transplant_view();
+        fresh.render(vp).unwrap();
+        assert_ne!(fresh.render(vp).unwrap().frame.sha256_hex(), first);
+    }
+
+    #[test]
+    fn scroll_position_survives_resize_and_reclamps() {
+        let mut view = transplant_view();
+        // Document extent 400 tall; viewport 200 → max offset 200.
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        for _ in 0..5 {
+            view.wheel(vp, 150.0, 150.0, 0.0, 40.0); // ×5 → 200 (max)
+            let _ = view.take_events();
+            view.render(vp).unwrap();
+        }
+
+        // Resize the viewport taller: extent 400 − 320 = max 80 now. The
+        // offset must survive (re-clamped), not reset. The blue block
+        // spans content y 100..400, so at viewport y=200:
+        // offset 0 → content 200 (blue), offset 80 → content 280 (blue)…
+        // both blue, so probe the pane instead: pane content is red at
+        // every reachable offset — instead assert behaviorally below.
+        let taller = Viewport::try_new(300, 320, 1.0).unwrap();
+        view.render(taller).unwrap();
+
+        // At the new max (80): a further wheel-down changes nothing, and a
+        // wheel-up lands exactly 40 lower — the position re-clamped rather
+        // than resetting to 0 (which would wheel up to... nothing) or
+        // staying at the stale 200 (which would wheel down "clamping" a
+        // correction).
+        view.wheel(taller, 150.0, 150.0, 0.0, 40.0);
+        assert!(
+            view.take_events().is_empty(),
+            "at the re-clamped max, further wheel-down is a no-op"
+        );
+        view.wheel(taller, 150.0, 150.0, 0.0, -40.0);
+        assert_eq!(
+            view.take_events(),
+            vec![Event::Scrolled {
+                target: ScrollTarget::Document,
+                x: 0.0,
+                y: 40.0,
+            }],
+            "offset survived the resize (80) and moved to 40"
+        );
+    }
+
+    #[test]
+    fn scroll_position_survives_a_restyle_relayout() {
+        let mut view = transplant_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.wheel(vp, 50.0, 50.0, 0.0, 40.0); // pane a → 40
+        let _ = view.take_events();
+
+        // A new stylesheet forces a full relayout (the box tree is
+        // rebuilt); the pane still exists, so its offset transplants.
+        view.load_css("#a { background-color: #22c55e }").unwrap();
+        view.render(vp).unwrap();
+
+        view.wheel(vp, 50.0, 50.0, 0.0, 40.0);
+        assert_eq!(
+            view.take_events(),
+            vec![Event::Scrolled {
+                target: ScrollTarget::Element {
+                    id: Some("a".into())
+                },
+                x: 0.0,
+                y: 80.0,
+            }],
+            "the offset accumulated across the relayout"
+        );
+    }
+
+    #[test]
+    fn idless_scroll_containers_have_independent_accumulating_state() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div style=\"overflow: auto; width: 200px; height: 100px\">\
+             <div style=\"width: 100px; height: 300px\"></div></div>\
+             <div style=\"width: 200px; height: 50px\"></div>\
+             <div style=\"overflow: auto; width: 200px; height: 100px\">\
+             <div style=\"width: 100px; height: 300px\"></div></div>\
+             </body></html>",
+        )
+        .unwrap();
+        // Viewport 200 tall vs a 250px document: the document scroller has
+        // range 50, and both panes are reachable.
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Both panes are id-less; neither may alias the document scroller
+        // or each other, and repeated wheels accumulate (they bake into
+        // the cached tree).
+        for _ in 0..3 {
+            view.wheel(vp, 50.0, 50.0, 0.0, 40.0); // first pane
+            view.render(vp).unwrap();
+        }
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![
+                Event::Scrolled {
+                    target: ScrollTarget::Element { id: None },
+                    x: 0.0,
+                    y: 40.0,
+                },
+                Event::Scrolled {
+                    target: ScrollTarget::Element { id: None },
+                    x: 0.0,
+                    y: 80.0,
+                },
+                Event::Scrolled {
+                    target: ScrollTarget::Element { id: None },
+                    x: 0.0,
+                    y: 120.0,
+                },
+            ]
+        );
+
+        // The second pane is untouched by the first pane's scroll.
+        view.wheel(vp, 50.0, 200.0, 0.0, 40.0); // second pane (y 150..250)
+        let events = view.take_events();
+        assert_eq!(
+            events,
+            vec![Event::Scrolled {
+                target: ScrollTarget::Element { id: None },
+                x: 0.0,
+                y: 40.0,
+            }]
+        );
+        // And the document scroller is a distinct target (probed outside
+        // the 200px content width, over the body block).
+        view.wheel(vp, 250.0, 180.0, 0.0, 40.0);
+        let events = view.take_events();
+        assert!(matches!(
+            events.as_slice(),
+            [Event::Scrolled {
+                target: ScrollTarget::Document,
+                ..
+            }]
+        ));
     }
 
     #[test]
