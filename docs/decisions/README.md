@@ -14,6 +14,10 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0008](0008-m2c-images-grid-scroll.md) | M2c: bounded image decoding, replaced-element sizing, frozen grid profile, paint-side scrolling | accepted |
 | [0009](0009-m3-tailwind-pipeline.md) | M3: v0 Tailwind-compatible pipeline (utilities → CSS → cascade) in velqu-tailwind | accepted |
 
-Future decisions expected: text shaping engine (Parley candidate), UI
-QuickJS embedding crate, host capability trait stabilization,
-compiled-Tailwind ingestion and the `velqu css check` CLI.
+Future decisions expected: text shaping engine (Parley candidate — see
+[`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how
+blitz delegates white-space/wrapping to Parley and what MSRV that
+implies), inline fragmentation strategy (blitz's custom-Taffy-mode
+approach documented in the same note), UI QuickJS embedding crate, host
+capability trait stabilization, compiled-Tailwind ingestion, and the
+Tailwind conformance-corpus runner (WPT-style reftests).
