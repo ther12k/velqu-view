@@ -10,9 +10,12 @@
 //! later GPU backend swap does not touch this crate's contract beyond how
 //! frames reach the surface.
 //!
-//! Input is forwarded to renderer hot paths only (M1: redraw scheduling on
-//! resize/DPI change, Escape to close). Real event dispatch, focus, and IME
-//! land in M4 and will stay in Rust, never routed through a JS runtime.
+//! Input is forwarded to the renderer's input gate (M4a, ADR 0010):
+//! pointer move/press/release, wheel scrolling, and Tab focus cycling are
+//! handed to [`VelquView`], which answers from the cached layout with zero
+//! additional layout passes; a wheel that changes the scroll offset marks
+//! the window dirty for a redraw. Escape still closes. Text editing, IME,
+//! selection, and hover/focus *painting* land in later M4 slices.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -20,10 +23,14 @@ use std::time::{Duration, Instant};
 
 use velqu_view::{FrameResult, VelquError, VelquView, Viewport};
 use winit::application::ApplicationHandler;
-use winit::event::ElementState;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+/// Vertical px per wheel line notch (winit `LineDelta`); matches common
+/// browser defaults and the visual scroll fixtures.
+const WHEEL_LINE_PX: f32 = 40.0;
 
 /// A fatal shell error (window, surface, or render failure).
 #[derive(Debug)]
@@ -153,6 +160,9 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
         window: None,
         surface: None,
         dirty: true,
+        // NaN until the first CursorMoved: every containment comparison
+        // against NaN is false, so early presses hit nothing.
+        pointer: (f32::NAN, f32::NAN),
         started: Instant::now(),
         frames: 0,
         error: None,
@@ -169,6 +179,8 @@ struct ShellApp<'a> {
     surface:
         Option<softbuffer::Surface<winit::event_loop::OwnedDisplayHandle, std::rc::Rc<Window>>>,
     dirty: bool,
+    /// Last pointer position in viewport device px (physical window px).
+    pointer: (f32, f32),
     started: Instant,
     frames: u64,
     error: Option<ShellError>,
@@ -212,6 +224,32 @@ impl ShellApp<'_> {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    /// The viewport matching the current window size, for input calls.
+    /// `None` before the window exists or while minimized (zero-size);
+    /// input is silently dropped in both cases.
+    fn input_viewport(&self) -> Option<Viewport> {
+        let window = self.window.as_ref()?;
+        let physical = window.inner_size();
+        Viewport::try_new(
+            physical.width.max(1),
+            physical.height.max(1),
+            window.scale_factor() as f32,
+        )
+        .ok()
+    }
+
+    /// Feeds the pointer position to the view (viewport device px are
+    /// physical window px). Hover alone changes no pixels yet, so no
+    /// redraw is scheduled.
+    fn pointer_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
+        let Some(viewport) = self.input_viewport() else {
+            return;
+        };
+        self.pointer = (position.x as f32, position.y as f32);
+        self.view
+            .pointer_move(viewport, self.pointer.0, self.pointer.1);
     }
 
     /// Renders one frame and presents it. Errors end the loop.
@@ -285,6 +323,53 @@ impl ApplicationHandler for ShellApp<'_> {
                 {
                     event_loop.exit();
                 }
+                if event.state == ElementState::Pressed
+                    && !event.repeat
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Tab)
+                {
+                    // Focus is runtime presentation state; it paints with
+                    // the M4b styling slice, so no redraw yet.
+                    self.view.focus_next();
+                }
+            }
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                self.pointer_moved(position);
+            }
+            winit::event::WindowEvent::CursorLeft { .. } => {
+                self.view.pointer_exit();
+            }
+            winit::event::WindowEvent::MouseInput { state, button, .. } => {
+                let Some(viewport) = self.input_viewport() else {
+                    return;
+                };
+                if button != MouseButton::Left {
+                    return;
+                }
+                let (x, y) = self.pointer;
+                match state {
+                    ElementState::Pressed => self.view.pointer_press(viewport, x, y),
+                    ElementState::Released => self.view.pointer_release(viewport, x, y),
+                }
+            }
+            winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                let Some(viewport) = self.input_viewport() else {
+                    return;
+                };
+                // Browser-signed delta (positive dy = scroll forward).
+                // winit's is opposite ("positive = content moves down"),
+                // and line deltas scale by the wheel line height.
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (-x * WHEEL_LINE_PX, -y * WHEEL_LINE_PX),
+                    MouseScrollDelta::PixelDelta(position) => {
+                        (-(position.x as f32), -(position.y as f32))
+                    }
+                };
+                let (px, py) = self.pointer;
+                self.view.wheel(viewport, px, py, dx, dy);
+                // The new offset changes pixels: schedule the paint, which
+                // re-renders from the baked offsets with zero relayout.
+                self.dirty = true;
+                self.request_redraw();
             }
             winit::event::WindowEvent::RedrawRequested => {
                 self.redraw(event_loop);
