@@ -284,6 +284,10 @@ pub struct LayoutStats {
     /// Wall time of the most recent pass. Indicative only — never part of
     /// pixel output or facts.
     pub duration_last_pass: std::time::Duration,
+    /// Presentation-only repaints (M4b, ADR 0011): frames re-emitted from
+    /// cached geometry because interaction state alone changed. Never
+    /// counts toward `passes` — pointer motion never lays out.
+    pub repaints: u64,
 }
 
 /// The result of [`VelquView::render`]: the frame plus paint metadata.
@@ -323,13 +327,21 @@ pub struct VelquView {
     /// Deterministic image diagnostics from the last prepare pass, in
     /// document order.
     image_diagnostics: Vec<String>,
-    /// Runtime scroll offsets (ADR 0008): target key → raw (unclamped)
-    /// offset. The empty key is the document-level scroller.
+    /// Runtime scroll offsets (ADR 0008): DOM node (None = document) →
+    /// raw (unclamped) offset.
     scroll_offsets: layout::ScrollOffsets,
     // Layout instrumentation (ADR 0008).
     layout_passes: u64,
     layout_nodes_last: usize,
     layout_duration_last: std::time::Duration,
+    /// Presentation-only repaints (M4b, ADR 0011): frames re-emitted from
+    /// the cached geometry because interaction state alone changed — no
+    /// Taffy pass.
+    repaint_passes: u64,
+    /// Deterministic diagnostics from the cascade's apply stage (skipped
+    /// declarations, deferred interaction properties), deduplicated across
+    /// frames and in first-seen order.
+    style_diagnostics_list: Vec<String>,
     /// Tailwind utility pipeline (ADR 0009): when enabled, the `class`
     /// attributes of the loaded document are compiled into a generated
     /// stylesheet appended after the author sheets in cascade order.
@@ -338,18 +350,25 @@ pub struct VelquView {
     tailwind_diagnostics_list: Vec<String>,
     /// `<style>` block text extracted from the document, in order.
     style_blocks: Vec<String>,
-    // Input gate state (M4a, ADR 0010). Interaction state is runtime
-    // presentation state — it never changes layout facts.
+    // Input gate state (M4a/M4b, ADR 0010/0011). Interaction state is
+    // runtime presentation state — it never changes layout facts; it is
+    // keyed by DOM node and reaches only pixels (via stateful selectors).
     /// The most recent layout pass, kept for hit testing. Refreshed by
     /// every render/layout_facts call; input methods use it read-only.
     last_laid: Option<layout::LaidOutDocument>,
     last_viewport: Option<Viewport>,
-    /// Element `id` under the pointer (hover), if any element with an id.
-    hover: Option<String>,
-    /// Focused element `id`, if any.
-    focus: Option<String>,
-    /// Element `id` of the pointer press target (click tracking).
-    pressed: Option<Option<String>>,
+    /// Set when document content or stylesheets changed: the next render
+    /// must run a full layout, not the presentation-only path.
+    structure_dirty: bool,
+    /// Last pointer position (viewport device px) from input; hover is
+    /// re-derived from it when scrolling moves content underneath.
+    pointer_pos: Option<(f32, f32)>,
+    /// The element under the pointer (for `:hover`), if any.
+    hover: Option<dom::NodeId>,
+    /// Focused element (for `:focus`), if any.
+    focus: Option<dom::NodeId>,
+    /// The pressed element (for `:active` chain + click tracking).
+    pressed: Option<dom::NodeId>,
     /// Interaction events since the last [`VelquView::take_events`].
     events: Vec<Event>,
 }
@@ -393,12 +412,16 @@ impl VelquView {
             layout_passes: 0,
             layout_nodes_last: 0,
             layout_duration_last: std::time::Duration::ZERO,
+            repaint_passes: 0,
+            style_diagnostics_list: Vec::new(),
             tailwind_enabled: false,
             tailwind_css: None,
             tailwind_diagnostics_list: Vec::new(),
             style_blocks: Vec::new(),
             last_laid: None,
             last_viewport: None,
+            structure_dirty: true,
+            pointer_pos: None,
             hover: None,
             focus: None,
             pressed: None,
@@ -585,13 +608,20 @@ impl VelquView {
         self.document = Some(source);
         // Image identity is per-document, like the DOM: a new document
         // invalidates every decoded asset — and the input state belongs to
-        // the old tree (M4a).
+        // the old tree (M4a/M4b).
         self.images.clear();
         self.last_laid = None;
+        self.last_viewport = None;
+        self.structure_dirty = true;
+        self.pointer_pos = None;
         self.hover = None;
         self.focus = None;
         self.pressed = None;
         self.events.clear();
+        // Scroll offsets are keyed by DOM node: they die with the document
+        // — a reload is the one sanctioned reset (ADR 0011).
+        self.scroll_offsets.clear();
+        self.style_diagnostics_list.clear();
         // `<style>` blocks travel with the document (review fix: they were
         // silently dropped before M3's review).
         self.collect_style_blocks();
@@ -683,6 +713,14 @@ impl VelquView {
             .collect()
     }
 
+    /// Deterministic diagnostics from the cascade's apply stage (ADR
+    /// 0011): skipped declarations and deferred interaction properties,
+    /// deduplicated across frames in first-seen order. Parse-time issues
+    /// surface through [`VelquView::css_diagnostics`].
+    pub fn style_diagnostics(&self) -> Vec<String> {
+        self.style_diagnostics_list.clone()
+    }
+
     /// The loaded HTML source text, if any.
     pub fn html(&self) -> Option<&str> {
         self.document.as_ref().map(|doc| doc.html.as_str())
@@ -746,7 +784,20 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        self.run_layout(viewport, &mut cascade, None);
+        if self.structure_dirty || self.cached_layout(viewport).is_none() {
+            // Structural change or new viewport: full layout. The current
+            // interaction state feeds stateful selectors so pixels are
+            // correct after resize/reload too (M4b).
+            let interaction = self.interaction_state();
+            self.run_layout(viewport, &mut cascade, Some(&interaction));
+            self.structure_dirty = false;
+        } else {
+            // Steady state: only presentation can have changed. Recompute
+            // styles with the current interaction state, patch the cached
+            // tree, re-emit — no Taffy pass (ADR 0011).
+            self.repaint_presentation(viewport, &mut cascade);
+        }
+        self.record_style_diagnostics(&cascade);
         if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
@@ -817,6 +868,66 @@ impl VelquView {
         // clone-free).
         self.last_viewport = Some(viewport);
         self.last_laid = laid;
+    }
+
+    /// Presentation-only repaint (M4b, ADR 0011): recompute styles with
+    /// the current interaction state, patch the cached box tree's
+    /// paint-only fields, and re-emit the display list. Layout geometry,
+    /// scroll extents, and the Taffy pass count are untouched.
+    fn repaint_presentation(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
+        let interaction = self.interaction_state();
+        let root_element = layout::layout_root(&self.dom);
+        let styles =
+            layout::compute_all_styles(&self.dom, root_element, cascade, Some(&interaction));
+        if let Some(laid) = self.last_laid.as_mut() {
+            let offset = laid.root_offset;
+            layout::patch_presentation_styles(&mut laid.root, &styles);
+            laid.display_list =
+                layout::build_display_list(&laid.root, viewport.scale_factor(), offset);
+        }
+        self.repaint_passes += 1;
+    }
+
+    /// Snapshots the node-keyed interaction state for the cascade.
+    fn interaction_state(&self) -> style::InteractionState {
+        // :active chains through the pressed element's ancestors, exactly
+        // like :hover (CSS activation propagates up).
+        let mut active_path = Vec::new();
+        if let Some(pressed) = self.pressed {
+            let mut cursor = Some(pressed);
+            while let Some(id) = cursor {
+                active_path.push(id);
+                cursor = self.dom.node(id).parent;
+            }
+        }
+        // :hover chains through the hovered element's ancestors (ADR 0011).
+        let mut hover_path = Vec::new();
+        if let Some(hovered) = self.hover {
+            let mut cursor = Some(hovered);
+            while let Some(id) = cursor {
+                hover_path.push(id);
+                cursor = self.dom.node(id).parent;
+            }
+        }
+        style::InteractionState {
+            hover_path,
+            active_path,
+            focus: self.focus,
+        }
+    }
+
+    /// Merges this pass's cascade diagnostics into the deduplicated,
+    /// first-seen-order list surfaced by [`VelquView::style_diagnostics`].
+    fn record_style_diagnostics(&mut self, cascade: &style::Cascade<'_>) {
+        for diagnostic in &cascade.diagnostics {
+            let text = format!(
+                "{} line {}: {}",
+                diagnostic.source, diagnostic.line, diagnostic.message
+            );
+            if !self.style_diagnostics_list.contains(&text) {
+                self.style_diagnostics_list.push(text);
+            }
+        }
     }
 
     /// Lays the current document out and returns fixture-facing facts.
@@ -918,9 +1029,36 @@ impl VelquView {
             Some(slot) => slot.1 = entry.1,
             None => self.scroll_offsets.push(entry),
         }
-        // Cached geometry has stale applied offsets; the next render
-        // re-applies them with zero layout passes.
-        self.last_laid = None;
+        // Bake the clamped offset into the cached tree (mirroring what the
+        // next layout's apply stage computes from the raw request), so hit
+        // testing and hover stay coherent and the next render needs no
+        // Taffy pass. The stored request stays raw for later re-clamping.
+        if let (Some(laid), Some(viewport)) = (self.last_laid.as_mut(), self.last_viewport) {
+            match entry.0 {
+                Some(node) => {
+                    if let Some(container) = layout::find_box(&laid.root, node) {
+                        if let Some(extent) = container.scroll {
+                            let clamped = layout::clamp_scroll_offset(
+                                entry.1,
+                                (extent.width, extent.height),
+                                (container.padding_box.w, container.padding_box.h),
+                            );
+                            bake_scroll(&mut laid.root, node, clamped);
+                        }
+                    }
+                }
+                None => {
+                    laid.root_offset = layout::clamp_scroll_offset(
+                        entry.1,
+                        (laid.document_scroll.width, laid.document_scroll.height),
+                        (viewport.width() as f32, viewport.height() as f32),
+                    );
+                }
+            }
+        }
+        if let Some(viewport) = self.last_viewport {
+            self.refresh_hover(viewport);
+        }
         Ok(())
     }
 
@@ -949,6 +1087,7 @@ impl VelquView {
             passes: self.layout_passes,
             nodes_last_pass: self.layout_nodes_last,
             duration_last_pass: self.layout_duration_last,
+            repaints: self.repaint_passes,
         }
     }
 
@@ -988,28 +1127,64 @@ impl VelquView {
 
     /// Moves the pointer to `(x, y)` (viewport device px): updates hover
     /// and emits [`Event::PointerLeave`]/[`Event::PointerEnter`] when the
-    /// hovered element id changed.
+    /// hovered element changed. The position is remembered so scrolling
+    /// can re-derive hover when content moves underneath (ADR 0011).
     pub fn pointer_move(&mut self, viewport: Viewport, x: f32, y: f32) {
-        let hit = self.hit_test(viewport, x, y);
-        let new_hover = hit.and_then(|target| target.element_id);
-        if new_hover == self.hover {
+        self.pointer_pos = Some((x, y));
+        self.update_hover(viewport, x, y);
+    }
+
+    /// Re-derives hover from the remembered pointer position — after a
+    /// scroll, the content under a stationary pointer changed.
+    fn refresh_hover(&mut self, viewport: Viewport) {
+        if let Some((x, y)) = self.pointer_pos {
+            self.update_hover(viewport, x, y);
+        }
+    }
+
+    fn update_hover(&mut self, viewport: Viewport, x: f32, y: f32) {
+        let hit = self
+            .cached_layout(viewport)
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .map(|node| node.node);
+        if hit == self.hover {
             return;
         }
         if let Some(old) = self.hover.take() {
-            self.events.push(Event::PointerLeave { element: Some(old) });
+            self.events.push(Event::PointerLeave {
+                element: self.node_element_id(old).map(str::to_owned),
+            });
         }
-        if let Some(new) = new_hover.clone() {
-            self.events.push(Event::PointerEnter { element: Some(new) });
+        if let Some(node) = hit {
+            self.events.push(Event::PointerEnter {
+                element: self.node_element_id(node).map(str::to_owned),
+            });
         }
-        self.hover = new_hover;
+        self.hover = hit;
+    }
+
+    /// The element's HTML `id` attribute value, if any (event identity).
+    fn node_element_id(&self, node: dom::NodeId) -> Option<&str> {
+        match &self.dom.node(node).data {
+            dom::NodeData::Element { attrs, .. } => attrs
+                .iter()
+                .find(|a| a.name == "id")
+                .map(|a| a.value.as_str()),
+            _ => None,
+        }
     }
 
     /// Presses at `(x, y)` (viewport device px). Remembers the press
-    /// target for click tracking; a later [`VelquView::pointer_release`]
-    /// over the same element emits [`Event::Click`].
+    /// target for click tracking and `:active` styling; a later
+    /// [`VelquView::pointer_release`] over the same element emits
+    /// [`Event::Click`].
     pub fn pointer_press(&mut self, viewport: Viewport, x: f32, y: f32) {
-        let hit = self.hit_test(viewport, x, y);
-        self.pressed = Some(hit.and_then(|target| target.element_id));
+        self.pointer_pos = Some((x, y));
+        self.update_hover(viewport, x, y);
+        self.pressed = self
+            .cached_layout(viewport)
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .map(|node| node.node);
     }
 
     /// Releases at `(x, y)` (viewport device px). If the press and release
@@ -1019,14 +1194,18 @@ impl VelquView {
         let Some(pressed) = self.pressed.take() else {
             return;
         };
-        let hit = self.hit_test(viewport, x, y);
-        let released = hit.and_then(|target| target.element_id);
-        if pressed.is_some() && pressed == released {
+        self.pointer_pos = Some((x, y));
+        self.update_hover(viewport, x, y);
+        let released = self
+            .cached_layout(viewport)
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .map(|node| node.node);
+        if Some(pressed) == released {
             self.events.push(Event::Click {
-                element: released.clone(),
+                element: self.node_element_id(pressed).map(str::to_owned),
             });
-            if let Some(id) = released {
-                self.set_focus_impl(Some(id));
+            if self.node_element_id(pressed).is_some() {
+                self.set_focus_node(Some(pressed));
             }
         }
     }
@@ -1095,71 +1274,77 @@ impl VelquView {
             x: result.offset.0,
             y: result.offset.1,
         });
+        // The content under a stationary pointer changed: re-derive hover
+        // so :hover follows what is visually under the cursor (ADR 0011).
+        self.refresh_hover(viewport);
     }
 
     /// Moves focus to the next element with an `id` in document order,
     /// wrapping around (Tab semantics). Emits
     /// [`Event::FocusChanged`] when focus moved.
     pub fn focus_next(&mut self) {
-        let mut ids: Vec<String> = Vec::new();
+        let mut nodes: Vec<dom::NodeId> = Vec::new();
         self.dom.walk(|id, node| {
             if let dom::NodeData::Element { attrs, .. } = &node.data {
-                if let Some(value) = attrs
-                    .iter()
-                    .find(|a| a.name == "id")
-                    .map(|a| a.value.clone())
-                {
-                    if !ids.contains(&value) {
-                        ids.push(value);
-                    }
+                if attrs.iter().any(|a| a.name == "id") && !nodes.contains(&id) {
+                    nodes.push(id);
                 }
             }
-            let _ = id;
         });
-        let next: Option<String> = match &self.focus {
-            Some(current) => match ids.iter().position(|id| id == current) {
-                Some(index) => ids
-                    .get((index + 1) % ids.len().max(1))
-                    .cloned()
-                    .or_else(|| Some(current.clone())),
-                None => ids.first().cloned(),
+        let next: Option<dom::NodeId> = match self.focus {
+            Some(current) => match nodes.iter().position(|&id| id == current) {
+                Some(index) => nodes.get((index + 1) % nodes.len().max(1)).copied(),
+                None => nodes.first().copied(),
             },
-            None => ids.first().cloned(),
+            None => nodes.first().copied(),
         };
-        self.set_focus_impl(next);
+        self.set_focus_node(next);
     }
 
-    /// Sets focus directly (`None` clears it) and emits
-    /// [`Event::FocusChanged`] when it moved.
+    /// Sets focus by element `id` (`None` clears it) and emits
+    /// [`Event::FocusChanged`] when it moved. Unknown ids are ignored —
+    /// focus targets resolve against the loaded document.
     pub fn set_focus(&mut self, element: Option<&str>) {
-        self.set_focus_impl(element.map(str::to_owned));
+        self.set_focus_node(match element {
+            None => None,
+            Some(id) => self.element_node(id),
+        });
     }
 
-    fn set_focus_impl(&mut self, to: Option<String>) {
+    fn set_focus_node(&mut self, to: Option<dom::NodeId>) {
         if to == self.focus {
             return;
         }
-        let from = self.focus.take();
-        self.focus = to.clone();
-        self.events.push(Event::FocusChanged { from, to });
+        let from = self
+            .focus
+            .take()
+            .and_then(|node| self.node_element_id(node).map(str::to_owned));
+        self.focus = to;
+        self.events.push(Event::FocusChanged {
+            from,
+            to: to.and_then(|node| self.node_element_id(node).map(str::to_owned)),
+        });
     }
 
     /// Reports the pointer leaving the window: clears hover and emits
     /// [`Event::PointerLeave`] when an element was hovered.
     pub fn pointer_exit(&mut self) {
+        self.pointer_pos = None;
         if let Some(old) = self.hover.take() {
-            self.events.push(Event::PointerLeave { element: Some(old) });
+            self.events.push(Event::PointerLeave {
+                element: self.node_element_id(old).map(str::to_owned),
+            });
         }
     }
 
-    /// The currently focused element id, if any.
+    /// The currently focused element's `id`, if it has one.
     pub fn focused(&self) -> Option<&str> {
-        self.focus.as_deref()
+        self.focus.and_then(|node| self.node_element_id(node))
     }
 
-    /// The element id currently under the pointer (hover), if any.
+    /// The `id` of the element currently under the pointer, if it has one.
     pub fn hovered(&self) -> Option<&str> {
-        self.hover.as_deref()
+        self.hover.and_then(|node| self.node_element_id(node))
     }
 
     /// Drains the interaction events accumulated since the last call, in
@@ -1768,13 +1953,15 @@ mod tests {
         );
         // No layout pass ran for the wheel itself.
         assert_eq!(view.layout_stats().passes, passes_before);
-        // The next render paints the new offset — still zero new passes
-        // beyond the frame's own single pass.
+        // Painting the new offset is a presentation-only repaint: the
+        // baked offsets re-emit from cached geometry, still zero passes
+        // (M4b, ADR 0011).
         view.render(vp).unwrap();
-        assert_eq!(view.layout_stats().passes, passes_before + 1);
+        assert_eq!(view.layout_stats().passes, passes_before);
+        assert_eq!(view.layout_stats().repaints, 1);
 
         // Wheel over the scrollable pane a: the pane scrolls, not the page.
-        view.render(vp).unwrap(); // paint the document scroll (one pass)
+        view.render(vp).unwrap();
         view.pointer_move(vp, 100.0, 50.0); // hover tracking for realism
         let _ = view.take_events();
         view.wheel(vp, 100.0, 50.0, 40.0, 0.0);
@@ -1998,6 +2185,309 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    // -- M4b: interaction styling end-to-end (ADR 0011) --------------------
+
+    /// Card (120×120, blue) with a label child (60×60): hovering the
+    /// *label* must turn the card red through the ancestor chain and the
+    /// label green through the `.card:hover .label` descendant rule.
+    fn hover_chain_view() -> VelquView {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             .card { width: 120px; height: 120px; background-color: #3b82f6 }\
+             .card:hover { background-color: #ef4444 }\
+             .label { display: block; width: 60px; height: 60px }\
+             .card:hover .label { background-color: #22c55e }\
+             </style></head><body>\
+             <div class=card><span class=label>x</span></div>\
+             </body></html>",
+        )
+        .unwrap();
+        view
+    }
+
+    #[test]
+    fn hover_styles_follow_the_pointer_chain() {
+        let mut view = hover_chain_view();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        let base = view.render(vp).unwrap().frame;
+        assert_eq!(
+            base.pixel(30, 30),
+            Some(Color::from_hex("#3b82f6").unwrap()),
+            "unhovered: the label area shows the card's blue"
+        );
+
+        // Pointer over the label — the card is in the label's hover chain.
+        view.pointer_move(vp, 30.0, 30.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(90, 90),
+            Some(Color::from_hex("#ef4444").unwrap()),
+            "an ancestor matches :hover when a descendant is hovered"
+        );
+        assert_eq!(
+            frame.pixel(30, 30),
+            Some(Color::from_hex("#22c55e").unwrap()),
+            "the descendant rule .card:hover .label activates"
+        );
+
+        // Pointer off the card: everything reverts.
+        view.pointer_move(vp, 180.0, 180.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(90, 90),
+            Some(Color::from_hex("#3b82f6").unwrap())
+        );
+        assert_eq!(
+            frame.pixel(30, 30),
+            Some(Color::from_hex("#3b82f6").unwrap())
+        );
+    }
+
+    #[test]
+    fn hover_changes_pixels_without_touching_layout() {
+        let mut view = hover_chain_view();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        view.pointer_move(vp, 30.0, 30.0);
+        let hovered = view.render(vp).unwrap();
+        assert_eq!(
+            hovered.frame.sha256_hex(),
+            view.render(vp).unwrap().frame.sha256_hex(),
+            "steady-state hover renders are deterministic"
+        );
+
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "pointer motion must not lay out"
+        );
+        assert!(view.layout_stats().repaints >= 1, "the repaint is counted");
+        // Facts call runs its own truth pass, after the count assertions.
+        let after = view.layout_facts(vp).unwrap();
+        assert_eq!(facts, after, "facts are the structural truth, state-free");
+    }
+
+    #[test]
+    fn overlapping_siblings_hover_the_topmost_only() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             .box { width: 100px; height: 100px }\
+             #under { background-color: #3b82f6 }\
+             #under:hover { background-color: #ef4444 }\
+             #over { background-color: #111111; margin-top: -50px }\
+             #over:hover { background-color: #22c55e }\
+             </style></head><body>\
+             <div id=under class=box></div>\
+             <div id=over class=box></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // The overlap zone (y 50..100) paints `over` last: hit testing and
+        // hover both go to the visually topmost box (ADR 0010's contract).
+        view.pointer_move(vp, 50.0, 75.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(50, 75),
+            Some(Color::from_hex("#22c55e").unwrap()),
+            "the topmost painted box takes the hover"
+        );
+
+        // Above the overlap (y 0..50), only `under` is under the pointer.
+        view.pointer_move(vp, 50.0, 25.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(50, 25),
+            Some(Color::from_hex("#ef4444").unwrap()),
+            "the lower box hovers where it is visible"
+        );
+    }
+
+    #[test]
+    fn clipped_content_is_never_hovered() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             .pane { overflow: auto; width: 200px; height: 100px }\
+             .wide { width: 400px; height: 60px; background-color: #3b82f6 }\
+             .wide:hover { background-color: #ef4444 }\
+             </style></head><body>\
+             <div class=pane><div class=wide></div></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Inside the clip: hover applies.
+        view.pointer_move(vp, 100.0, 30.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(100, 30),
+            Some(Color::from_hex("#ef4444").unwrap())
+        );
+
+        // Outside the clip (x ≥ 200 is past the pane's edge): the wide
+        // child's raw geometry extends here, but it is clipped away —
+        // no hover, pixels unchanged.
+        view.pointer_move(vp, 250.0, 30.0);
+        let frame = view.render(vp).unwrap().frame;
+        assert_ne!(
+            frame.pixel(250, 30),
+            Some(Color::from_hex("#ef4444").unwrap()),
+            "clipped-away content must not match :hover"
+        );
+    }
+
+    #[test]
+    fn scrolling_under_a_stationary_pointer_moves_hover() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             section { width: 200px; height: 200px }\
+             #a { background-color: #3b82f6 }\
+             #a:hover { background-color: #ef4444 }\
+             #b { background-color: #111111 }\
+             #b:hover { background-color: #22c55e }\
+             </style></head><body>\
+             <section id=a></section>\
+             <section id=b></section>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        // Pointer parked at (50, 150) over #a.
+        view.pointer_move(vp, 50.0, 150.0);
+        view.render(vp).unwrap();
+        assert_eq!(
+            view.render(vp).unwrap().frame.pixel(50, 150),
+            Some(Color::from_hex("#ef4444").unwrap())
+        );
+
+        // Wheel down without moving the pointer: #b slides under it.
+        view.wheel(vp, 50.0, 150.0, 0.0, 100.0);
+        let events = view.take_events();
+        assert!(
+            events.contains(&Event::PointerLeave {
+                element: Some("a".into())
+            }),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&Event::PointerEnter {
+                element: Some("b".into())
+            }),
+            "{events:?}"
+        );
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(50, 150),
+            Some(Color::from_hex("#22c55e").unwrap()),
+            "the hover style follows the content under the pointer"
+        );
+        assert_eq!(
+            view.layout_stats().passes,
+            passes,
+            "scroll + hover never lay out"
+        );
+    }
+
+    #[test]
+    fn focus_paint_moves_with_tab_and_never_lays_out() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             .box { width: 100px; height: 100px; background-color: #3b82f6 }\
+             :focus { background-color: #ef4444 }\
+             </style></head><body>\
+             <div id=a class=box></div>\
+             <div id=b class=box></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        view.focus_next(); // → a
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(50, 50),
+            Some(Color::from_hex("#ef4444").unwrap())
+        );
+        assert_eq!(
+            frame.pixel(50, 150),
+            Some(Color::from_hex("#3b82f6").unwrap()),
+            "only the focused box paints the focus style"
+        );
+
+        view.focus_next(); // → b
+        let frame = view.render(vp).unwrap().frame;
+        assert_eq!(
+            frame.pixel(50, 150),
+            Some(Color::from_hex("#ef4444").unwrap())
+        );
+        assert_eq!(
+            frame.pixel(50, 50),
+            Some(Color::from_hex("#3b82f6").unwrap())
+        );
+        assert_eq!(view.layout_stats().passes, passes);
+    }
+
+    #[test]
+    fn layout_hover_deferred_with_deduped_diagnostics() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>             body { margin: 0 }\
+             .card { width: 100px; height: 100px; background-color: #3b82f6 }\
+             .card:hover { width: 500px; background-color: #ef4444 }\
+             </style></head><body>\
+             <div class=card data-vv-test=card></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(600, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        view.pointer_move(vp, 50.0, 50.0);
+        let frame = view.render(vp).unwrap().frame;
+        // The paint half of the rule applies...
+        assert_eq!(
+            frame.pixel(50, 50),
+            Some(Color::from_hex("#ef4444").unwrap())
+        );
+        // ...but the layout half is deferred: the card keeps its width.
+        assert_eq!(
+            frame.pixel(300, 50),
+            Some(Color::WHITE),
+            "the deferred width never changes layout truth"
+        );
+
+        let diagnostics = view.style_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "deduplicated: {diagnostics:?}");
+        assert!(diagnostics[0].contains("width"), "{diagnostics:?}");
+        assert!(diagnostics[0].contains("deferred"), "{diagnostics:?}");
+
+        // Facts stay untouched by the whole affair.
+        let facts = view.layout_facts(vp).unwrap();
+        let card = facts
+            .nodes
+            .iter()
+            .find(|n| n.fixture_id == "card")
+            .expect("card in facts");
+        assert_eq!(card.width, 100.0, "the deferred width never applies");
     }
 
     #[test]

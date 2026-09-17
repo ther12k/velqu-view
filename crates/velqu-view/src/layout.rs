@@ -417,6 +417,15 @@ pub(crate) fn clamp_scroll_offset(
 }
 
 /// Counts every box in the laid-out tree (instrumentation, ADR 0008).
+/// Finds the box for a DOM node in the laid-out tree (runtime state
+/// baking, ADR 0011).
+pub(crate) fn find_box(root: &BoxNode, node: NodeId) -> Option<&BoxNode> {
+    if root.node == node {
+        return Some(root);
+    }
+    root.children.iter().find_map(|child| find_box(child, node))
+}
+
 pub(crate) fn count_box_tree(root: &BoxNode) -> usize {
     let mut count = 1;
     for child in &root.children {
@@ -439,14 +448,7 @@ pub(crate) fn layout_document(
     scroll_offsets: &ScrollOffsets,
     interaction: Option<&crate::style::InteractionState>,
 ) -> Option<LaidOutDocument> {
-    // The layout root: <body> if present, else <html>, else the document.
-    let mut root_element = None;
-    dom.walk_from(dom.document(), |id, _node| {
-        if root_element.is_none() && dom.tag_name(id) == Some("body") {
-            root_element = Some(id);
-        }
-    });
-    let root_element = root_element.unwrap_or_else(|| dom.document());
+    let root_element = layout_root(dom);
 
     let styles = compute_all_styles(dom, root_element, cascade, interaction);
     let mut root = build_boxes(dom, root_element, &styles, images)?;
@@ -472,26 +474,71 @@ pub(crate) fn layout_document(
         (viewport.width() as f32, viewport.height() as f32),
     );
 
-    let mut list = DisplayList::default();
-    emit_display_list(&root, &mut list, viewport.scale_factor());
-    // The document-level scroller translates the whole frame; the viewport
-    // is its scrollport, so no root clip scope is needed.
-    if document_offset_clamped != (0.0, 0.0) {
-        list.items.insert(
-            0,
-            DisplayItem::PushTransform {
-                x: -document_offset_clamped.0,
-                y: -document_offset_clamped.1,
-            },
-        );
-        list.items.push(DisplayItem::PopTransform);
-    }
+    let list = build_display_list(&root, viewport.scale_factor(), document_offset_clamped);
     Some(LaidOutDocument {
         root,
         display_list: list,
         document_scroll,
         root_offset: document_offset_clamped,
     })
+}
+
+/// The layout root: `<body>` if present, else `<html>`, else the document
+/// node. Shared by the full pass and the presentation repaint (M4b).
+pub(crate) fn layout_root(dom: &Dom) -> NodeId {
+    let mut root_element = None;
+    dom.walk_from(dom.document(), |id, _node| {
+        if root_element.is_none() && dom.tag_name(id) == Some("body") {
+            root_element = Some(id);
+        }
+    });
+    root_element.unwrap_or_else(|| dom.document())
+}
+
+/// Emits the paint-ready display list from a laid-out root, wrapping it
+/// with the document-level transform when the page is scrolled (the
+/// viewport is the document scroller's scrollport, so no root clip scope).
+pub(crate) fn build_display_list(
+    root: &BoxNode,
+    scale: f32,
+    document_offset: (f32, f32),
+) -> DisplayList {
+    let mut list = DisplayList::default();
+    emit_display_list(root, &mut list, scale);
+    if document_offset != (0.0, 0.0) {
+        list.items.insert(
+            0,
+            DisplayItem::PushTransform {
+                x: -document_offset.0,
+                y: -document_offset.1,
+            },
+        );
+        list.items.push(DisplayItem::PopTransform);
+    }
+    list
+}
+
+/// Patches paint-only style state from freshly computed styles (M4b, ADR
+/// 0011): node styles and inline-run colors update in place; geometry
+/// (boxes, lines, words) is untouched, so no Taffy pass is needed. The
+/// freeze guarantees only paint fields can differ.
+pub(crate) fn patch_presentation_styles(root: &mut BoxNode, styles: &StyleMap) {
+    fn walk(node: &mut BoxNode, styles: &StyleMap) {
+        if let Some(fresh) = styles.get(&node.node) {
+            node.style = fresh.clone();
+            for line in &mut node.lines {
+                for run in &mut line.runs {
+                    if let Some(source_style) = styles.get(&run.source) {
+                        run.color = source_style.color;
+                    }
+                }
+            }
+        }
+        for child in &mut node.children {
+            walk(child, styles);
+        }
+    }
+    walk(root, styles)
 }
 
 /// Emits paint-ready items: backgrounds, borders, text, with
