@@ -55,12 +55,15 @@
 //!   edit the wrong control; the shell owns enablement via `wants_ime`
 //!   and `ime_cursor_rect`
 //!   ([ADR 0014](docs/decisions/0014-m4c3-ime.md)).
-//! * **M5 (in progress):** Velqu Reactive v0 — the bounded QuickJS
+//! * **M5 (done):** Velqu Reactive v0 — the bounded QuickJS
 //!   runtime, the vx-* binding compiler, atomic reactive turns, and
 //!   measured invalidation batching: a presentation-only turn costs zero
 //!   Taffy passes, a structural turn exactly one, and a no-op turn zero
 //!   repaints; a render nothing dirtied paints the cached display list
 //!   unchanged ([ADRs 0015–0018](docs/decisions/0018-m5d-invalidation-batching.md)).
+//!   The counter/forms/tabs examples run reactive with Tailwind
+//!   (`velqu-lab --tailwind --reactive`) and their conformance is
+//!   test-pinned.
 //!
 //! # Example
 //!
@@ -1677,15 +1680,30 @@ impl VelquView {
             .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
             .map(|node| node.node);
         if Some(pressed) == released {
-            self.events.push(Event::Click {
-                target: self.node_target(pressed),
-            });
-            if self.node_element_id(pressed).is_some() {
-                self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
+            // HTML semantics: disabled elements do not activate — no
+            // click, no focus transfer (controls track runtime state;
+            // other elements, e.g. `<button disabled>`, the attribute).
+            if !self.node_is_disabled(pressed) {
+                self.events.push(Event::Click {
+                    target: self.node_target(pressed),
+                });
+                if self.node_element_id(pressed).is_some() {
+                    self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
+                }
             }
             return true;
         }
         false
+    }
+
+    /// Whether `node` is disabled: runtime control state (`<input>`/
+    /// `<textarea>`, M4c1) or the HTML attribute (any element — the
+    /// `:disabled` mutation's non-control route).
+    fn node_is_disabled(&self, node: dom::NodeId) -> bool {
+        if self.controls.get(&node).is_some_and(|state| state.disabled) {
+            return true;
+        }
+        self.dom.attribute(node, "disabled").is_some()
     }
 
     /// Focuses an enabled control, places the caret under the press point,
@@ -1872,11 +1890,7 @@ impl VelquView {
             };
             let has_id = attrs.iter().any(|attribute| attribute.name == "id");
             let is_control = self.controls.contains_key(&id);
-            let disabled = self
-                .controls
-                .get(&id)
-                .is_some_and(|control| control.disabled);
-            if (has_id || is_control) && !disabled {
+            if (has_id || is_control) && !self.node_is_disabled(id) {
                 nodes.push(id);
             }
         });
@@ -1906,11 +1920,7 @@ impl VelquView {
         if self.ime_session.is_some() && to != self.focus {
             self.ime_cancel();
         }
-        if to.is_some_and(|node| {
-            self.controls
-                .get(&node)
-                .is_some_and(|control| control.disabled)
-        }) {
+        if to.is_some_and(|node| self.node_is_disabled(node)) {
             return;
         }
         if to == self.focus {
@@ -2355,6 +2365,12 @@ impl VelquView {
     /// synthesize a user `ValueChanged` (no feedback loops). Events
     /// still reach the host through [`VelquView::take_events`].
     /// Documents without reactive markup pump as a no-op.
+    ///
+    /// The pump reads the queue but does not consume it — hosts that
+    /// want the event record drain **after** pumping (the test
+    /// ordering). Hosts that don't observe events must drain too:
+    /// undrained turn-driving events would map to fresh turns on every
+    /// later pump (the shell drains in its redraw).
     pub fn pump_reactive(&mut self) {
         let Some(state) = self.reactive.take() else {
             return;
@@ -2569,9 +2585,11 @@ impl VelquView {
                 return false;
             }
             match &mutation.kind {
-                MutationKind::SetControlValue(_) | MutationKind::SetControlDisabled(_) => {
-                    self.controls.contains_key(&node)
-                }
+                MutationKind::SetControlValue(_) => self.controls.contains_key(&node),
+                // `:disabled` may target controls (runtime state) or any
+                // element (the DOM attribute — buttons; the frozen M5b
+                // surface compiles it).
+                MutationKind::SetControlDisabled(_) => true,
                 MutationKind::SetControlChecked(_) => false, // outside the M4c1 profile
                 _ => true,
             }
@@ -2634,8 +2652,24 @@ impl VelquView {
                 MutationKind::SetControlDisabled(disabled) => {
                     if let Some(state) = self.controls.get_mut(&node) {
                         state.disabled = *disabled;
+                        presentation = true;
+                    } else {
+                        // Non-control targets (e.g. `<button>`): the HTML
+                        // attribute carries the semantics — click and
+                        // focus suppression read it back, and the
+                        // presence flip is a structural restyle.
+                        if *disabled {
+                            if self
+                                .dom
+                                .set_attribute(node, "disabled", String::new())
+                                .is_none()
+                            {
+                                structural = true;
+                            }
+                        } else if self.dom.remove_attribute(node, "disabled").is_some() {
+                            structural = true;
+                        }
                     }
-                    presentation = true;
                 }
                 MutationKind::SetControlChecked(_) => {
                     // Rejected by mutations_valid; unreachable.
@@ -5656,6 +5690,57 @@ mod tests {
         assert_eq!(
             view.reactive_state().map(|s| s.get_path("count")),
             Some(velqu_reactive::ReactiveValue::Number(2.0))
+        );
+    }
+
+    /// `:disabled` on a non-control element (the frozen M5b surface
+    /// compiles it for buttons): the mutation lands as the HTML
+    /// attribute, a disabled button neither clicks nor focuses, and the
+    /// attribute clears when the binding flips back.
+    #[test]
+    fn m5_disabled_buttons_do_not_activate() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ n: 0 }\">\
+             <button id=go @click=\"n = n + 1\" :disabled=\"n > 0\">go</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(); // turn zero: n = 0, enabled
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+
+        // Enabled: the click runs the handler; n = 1 disables the button.
+        click_element(&mut view, vp, "go");
+        view.pump_reactive();
+        let _ = view.take_events(); // drain: undrained turns would re-run
+        view.render(vp).unwrap(); // structural turn: rebuild for the next hit test
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("n")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+
+        // Disabled via the binding: the press/release pair produces no
+        // Click event, no new focus transfer, and no state change (the
+        // focus from the first, enabled click legitimately persists).
+        click_element(&mut view, vp, "go");
+        view.pump_reactive();
+        let events = view.take_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Click { .. } | Event::FocusChanged { .. })),
+            "no click or focus transfer from a disabled button: {events:?}"
+        );
+        assert_eq!(view.focused(), Some("go"));
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("n")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
         );
     }
 

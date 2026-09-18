@@ -70,7 +70,11 @@ structural turn → exactly one pass, no-op turn → zero repaints;
 `presentation_dirty` gating plus a precise interaction-paint probe —
 ADR 0018, done).
 
-Exit: counter/forms/tabs examples pass reactive conformance.
+Exit: counter/forms/tabs examples pass reactive conformance — **met**:
+`velqu-lab --tailwind --reactive examples/<name>` runs all three, and
+`crates/velqu-view/tests/reactive_examples.rs` drives the exact files
+end-to-end (events → turns → state, facts, and raster digests); see
+`docs/evidence/m5-conformance.md`.
 
 ## M6 - VelquView Lab
 

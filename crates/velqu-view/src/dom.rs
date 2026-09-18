@@ -252,6 +252,19 @@ impl Dom {
         }
     }
 
+    /// Removes one attribute from an element. Returns the previous value
+    /// when it existed (a `SetControlDisabled(false)` on a non-control
+    /// target drops the boolean attribute entirely).
+    pub(crate) fn remove_attribute(&mut self, node: NodeId, name: &str) -> Option<String> {
+        let NodeData::Element { attrs, .. } = &mut self.nodes[node].data else {
+            return None;
+        };
+        attrs
+            .iter()
+            .position(|attr| attr.name == name)
+            .map(|index| attrs.remove(index).value)
+    }
+
     // -- construction (used by the html5ever sink) ------------------------
 
     /// Allocates a detached node (no parent, no children).

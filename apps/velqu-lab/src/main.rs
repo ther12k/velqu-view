@@ -28,6 +28,7 @@ struct Args {
     frames: u32,
     exit_after: Option<Duration>,
     tailwind: bool,
+    reactive: bool,
 }
 
 const USAGE: &str = "\
@@ -42,6 +43,8 @@ ARGS:
 OPTIONS:
     --headless         Render offscreen; no window (fixtures, CI)
     --tailwind         Compile Tailwind utility classes into CSS (ADR 0009)
+    --reactive         Enable Velqu Reactive: compile vx-* markup into the
+                       bounded execution plan and drive reactive turns (ADR 0016/0017)
     --size WxH         Logical viewport size (default 1024x640)
     --scale F          DPI scale factor (default 1.0)
     --frames N         Headless: render N frames and verify determinism (default 1)
@@ -60,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
         frames: 1,
         exit_after: None,
         tailwind: false,
+        reactive: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut argv = std::env::args().skip(1);
@@ -72,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
             "--headless" => args.headless = true,
             "--window" => args.headless = false,
             "--tailwind" => args.tailwind = true,
+            "--reactive" => args.reactive = true,
             "--size" => {
                 let value = argv.next().ok_or("--size requires WxH")?;
                 args.size = parse_size(&value)?;
@@ -201,6 +206,11 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
     let mut durations: Vec<Duration> = Vec::new();
     let mut first: Option<velqu_view::FrameResult> = None;
     for _ in 0..args.frames {
+        // One pump per frame, mirroring the shell's redraw order (M5c):
+        // turn-zero mutations land before the first render, and the
+        // queue drains with the pump so frames never re-run turns.
+        view.pump_reactive();
+        let _ = view.take_events();
         let started = Instant::now();
         let result = view.render(viewport).map_err(|e| e.to_string())?;
         durations.push(started.elapsed());
@@ -241,6 +251,22 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
             for message in diagnostics {
                 println!("tailwind diagnostic: {message}");
             }
+        }
+    }
+    if view.reactive_enabled() {
+        match view.reactive_plan() {
+            Some(plan) => {
+                println!(
+                    "reactive: {} scope(s), {} binding(s), {} handler(s)",
+                    plan.scopes.len(),
+                    plan.bindings.len(),
+                    plan.events.len()
+                );
+                for message in view.reactive_diagnostics() {
+                    println!("reactive diagnostic: {message}");
+                }
+            }
+            None => println!("reactive: no vx-* markup in this document"),
         }
     }
     println!("sha256: {}", hashes[0]);
@@ -300,6 +326,9 @@ fn main() -> ExitCode {
     let mut view = VelquView::new();
     if args.tailwind {
         view.enable_tailwind();
+    }
+    if args.reactive {
+        view.enable_reactive();
     }
     if let Err(message) = load_app(&mut view, &args.app_dir) {
         eprintln!("velqu-lab: {message}");

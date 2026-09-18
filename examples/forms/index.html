@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Velqu Reactive Forms</title>
+</head>
+<body class="bg-zinc-950 p-8 text-zinc-100">
+  <main
+    vx-state="{ name: '', email: '', submitted: false }"
+    class="max-w-md rounded-xl border border-zinc-800 p-6"
+  >
+    <h1 class="text-xl font-semibold">Sign up</h1>
+
+    <label class="mt-6 block text-sm text-zinc-400" for="name">Name</label>
+    <input
+      id="name"
+      vx-model="name"
+      class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2"
+    >
+
+    <label class="mt-4 block text-sm text-zinc-400" for="email">Email</label>
+    <input
+      id="email"
+      vx-model="email"
+      class="mt-2 w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2"
+    >
+
+    <p data-vv-test="greeting" class="mt-4 text-sm text-zinc-400" vx-text="name ? 'Hello, ' + name : 'Hello, stranger'"></p>
+    <p data-vv-test="count" class="text-sm text-zinc-500" vx-text="name.length + ' character(s) typed'"></p>
+
+    <button
+      id="submit"
+      @click="submitted = true"
+      :disabled="!name || !email"
+      :class="name.length + email.length > 0 ? 'mt-6 w-full rounded-md bg-blue-600 px-3 py-2 font-medium' : 'mt-6 w-full rounded-md bg-zinc-700 px-3 py-2 font-medium text-zinc-400'"
+    >
+      Create account
+    </button>
+
+    <p data-vv-test="done" class="mt-4 text-sm text-emerald-400" vx-show="submitted" vx-text="'Signed up: ' + email"></p>
+  </main>
+</body>
+</html>

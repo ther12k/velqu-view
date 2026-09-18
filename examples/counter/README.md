@@ -3,10 +3,11 @@
 The Velqu Reactive v0 example, transcribed from the OKF spec
 (`examples` → counter in the bundle; `docs/okf/`).
 
-Status: **not yet interactive**. The `vx-*` / `@click` markup is the frozen
-v0 surface (see `crates/velqu-reactive`), but the reactive runtime and the
-HTML renderer land in M5 and M2 respectively. Until then `velqu-lab` loads
-this directory and renders the M1 probe scene.
+Interactive since M5c/M5d: `velqu-lab --tailwind --reactive
+examples/counter` opens a window where the buttons drive bounded
+reactive turns (state + UI commit atomically; each structural turn
+costs exactly one layout pass). The `vx-*` / `@click` surface is the
+frozen v0 directive set (see `crates/velqu-reactive`, ADR 0016/0017).
 
-This file exists now so the reactive conformance suite has its target app
-from day one.
+Conformance is pinned by `crates/velqu-view/tests/reactive_examples.rs`
+(this document, event-driven, digest-checked).
