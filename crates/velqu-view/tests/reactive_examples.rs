@@ -38,7 +38,7 @@ fn load_example(app: &str) -> VelquView {
 /// every scenario starts from.
 fn settle(view: &mut VelquView, vp: Viewport) {
     view.render(vp).unwrap();
-    view.pump_reactive();
+    view.pump_reactive(&[]);
     view.render(vp).unwrap();
     let _ = view.take_events();
 }
@@ -64,8 +64,8 @@ fn click_element(view: &mut VelquView, vp: Viewport, id: &str) {
     let (x, y) = found.unwrap_or_else(|| panic!("no hit target for {id}"));
     view.pointer_press(vp, x, y);
     view.pointer_release(vp, x, y);
-    view.pump_reactive();
-    let _ = view.take_events();
+    let events = view.take_events();
+    view.pump_reactive(&events);
     view.render(vp).unwrap();
 }
 
@@ -75,8 +75,8 @@ fn type_into(view: &mut VelquView, vp: Viewport, id: &str, text: &str) {
     view.set_focus(Some(id));
     for character in text.chars() {
         view.insert_text(&character.to_string());
-        view.pump_reactive();
-        let _ = view.take_events();
+        let events = view.take_events();
+        view.pump_reactive(&events);
         view.render(vp).unwrap();
     }
 }

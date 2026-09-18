@@ -207,10 +207,12 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
     let mut first: Option<velqu_view::FrameResult> = None;
     for _ in 0..args.frames {
         // One pump per frame, mirroring the shell's redraw order (M5c):
-        // turn-zero mutations land before the first render, and the
-        // queue drains with the pump so frames never re-run turns.
-        view.pump_reactive();
-        let _ = view.take_events();
+        // drain the queue into a batch, pump the batch (M6a ownership,
+        // ADR 0019), then render. Turn-zero mutations land before the
+        // first render; drained batches are not re-observed here.
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        drop(batch);
         let started = Instant::now();
         let result = view.render(viewport).map_err(|e| e.to_string())?;
         durations.push(started.elapsed());

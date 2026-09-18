@@ -80,6 +80,37 @@ end-to-end (events → turns → state, facts, and raster digests); see
 
 Local app runner, reload, inspector, diagnostics.
 
+Executed in slices (reviewer-directed): **M6a.1 event ownership**
+(`pump_reactive` takes a caller-owned batch, never the queue; replay
+is explicit; turn-generated events wait for the next drain — ADR 0019,
+done); **M6a inspector** — Rust-owned snapshot outside the rendered
+document (generation, sources, plan summary, selected element's
+attrs/computed style/box geometry, diagnostics, an event→turn→
+mutations→invalidation trace with monotonic trace ids and bounded
+retention, performance counters, and a "why did layout happen"
+invalidation panel); **M6b transactional hot reload** — candidate
+builds fully (parse/compile/runtime/initial validation) before an
+atomic generation swap; failures keep the old document running with
+diagnostics; CSS-only reload upserts the sheet and preserves reactive
+state/focus/control values/scroll (no generation reset), while
+HTML/reactive reload starts a fresh generation; **M6c file watching**
+— parent-directory watching (editor temp-file renames), debounced and
+coalesced, content-hash suppressed (unchanged bytes → no reload).
+
+Acceptance gate: malformed reload leaves the previous valid UI
+running; fixed file swaps atomically; CSS-only reload preserves JS
+state, input value, scroll, and focus; HTML reload starts a fresh
+generation with stale handles/jobs rejected; five notifications for
+one save → at most one reload; unchanged content → no reload;
+temp-file rename detected; traces deterministic with bounded
+retention; inspector observation itself causes zero layout/repaint;
+reload diagnostics identify source/subsystem; reload during active
+IME cancels the old composition through existing generation
+semantics; M5 conformance digests unchanged without reload. End-to-end
+probe: counter at 7 → CSS color edit → still 7, new color, zero
+generation resets; then HTML edit → new generation, state resets per
+source, old handles rejected.
+
 Exit: layout/state failures can be diagnosed without browser tooling.
 
 ## M7 - Real Dashboard
