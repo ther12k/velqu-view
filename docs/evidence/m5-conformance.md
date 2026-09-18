@@ -69,3 +69,7 @@ redraw order the shell uses.
   `cargo +1.87.0 check --workspace --all-targets --locked`; headless
   smokes: all three examples render deterministically with reactive
   enabled; dashboard digest unchanged (`770b933b…`).
+
+Landing: `27db6c0` pushed to `main`; GitHub CI green — run
+[35378279214](https://github.com/ther12k/velqu-view/actions/runs/35378279214)
+(fmt/clippy/test/build + MSRV 1.87, both jobs).
