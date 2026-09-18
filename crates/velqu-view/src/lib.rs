@@ -100,6 +100,7 @@ mod font;
 mod html;
 mod image;
 mod input;
+mod inspect;
 mod keyboard;
 mod layout;
 mod painter;
@@ -119,6 +120,11 @@ pub use color::{Color, ColorParseError};
 pub use control::{ControlFact, ControlFacts, ControlKind, ControlRect};
 pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
 pub use input::{ElementHandle, ElementTarget, Event, FocusOrigin, HitTarget, ScrollTarget};
+pub use inspect::{
+    DiagnosticEntry, ElementInspection, InspectorCounters, InspectorLimits, InspectorSnapshot,
+    InvalidationClass, InvalidationRecord, LayoutCacheState, PendingCauses, RenderRecord,
+    TraceRecord, TraceRecordKind, TraceSummary, TurnOutcomeRecord, TurnRecord,
+};
 pub use keyboard::{KeyCommand, KeyModifiers};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
 pub use source::{
@@ -470,6 +476,24 @@ pub struct VelquView {
     pressed: Option<dom::NodeId>,
     /// Interaction events since the last [`VelquView::take_events`].
     events: Vec<Event>,
+    // -- inspector (M6a, ADR 0020) ------------------------------------
+    /// The bounded trace store; `None` = capture disabled (every
+    /// recording hook no-ops, cause strings are never formatted).
+    inspector: Option<inspect::Trace>,
+    /// Committed reactive turns for the current generation.
+    state_revision: u64,
+    /// Completed layout passes for the current generation.
+    layout_revision: u64,
+    /// Reactive turn attempts, committed or not (cheap; kept always).
+    reactive_turns: u64,
+    /// Display items in the last completed render.
+    display_items_last: usize,
+    /// Bounded invalidation-cause stacks, drained by the render that
+    /// settles them (the "why did layout happen" panel's input).
+    structural_causes: Vec<String>,
+    presentation_causes: Vec<String>,
+    structural_causes_dropped: usize,
+    presentation_causes_dropped: usize,
 }
 
 impl Default for VelquView {
@@ -543,6 +567,15 @@ impl VelquView {
             focus_origin: None,
             pressed: None,
             events: Vec::new(),
+            inspector: None,
+            state_revision: 0,
+            layout_revision: 0,
+            reactive_turns: 0,
+            display_items_last: 0,
+            structural_causes: Vec::new(),
+            presentation_causes: Vec::new(),
+            structural_causes_dropped: 0,
+            presentation_causes_dropped: 0,
         }
     }
 
@@ -606,6 +639,7 @@ impl VelquView {
         self.rebuild_tailwind();
         // Enabling injects a utility sheet into the cascade: restyle.
         self.mark_structure_dirty();
+        self.note_structural_cause("utility sheet");
     }
 
     /// Whether the Tailwind utility pipeline is enabled.
@@ -912,6 +946,15 @@ impl VelquView {
         self.last_viewport = None;
         self.mark_structure_dirty();
         self.presentation_dirty = false;
+        // The inspector trace survives generations (records carry
+        // theirs); per-generation revisions and pending causes reset.
+        self.state_revision = 0;
+        self.layout_revision = 0;
+        self.structural_causes.clear();
+        self.presentation_causes.clear();
+        self.structural_causes_dropped = 0;
+        self.presentation_causes_dropped = 0;
+        self.note_structural_cause("document load");
         self.pointer_pos = None;
         self.pointer_capture = None;
         self.pointer_anchor = None;
@@ -979,6 +1022,7 @@ impl VelquView {
                 kind: SourceKind::Css,
             });
         }
+        let sheet_id = source.id.to_string();
         match self
             .stylesheets
             .iter_mut()
@@ -992,6 +1036,9 @@ impl VelquView {
         // paint: the next render runs a full pass (M5d — previously this
         // only worked because steady-state renders always repainted).
         self.mark_structure_dirty();
+        if self.recording() {
+            self.note_structural_cause(&format!("stylesheet {sheet_id}"));
+        }
         Ok(())
     }
 
@@ -1096,22 +1143,51 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
+        let passes_before = self.layout_passes;
+        let repaints_before = self.repaint_passes;
+        let mut settled: Vec<u64> = Vec::new();
         if self.structure_dirty || self.cached_layout(viewport).is_none() {
             // Structural change or new viewport: full layout. The current
             // interaction state feeds stateful selectors so pixels are
             // correct after resize/restyle too (M4b).
+            let mut causes = std::mem::take(&mut self.structural_causes);
+            let dropped = self.structural_causes_dropped;
+            self.structural_causes_dropped = 0;
+            if self.cached_layout(viewport).is_none() {
+                causes.push("viewport".to_owned());
+            }
             let interaction = self.interaction_state();
             self.run_layout(viewport, &mut cascade, Some(&interaction));
+            self.layout_revision += 1;
+            if let Some(seq) =
+                self.trace_invalidation(InvalidationClass::Structural, causes, dropped)
+            {
+                settled.push(seq);
+            }
             self.structure_dirty = false;
         } else if self.presentation_dirty {
             // Steady state with a presentation-only change. Recompute
             // styles with the current interaction state, patch the cached
             // tree, re-emit — no Taffy pass (ADR 0011).
+            let causes = std::mem::take(&mut self.presentation_causes);
+            let dropped = self.presentation_causes_dropped;
+            self.presentation_causes_dropped = 0;
             self.repaint_presentation(viewport, &mut cascade);
+            if let Some(seq) =
+                self.trace_invalidation(InvalidationClass::Presentation, causes, dropped)
+            {
+                settled.push(seq);
+            }
         }
         // Otherwise nothing changed since the last emitted frame: paint
         // the cached display list unchanged — zero Taffy passes, zero
         // repaint accounting (M5d, ADR 0018).
+        self.trace_render(
+            self.frame_index,
+            self.layout_passes - passes_before,
+            self.repaint_passes - repaints_before,
+            settled,
+        );
         self.record_style_diagnostics(&cascade);
         if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
@@ -1123,6 +1199,7 @@ impl VelquView {
                 viewport,
                 &mut self.fonts,
             )?;
+            self.display_items_last = items;
             return Ok(FrameResult {
                 frame,
                 stats: RenderStats {
@@ -1140,6 +1217,7 @@ impl VelquView {
         let display_list = &self.last_laid.as_ref().expect("checked above").display_list;
         let (frame, items, glyphs) =
             painter::paint_document(display_list, background, viewport, &mut self.fonts)?;
+        self.display_items_last = items;
         Ok(FrameResult {
             frame,
             stats: RenderStats {
@@ -1433,6 +1511,7 @@ impl VelquView {
             // The applied offset changes the frame's pixels: the next
             // render re-emits from the baked tree (presentation-only).
             self.presentation_dirty = true;
+            self.note_presentation_cause("scroll");
         }
         // Bake the clamped offset into the cached tree (mirroring what the
         // next layout's apply stage computes from the raw request), so hit
@@ -1579,6 +1658,7 @@ impl VelquView {
         if self.interaction_paint() {
             self.presentation_dirty = true;
         }
+        self.note_presentation_cause("hover");
     }
 
     /// Builds the opaque public handle for a current-document DOM node.
@@ -1656,6 +1736,9 @@ impl VelquView {
             // on it (a control press dirties via its caret placement).
             self.presentation_dirty = true;
         }
+        if changed {
+            self.note_presentation_cause("active");
+        }
         changed
     }
 
@@ -1673,6 +1756,7 @@ impl VelquView {
         if self.interaction_paint() {
             self.presentation_dirty = true;
         }
+        self.note_presentation_cause("active");
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
         let released = self
@@ -1728,6 +1812,7 @@ impl VelquView {
             focus: offset,
         });
         self.rebuild_control_presentation();
+        self.note_presentation_cause("selection");
     }
 
     /// Extends the captured control's selection to the pointer position.
@@ -1756,6 +1841,7 @@ impl VelquView {
             focus: offset,
         });
         self.rebuild_control_presentation();
+        self.note_presentation_cause("selection");
         true
     }
 
@@ -1849,6 +1935,7 @@ impl VelquView {
             }
         }
         self.presentation_dirty = true;
+        self.note_presentation_cause("scroll");
         self.events.push(Event::Scrolled {
             target: match result.node {
                 None => ScrollTarget::Document,
@@ -1940,6 +2027,7 @@ impl VelquView {
         if caret_moves || self.interaction_paint() {
             self.presentation_dirty = true;
         }
+        self.note_presentation_cause("focus");
         self.events.push(Event::FocusChanged {
             from,
             to: to.map(|node| self.node_target(node)),
@@ -2164,6 +2252,7 @@ impl VelquView {
         if text.is_empty() {
             if state.composition.take().is_some() {
                 self.rebuild_control_presentation();
+                self.note_presentation_cause("ime");
                 return true;
             }
             return false;
@@ -2183,6 +2272,7 @@ impl VelquView {
             range,
         ));
         self.rebuild_control_presentation();
+        self.note_presentation_cause("ime");
         true
     }
 
@@ -2253,6 +2343,7 @@ impl VelquView {
         }
         if changed {
             self.rebuild_control_presentation();
+            self.note_presentation_cause("ime");
         }
         changed
     }
@@ -2296,6 +2387,7 @@ impl VelquView {
             // Editor paint (value/selection/caret/scroll) is presentation:
             // rebuilt from the cached outer box, never a Taffy pass.
             self.rebuild_control_presentation();
+            self.note_presentation_cause("control edit");
         }
         value_changed || selection_changed
     }
@@ -2418,6 +2510,7 @@ impl VelquView {
         // of `state` per event: preparing a turn needs &mut self (DOM
         // reads) alongside &mut machine.
         for event in events {
+            let trigger = self.trace_event(event);
             let flow = match machine_slot.take() {
                 Some(mut machine) => {
                     let flow = self.prepare_turn_for(plan, &mut machine, event);
@@ -2428,17 +2521,61 @@ impl VelquView {
             };
             match flow {
                 TurnFlow::Nothing => {}
+                TurnFlow::Failed => {
+                    // The turn rolled back (diagnostic already recorded):
+                    // the trace shows the attempt with zero committed work.
+                    self.reactive_turns += 1;
+                    self.trace_turn(
+                        trigger,
+                        0,
+                        &[],
+                        TurnOutcomeRecord::RolledBack,
+                        self.state_revision,
+                        std::time::Duration::ZERO,
+                    );
+                }
                 TurnFlow::Prepared(pending) => {
+                    let started = std::time::Instant::now();
+                    let revision_before = self.state_revision;
+                    let attempted = pending.mutations.len();
+                    let kinds: Vec<&'static str> = pending
+                        .mutations
+                        .iter()
+                        .map(|mutation| mutation_kind_label(&mutation.kind))
+                        .collect();
                     if let Some(machine) = machine_slot.as_mut() {
                         if !self.mutations_valid(plan, &pending.mutations) {
                             machine.record_host_diagnostic(
                                 "mutation batch rejected: a target failed validation",
+                            );
+                            self.reactive_turns += 1;
+                            let elapsed = started.elapsed();
+                            self.trace_turn(
+                                trigger,
+                                attempted,
+                                &kinds,
+                                TurnOutcomeRecord::Rejected,
+                                revision_before,
+                                elapsed,
                             );
                             continue;
                         }
                         let mutations = pending.mutations.clone();
                         machine.commit(pending);
                         self.apply_mutations(plan, &mutations);
+                        self.state_revision += 1;
+                        self.reactive_turns += 1;
+                        let elapsed = started.elapsed();
+                        self.trace_turn(
+                            trigger,
+                            attempted,
+                            &kinds,
+                            TurnOutcomeRecord::Committed {
+                                count: mutations.len(),
+                            },
+                            revision_before,
+                            elapsed,
+                        );
                     }
                 }
                 TurnFlow::NeedsReload => break,
@@ -2456,6 +2593,321 @@ impl VelquView {
     pub fn pump_reactive_queued(&mut self) {
         let batch = self.take_events();
         self.pump_reactive(&batch);
+    }
+
+    // -- inspector (M6a, ADR 0020) ----------------------------------------
+
+    /// Enables trace capture. Detailed records (events, turn attempts,
+    /// invalidation causes, render outcomes) accrue from this point;
+    /// cheap counters were running regardless. Capture has no semantic
+    /// side effects: it never pumps, drains, renders, or advances the
+    /// JS logical clock, and disabled capture never formats payloads
+    /// just to discard them.
+    pub fn enable_inspector(&mut self) {
+        if self.inspector.is_none() {
+            self.inspector = Some(inspect::Trace::new(InspectorLimits::default()));
+        }
+    }
+
+    /// Whether trace capture is enabled.
+    pub fn inspector_enabled(&self) -> bool {
+        self.inspector.is_some()
+    }
+
+    /// Replaces the retention/capture limits (applies immediately;
+    /// existing records over the new bounds evict oldest-first).
+    pub fn set_inspector_limits(&mut self, limits: InspectorLimits) {
+        match &mut self.inspector {
+            Some(trace) => trace.set_limits(limits),
+            None => {
+                let mut trace = inspect::Trace::new(limits);
+                trace.clear();
+                self.inspector = Some(trace);
+            }
+        }
+    }
+
+    /// The retained trace records, oldest first. IDs are monotonic and
+    /// never renumber; evictions are visible as gaps (see
+    /// [`VelquView::inspector_trace_summary`]).
+    pub fn inspector_records(&self) -> Vec<TraceRecord> {
+        self.inspector
+            .as_ref()
+            .map(|trace| trace.records().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Retention state of the trace window.
+    pub fn inspector_trace_summary(&self) -> TraceSummary {
+        self.inspector
+            .as_ref()
+            .map_or_else(TraceSummary::default, inspect::Trace::summary)
+    }
+
+    /// The observational snapshot (M6a, ADR 0020): reads cached results
+    /// only — it never pumps, drains, renders, lays out, or touches the
+    /// JS runtime. With no cached layout it reports
+    /// [`LayoutCacheState::NotAvailable`] instead of building one; a
+    /// cached layout for a different viewport reports `Stale`.
+    /// Intermediate coherence states (state newer than geometry,
+    /// presentation awaiting redraw) are exposed, not hidden by
+    /// triggering a render.
+    pub fn inspector_snapshot(
+        &self,
+        viewport: Viewport,
+        selection: Option<ElementHandle>,
+    ) -> InspectorSnapshot {
+        let layout = match self.last_viewport {
+            None => inspect::LayoutCacheState::NotAvailable,
+            Some(cached) => {
+                if cached.width() == viewport.width()
+                    && cached.height() == viewport.height()
+                    && cached.scale_factor() == viewport.scale_factor()
+                {
+                    inspect::LayoutCacheState::Fresh
+                } else {
+                    inspect::LayoutCacheState::Stale
+                }
+            }
+        };
+        let mut selected = None;
+        let mut selection_note = None;
+        if let Some(handle) = selection {
+            if handle.generation() != self.document_generation {
+                selection_note = Some("the selection belongs to an older generation");
+            } else if self.last_laid.is_none() {
+                selection_note = Some("no cached layout for this generation yet");
+            } else {
+                selected = self
+                    .resolve_handle(handle)
+                    .and_then(|node| self.inspect_element(node));
+                if selected.is_none() {
+                    selection_note = Some("the selection did not resolve to an element");
+                }
+            }
+        }
+        let counters = InspectorCounters {
+            layout_passes: self.layout_passes,
+            repaints: self.repaint_passes,
+            reactive_turns: self.reactive_turns,
+            display_items_last: self.display_items_last,
+        };
+        InspectorSnapshot {
+            generation: self.document_generation,
+            state_revision: self.state_revision,
+            layout_revision: self.layout_revision,
+            frame_index: self.frame_index,
+            layout,
+            awaiting_relayout: self.structure_dirty,
+            awaiting_repaint: self.presentation_dirty,
+            pending: inspect::PendingCauses {
+                structural: self.structural_causes.clone(),
+                presentation: self.presentation_causes.clone(),
+            },
+            counters,
+            diagnostics: self.inspector_diagnostics(),
+            selected,
+            selection_note,
+        }
+    }
+
+    /// Normalized diagnostics from every subsystem, tagged by origin.
+    fn inspector_diagnostics(&self) -> Vec<inspect::DiagnosticEntry> {
+        let mut entries = Vec::new();
+        for message in &self.style_diagnostics_list {
+            entries.push(inspect::DiagnosticEntry {
+                subsystem: "css",
+                message: message.clone(),
+            });
+        }
+        for message in &self.tailwind_diagnostics_list {
+            entries.push(inspect::DiagnosticEntry {
+                subsystem: "tailwind",
+                message: message.clone(),
+            });
+        }
+        for message in &self.image_diagnostics {
+            entries.push(inspect::DiagnosticEntry {
+                subsystem: "image",
+                message: message.clone(),
+            });
+        }
+        for message in &self.control_diagnostics_list {
+            entries.push(inspect::DiagnosticEntry {
+                subsystem: "control",
+                message: message.clone(),
+            });
+        }
+        for message in self.reactive_diagnostics() {
+            entries.push(inspect::DiagnosticEntry {
+                subsystem: "reactive",
+                message,
+            });
+        }
+        entries
+    }
+
+    /// Reads one element's cached inspection (no recompute): the box as
+    /// laid out, the effective (interaction-patched) style as of the
+    /// last paint, and the interaction flags **now**.
+    fn inspect_element(&self, node: dom::NodeId) -> Option<ElementInspection> {
+        let laid = self.last_laid.as_ref()?;
+        let found = find_box_node(&laid.root, node)?;
+        Some(ElementInspection {
+            generation: self.document_generation,
+            tag: found.tag.clone(),
+            id: found.element_id.clone(),
+            fixture_id: found.fixture_id.clone(),
+            display: format!("{:?}", found.style.display),
+            background_color: found.style.background_color,
+            color: found.style.color,
+            font_size: found.style.font_size,
+            font_weight: found.style.font_weight,
+            border_box: (
+                found.border_box.x,
+                found.border_box.y,
+                found.border_box.w,
+                found.border_box.h,
+            ),
+            content_box: (
+                found.content.x,
+                found.content.y,
+                found.content.w,
+                found.content.h,
+            ),
+            hovered: self.hover == Some(node),
+            focused: self.focus == Some(node),
+            active: self.pressed == Some(node),
+            control: found.control.map(control_label),
+            value_len: found
+                .control
+                .and_then(|_| self.controls.get(&node))
+                .map(|state| state.value().len()),
+        })
+    }
+
+    /// Whether detailed capture is on (cause formatting etc.).
+    fn recording(&self) -> bool {
+        self.inspector.is_some()
+    }
+
+    /// Notes a structural invalidation cause (bounded; dropped causes
+    /// are counted, never silently lost).
+    fn note_structural_cause(&mut self, cause: &str) {
+        if !self.recording() {
+            return;
+        }
+        if self.structural_causes.len() >= MAX_INVALIDATION_CAUSES {
+            self.structural_causes_dropped += 1;
+        } else {
+            self.structural_causes.push(cause.to_owned());
+        }
+    }
+
+    /// Notes a presentation invalidation cause (bounded).
+    fn note_presentation_cause(&mut self, cause: &str) {
+        if !self.recording() {
+            return;
+        }
+        if self.presentation_causes.len() >= MAX_INVALIDATION_CAUSES {
+            self.presentation_causes_dropped += 1;
+        } else {
+            self.presentation_causes.push(cause.to_owned());
+        }
+    }
+
+    /// Records one observed event from a pumped batch. Returns the
+    /// record's seq for turn triggering links.
+    fn trace_event(&mut self, event: &Event) -> Option<u64> {
+        let trace = self.inspector.as_mut()?;
+        let (kind, event_generation, target_id, value_len, value) = event_trace_metadata(event);
+        let value_preview = value.filter(|_| trace.limits().capture_values);
+        Some(
+            trace.push(inspect::TraceRecordKind::Event(inspect::EventRecord {
+                generation: self.document_generation,
+                event_generation,
+                kind,
+                target_id,
+                value_len,
+                value_preview,
+            })),
+        )
+    }
+
+    /// Records one reactive turn attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_turn(
+        &mut self,
+        trigger: Option<u64>,
+        attempted: usize,
+        kinds: &[&'static str],
+        outcome: TurnOutcomeRecord,
+        revision_before: u64,
+        duration: std::time::Duration,
+    ) {
+        let Some(trace) = self.inspector.as_mut() else {
+            return;
+        };
+        trace.push(inspect::TraceRecordKind::Turn(inspect::TurnRecord {
+            generation: self.document_generation,
+            trigger,
+            attempted_mutations: attempted,
+            mutation_kinds: kinds.to_vec(),
+            outcome,
+            state_revision_before: revision_before,
+            state_revision_after: self.state_revision,
+            duration: Some(duration),
+        }));
+    }
+
+    /// Records requested invalidation work; returns the seq renders
+    /// settle against.
+    fn trace_invalidation(
+        &mut self,
+        classification: InvalidationClass,
+        mut causes: Vec<String>,
+        dropped: usize,
+    ) -> Option<u64> {
+        let trace = self.inspector.as_mut()?;
+        let limits = trace.limits().clone();
+        for cause in &mut causes {
+            inspect::truncate_utf8(cause, limits.max_preview_bytes);
+        }
+        Some(trace.push(inspect::TraceRecordKind::Invalidation(
+            inspect::InvalidationRecord {
+                generation: self.document_generation,
+                classification,
+                causes,
+                truncated_causes: dropped,
+            },
+        )))
+    }
+
+    /// Records one completed render's actual work.
+    fn trace_render(
+        &mut self,
+        frame_index: u64,
+        layout_delta: u64,
+        repaint_delta: u64,
+        settled: Vec<u64>,
+    ) {
+        let Some(trace) = self.inspector.as_mut() else {
+            return;
+        };
+        let mut settled_truncated = 0;
+        let mut settled = settled;
+        if settled.len() > MAX_SETTLED_LINKS {
+            settled_truncated = settled.len() - MAX_SETTLED_LINKS;
+            settled.drain(..settled.len() - MAX_SETTLED_LINKS);
+        }
+        trace.push(inspect::TraceRecordKind::Render(inspect::RenderRecord {
+            generation: self.document_generation,
+            frame_index,
+            layout_pass_delta: layout_delta,
+            repaint_delta,
+            settled,
+            settled_truncated,
+        }));
     }
 
     /// Maps one M4 event onto a machine turn. `NeedsReload` signals the
@@ -2504,7 +2956,8 @@ impl VelquView {
                 };
                 match machine.prepare(Some(&payload), &handlers, None) {
                     velqu_reactive::TurnOutcome::Prepared(pending) => TurnFlow::Prepared(pending),
-                    _ => TurnFlow::Nothing,
+                    velqu_reactive::TurnOutcome::RolledBack(_) => TurnFlow::Failed,
+                    velqu_reactive::TurnOutcome::NoChange => TurnFlow::Nothing,
                 }
             }
             Event::ValueChanged { target, value } => {
@@ -2552,7 +3005,8 @@ impl VelquView {
                     .map(|(path, value)| (path.as_str(), value.as_str()));
                 match machine.prepare(Some(&payload), &handlers, write) {
                     velqu_reactive::TurnOutcome::Prepared(pending) => TurnFlow::Prepared(pending),
-                    _ => TurnFlow::Nothing,
+                    velqu_reactive::TurnOutcome::RolledBack(_) => TurnFlow::Failed,
+                    velqu_reactive::TurnOutcome::NoChange => TurnFlow::Nothing,
                 }
             }
             _ => TurnFlow::Nothing,
@@ -2639,6 +3093,7 @@ impl VelquView {
                 MutationKind::SetText(text) => {
                     self.dom.set_text(node, text.clone());
                     structural = true;
+                    self.note_structural_cause("reactive SetText");
                 }
                 MutationKind::SetVisible(visible) => {
                     let was_hidden = self.reactive_hidden.contains(&node);
@@ -2650,16 +3105,19 @@ impl VelquView {
                             self.reactive_hidden.remove(&node);
                         }
                         structural = true;
+                        self.note_structural_cause("reactive SetVisible");
                     }
                 }
                 MutationKind::SetClass(class) => {
                     self.dom.set_attribute(node, "class", class.clone());
                     structural = true;
                     tailwind = true;
+                    self.note_structural_cause("reactive SetClass");
                 }
                 MutationKind::SetStyle(style) => {
                     self.dom.set_attribute(node, "style", style.clone());
                     structural = true;
+                    self.note_structural_cause("reactive SetStyle");
                 }
                 MutationKind::SetControlValue(value) => {
                     // Silent: control runtime state only, no ValueChanged,
@@ -2689,6 +3147,7 @@ impl VelquView {
                         } else if self.dom.remove_attribute(node, "disabled").is_some() {
                             structural = true;
                         }
+                        self.note_structural_cause("reactive :disabled");
                     }
                 }
                 MutationKind::SetControlChecked(_) => {
@@ -2705,6 +3164,7 @@ impl VelquView {
         }
         if presentation {
             self.rebuild_control_presentation();
+            self.note_presentation_cause("reactive control update");
         }
     }
 
@@ -2724,9 +3184,11 @@ impl VelquView {
 
 /// The flow of mapping one M4 event to a machine turn.
 enum TurnFlow {
-    /// No handlers/model matched, or the turn rolled back (diagnostic
-    /// already recorded): nothing changed.
+    /// No handlers/model matched: nothing changed, no turn ran.
     Nothing,
+    /// The turn rolled back (JS failure or budget; the diagnostic is
+    /// already recorded): state and UI untouched.
+    Failed,
     /// A validated-pending turn: the caller validates the batch,
     /// commits, and applies. (The machine stays in its slot.)
     Prepared(velqu_reactive::PendingTurn),
@@ -2780,6 +3242,109 @@ pub struct ReactiveBindingId {
 /// updates in place, mirroring what the next render's
 /// `apply_scroll_offsets` will compute from the stored request. Keys are
 /// DOM node identity (ADR 0011). Returns once the node is found.
+/// Bounded causes per invalidation record (M6a, ADR 0020): coalesced
+/// frames keep a set plus a truncation count, not a last-cause-wins.
+const MAX_INVALIDATION_CAUSES: usize = 32;
+/// Bounded invalidation links per render record.
+const MAX_SETTLED_LINKS: usize = 16;
+
+/// Finds a node's box in the cached tree (inspector reads; no layout).
+fn find_box_node(node: &layout::BoxNode, id: dom::NodeId) -> Option<&layout::BoxNode> {
+    if node.node == id {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_box_node(child, id))
+}
+
+/// Control kind label for inspections.
+fn control_label(kind: control::ControlKind) -> &'static str {
+    match kind {
+        control::ControlKind::InputText => "input",
+        control::ControlKind::Textarea => "textarea",
+    }
+}
+
+/// Trace label for one mutation kind (attempted-mutation summaries).
+fn mutation_kind_label(kind: &MutationKind) -> &'static str {
+    match kind {
+        MutationKind::SetText(_) => "SetText",
+        MutationKind::SetVisible(_) => "SetVisible",
+        MutationKind::SetClass(_) => "SetClass",
+        MutationKind::SetStyle(_) => "SetStyle",
+        MutationKind::SetControlValue(_) => "SetControlValue",
+        MutationKind::SetControlDisabled(_) => "SetControlDisabled",
+        MutationKind::SetControlChecked(_) => "SetControlChecked",
+    }
+}
+
+/// Event trace metadata (kind, handle generation, HTML id, value
+/// length, and the raw value **only** for the capture opt-in to gate).
+fn event_trace_metadata(
+    event: &Event,
+) -> (
+    &'static str,
+    Option<u64>,
+    Option<String>,
+    Option<usize>,
+    Option<String>,
+) {
+    match event {
+        Event::PointerLeave { target } => (
+            "pointer-leave",
+            Some(target.handle.generation()),
+            target.id.clone(),
+            None,
+            None,
+        ),
+        Event::PointerEnter { target } => (
+            "pointer-enter",
+            Some(target.handle.generation()),
+            target.id.clone(),
+            None,
+            None,
+        ),
+        Event::Click { target } => (
+            "click",
+            Some(target.handle.generation()),
+            target.id.clone(),
+            None,
+            None,
+        ),
+        Event::FocusChanged { to, .. } => match to {
+            Some(target) => (
+                "focus",
+                Some(target.handle.generation()),
+                target.id.clone(),
+                None,
+                None,
+            ),
+            None => ("focus", None, None, None, None),
+        },
+        Event::Scrolled { target, .. } => match target {
+            ScrollTarget::Element { handle, id } => {
+                ("scroll", Some(handle.generation()), id.clone(), None, None)
+            }
+            ScrollTarget::Document => ("scroll", None, None, None, None),
+        },
+        Event::ValueChanged { target, value } => (
+            "input",
+            Some(target.handle.generation()),
+            target.id.clone(),
+            Some(value.len()),
+            Some(value.clone()),
+        ),
+        Event::SelectionChanged { target, .. } => (
+            "selection",
+            Some(target.handle.generation()),
+            target.id.clone(),
+            None,
+            None,
+        ),
+    }
+}
+
 fn bake_scroll(node: &mut layout::BoxNode, id: dom::NodeId, offset: (f32, f32)) -> bool {
     if node.node == id {
         node.applied_scroll = offset;
@@ -5895,6 +6460,542 @@ mod tests {
             Some(velqu_reactive::ReactiveValue::Number(1.0)),
             "no undrained event can re-run its turn"
         );
+    }
+
+    // -- M6a inspector (ADR 0020) ------------------------------------------
+
+    /// A counter document with the inspector already enabled.
+    fn inspected_counter_view() -> VelquView {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.enable_inspector();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view
+    }
+
+    /// Extracts the trace's records by kind, in order.
+    fn records_of(view: &VelquView, filter: fn(&TraceRecordKind) -> bool) -> Vec<TraceRecord> {
+        view.inspector_records()
+            .into_iter()
+            .filter(|record| filter(&record.kind))
+            .collect()
+    }
+
+    fn is_event(kind: &TraceRecordKind) -> bool {
+        matches!(kind, TraceRecordKind::Event(_))
+    }
+    fn is_turn(kind: &TraceRecordKind) -> bool {
+        matches!(kind, TraceRecordKind::Turn(_))
+    }
+    fn is_invalidation(kind: &TraceRecordKind) -> bool {
+        matches!(kind, TraceRecordKind::Invalidation(_))
+    }
+    fn is_render(kind: &TraceRecordKind) -> bool {
+        matches!(kind, TraceRecordKind::Render(_))
+    }
+
+    /// Repeated snapshot reads while idle: no queue changes, no turns,
+    /// no layout passes, no repaint requests, no frame production.
+    #[test]
+    fn m6a_snapshot_reads_are_inert() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let before = view.layout_stats();
+        let frame_before = view.render(vp).unwrap().frame.sha256_hex();
+        let stats_before = view.layout_stats();
+        let records_before = view.inspector_records().len();
+
+        for _ in 0..5 {
+            let _ = view.inspector_snapshot(vp, None);
+            let _ = view.inspector_records();
+            let _ = view.inspector_trace_summary();
+        }
+        assert!(view.take_events().is_empty(), "no events consumed");
+        let after = view.layout_stats();
+        assert_eq!(after.passes, stats_before.passes);
+        assert_eq!(after.repaints, stats_before.repaints);
+        assert_eq!(
+            view.inspector_records().len(),
+            records_before,
+            "reads record nothing"
+        );
+        assert_eq!(view.render(vp).unwrap().frame.sha256_hex(), frame_before);
+        assert_eq!(before.passes, stats_before.passes);
+    }
+
+    /// Capture on vs off: identical application state, event behavior,
+    /// layout facts, and document raster at the same viewport.
+    #[test]
+    fn m6a_capture_leaves_the_application_identical() {
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let run = |inspected: bool| {
+            let mut view = VelquView::new();
+            view.enable_reactive();
+            if inspected {
+                view.enable_inspector();
+            }
+            view.load_html(
+                "<!doctype html><html><body style=\"margin: 0\">\
+                 <div vx-state=\"{ count: 0 }\">\
+                 <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+                 <button id=inc @click=\"count = count + 1\">increment</button>\
+                 </div>\
+                 </body></html>",
+            )
+            .unwrap();
+            view.render(vp).unwrap();
+            view.pump_reactive(&[]);
+            view.render(vp).unwrap();
+            let _ = view.take_events();
+            click_element(&mut view, vp, "inc");
+            let batch = view.take_events();
+            view.pump_reactive(&batch);
+            view.render(vp).unwrap();
+            click_element(&mut view, vp, "inc");
+            let batch = view.take_events();
+            view.pump_reactive(&batch);
+            view.render(vp).unwrap();
+            view
+        };
+        let mut quiet = run(false);
+        let mut inspected = run(true);
+        assert_eq!(
+            format!("{:?}", quiet.reactive_state()),
+            format!("{:?}", inspected.reactive_state()),
+            "same committed state"
+        );
+        assert_eq!(
+            quiet.layout_facts(vp).unwrap(),
+            inspected.layout_facts(vp).unwrap(),
+            "same structural truth"
+        );
+        assert_eq!(
+            quiet.render(vp).unwrap().frame.sha256_hex(),
+            inspected.render(vp).unwrap().frame.sha256_hex(),
+            "same document raster"
+        );
+    }
+
+    /// A failed reactive transaction: the attempt is recorded, zero
+    /// mutations committed, the rollback is visible, and no
+    /// invalidation was requested.
+    #[test]
+    fn m6a_failed_turn_records_zero_committed() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.enable_inspector();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count + missing.x\">x</p>\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let invalidations_before = records_of(&view, is_invalidation).len();
+
+        click_element(&mut view, vp, "inc");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        let turns = records_of(&view, is_turn);
+        let turn = turns.last().expect("the attempt is recorded");
+        match &turn.kind {
+            TraceRecordKind::Turn(record) => {
+                assert_eq!(record.outcome, TurnOutcomeRecord::RolledBack);
+                assert_eq!(record.state_revision_before, record.state_revision_after);
+            }
+            other => panic!("expected a turn record, got {other:?}"),
+        }
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(0.0)),
+            "state rolled back"
+        );
+        // Nothing was requested of the renderer for the failed turn
+        // (the only invalidations on record are the document load's).
+        view.render(vp).unwrap();
+        assert_eq!(
+            records_of(&view, is_invalidation).len(),
+            invalidations_before,
+            "no invalidation requested by a rolled-back turn"
+        );
+    }
+
+    /// Several turns before one render: each attempt is attributable,
+    /// and the single render reports the completed work exactly once.
+    #[test]
+    fn m6a_several_turns_settle_in_one_render() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+
+        click_element(&mut view, vp, "inc");
+        click_element(&mut view, vp, "inc");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        let turns = records_of(&view, is_turn);
+        assert_eq!(turns.len(), 2, "one attempt per click");
+        // Each attempt immediately follows its own triggering event
+        // record (pointer/focus side events interleave between clicks).
+        for turn in &turns {
+            match &turn.kind {
+                TraceRecordKind::Turn(record) => {
+                    let trigger = record.trigger.expect("click-triggered");
+                    assert_eq!(turn.seq, trigger + 1);
+                }
+                other => panic!("expected a turn record, got {other:?}"),
+            }
+        }
+        view.render(vp).unwrap();
+        let renders = records_of(&view, is_render);
+        let render = renders.last().unwrap();
+        match &render.kind {
+            TraceRecordKind::Render(record) => {
+                assert_eq!(record.layout_pass_delta, 1, "two turns, one pass");
+                assert_eq!(record.repaint_delta, 0);
+                assert_eq!(record.settled.len(), 1, "the invalidation settled here");
+            }
+            other => panic!("expected a render record, got {other:?}"),
+        }
+        let invalidations = records_of(&view, is_invalidation);
+        match &invalidations.last().unwrap().kind {
+            TraceRecordKind::Invalidation(record) => {
+                assert_eq!(record.classification, InvalidationClass::Structural);
+                assert!(
+                    record.causes.iter().any(|c| c.contains("SetText")),
+                    "{:?}",
+                    record.causes
+                );
+            }
+            other => panic!("expected an invalidation record, got {other:?}"),
+        }
+    }
+
+    /// Explicit same-generation replay: separate processing attempts,
+    /// no hidden deduplication.
+    #[test]
+    fn m6a_replay_records_distinct_attempts() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+
+        click_element(&mut view, vp, "inc");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        view.render(vp).unwrap();
+        view.pump_reactive(&batch); // deliberate replay
+        let turns = records_of(&view, is_turn);
+        assert_eq!(turns.len(), 2, "a new attempt record, not an overwrite");
+        match (&turns[0].kind, &turns[1].kind) {
+            (TraceRecordKind::Turn(first), TraceRecordKind::Turn(second)) => {
+                assert_ne!(first.trigger, second.trigger, "distinct triggers");
+                assert_eq!(second.state_revision_before, first.state_revision_after);
+            }
+            other => panic!("expected turn records, got {other:?}"),
+        }
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(2.0))
+        );
+    }
+
+    /// An old batch after document replacement cannot operate on the
+    /// replacement: the events record their stale generation and no
+    /// turn runs for the new document.
+    #[test]
+    fn m6a_stale_batch_cannot_touch_the_replacement() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+
+        click_element(&mut view, vp, "inc");
+        let stale = view.take_events();
+        let old_generation = view.inspector_snapshot(vp, None).generation;
+
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 100 }\">\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view.pump_reactive(&stale); // late delivery of the old batch
+        let turns = records_of(&view, is_turn);
+        assert!(
+            turns.iter().all(|record| matches!(&record.kind, TraceRecordKind::Turn(t) if t.generation == old_generation)),
+            "no turn ran against the replacement"
+        );
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(100.0)),
+            "the replacement's initial state is untouched"
+        );
+        // The stale delivery is visible in the trace: the event records
+        // (pointer-enter, click, focus — every handle-carrying event of
+        // the batch) carry the old generation while the pump ran for the
+        // new one.
+        let events = records_of(&view, is_event);
+        let stale_events: Vec<&TraceRecord> = events
+            .iter()
+            .filter(|record| match &record.kind {
+                TraceRecordKind::Event(event) => {
+                    event.event_generation == Some(old_generation)
+                        && event.generation != old_generation
+                }
+                _ => false,
+            })
+            .collect();
+        assert_eq!(stale_events.len(), 3, "the mismatch is recorded");
+        // And a stale selection handle reports itself.
+        let snapshot = view.inspector_snapshot(vp, None);
+        assert_ne!(snapshot.generation, old_generation);
+    }
+
+    /// Retention overflow: the trace stays within its bounds, loss is
+    /// reported, and application events/turns are unaffected.
+    #[test]
+    fn m6a_retention_overflow_keeps_the_application_intact() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.set_inspector_limits(InspectorLimits {
+            max_records: 2,
+            max_retained_bytes: 512,
+            max_record_bytes: 256,
+            max_preview_bytes: 40,
+            capture_values: false,
+        });
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        for _ in 0..6 {
+            click_element(&mut view, vp, "inc");
+            let batch = view.take_events();
+            view.pump_reactive(&batch);
+            view.render(vp).unwrap();
+        }
+        let summary = view.inspector_trace_summary();
+        assert!(summary.evicted > 0, "loss happened");
+        assert!(summary.retained <= 2, "the bound holds");
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(6.0)),
+            "every application event still processed"
+        );
+        assert!(view.take_events().is_empty());
+        // IDs never renumber: the window is a suffix of the sequence.
+        let seqs: Vec<u64> = view.inspector_records().iter().map(|r| r.seq).collect();
+        assert_eq!(seqs.last().copied(), Some(summary.appended));
+        assert_eq!(seqs[0], summary.first_retained);
+    }
+
+    /// Hover under a stationary pointer: the snapshot reflects the
+    /// effective presentation state and the repaint is recorded —
+    /// without any JS turn or layout pass.
+    #[test]
+    fn m6a_hover_is_presentation_without_turns() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.enable_inspector();
+        view.load_css("#one:hover { color: red }").unwrap();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=one style=\"width: 100px; height: 50px\">one</div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let turns_before = records_of(&view, is_turn).len();
+
+        view.pointer_move(vp, 50.0, 20.0);
+        let snapshot = view.inspector_snapshot(vp, None);
+        assert!(snapshot.awaiting_repaint, "hover dirtied presentation");
+        assert_eq!(snapshot.pending.presentation, ["hover"]);
+        view.render(vp).unwrap();
+
+        let invalidations = records_of(&view, is_invalidation);
+        match &invalidations.last().unwrap().kind {
+            TraceRecordKind::Invalidation(record) => {
+                assert_eq!(record.classification, InvalidationClass::Presentation);
+                assert!(record.causes.iter().any(|c| c == "hover"));
+            }
+            other => panic!("expected an invalidation, got {other:?}"),
+        }
+        let renders = records_of(&view, is_render);
+        match &renders.last().unwrap().kind {
+            TraceRecordKind::Render(record) => {
+                assert_eq!(record.layout_pass_delta, 0, "no Taffy for hover");
+                assert_eq!(record.repaint_delta, 1);
+            }
+            other => panic!("expected a render, got {other:?}"),
+        }
+        assert_eq!(
+            records_of(&view, is_turn).len(),
+            turns_before,
+            "hover never ran JS"
+        );
+        // The snapshot reports the interaction state without work.
+        let handle = view.hit_test(vp, 50.0, 20.0).unwrap().handle;
+        let snapshot = view.inspector_snapshot(vp, Some(handle));
+        let element = snapshot.selected.expect("fresh layout, valid handle");
+        assert!(element.hovered);
+        assert_eq!(element.id.as_deref(), Some("one"));
+    }
+
+    /// The snapshot exposes intermediate coherence honestly: a
+    /// committed turn not yet rendered shows newer state than geometry
+    /// and pending invalidation causes — without triggering a render.
+    #[test]
+    fn m6a_snapshot_exposes_intermediate_coherence() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let baseline = view.inspector_snapshot(vp, None);
+
+        click_element(&mut view, vp, "inc");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        // No render yet: state committed, geometry stale, causes pending.
+        // (Deltas against the pre-click baseline; turn zero and the two
+        // settling renders already moved the absolute numbers.)
+        let settled = view.inspector_snapshot(vp, None);
+        assert_eq!(settled.state_revision, baseline.state_revision + 1);
+        assert_eq!(settled.layout_revision, baseline.layout_revision);
+        assert!(settled.awaiting_relayout);
+        assert!(
+            settled
+                .pending
+                .structural
+                .iter()
+                .any(|c| c.contains("SetText"))
+        );
+        view.render(vp).unwrap();
+        let snapshot = view.inspector_snapshot(vp, None);
+        assert_eq!(
+            snapshot.layout_revision,
+            baseline.layout_revision + 1,
+            "settled by the render"
+        );
+        assert!(!snapshot.awaiting_relayout);
+        assert_eq!(snapshot.layout, inspect::LayoutCacheState::Fresh);
+        // A different viewport reports Stale instead of building one.
+        let other = Viewport::try_new(400, 300, 1.0).unwrap();
+        let snapshot = view.inspector_snapshot(other, None);
+        assert_eq!(snapshot.layout, inspect::LayoutCacheState::Stale);
+    }
+
+    /// Metadata by default: value-carrying events record lengths, never
+    /// the text itself, unless capture opts in.
+    #[test]
+    fn m6a_records_metadata_not_user_text() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.enable_inspector();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: '' }\">\
+             <input id=field vx-model=\"name\">\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+
+        view.set_focus(Some("field"));
+        view.insert_text("s3cr3t-typ3d-value");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+
+        let debug = format!("{:?}", view.inspector_records());
+        assert!(!debug.contains("s3cr3t"), "no user text by default");
+        let events = records_of(&view, is_event);
+        let input_event = events
+            .iter()
+            .rev()
+            .find(|record| {
+                matches!(&record.kind, TraceRecordKind::Event(event) if event.kind == "input")
+            })
+            .expect("the input event is recorded");
+        match &input_event.kind {
+            TraceRecordKind::Event(record) => {
+                assert_eq!(record.value_len, Some("s3cr3t-typ3d-value".len()));
+                assert_eq!(record.value_preview, None);
+            }
+            other => panic!("expected an event record, got {other:?}"),
+        }
+        // Opt-in: the value appears, bounded by the preview limit.
+        view.set_inspector_limits(InspectorLimits {
+            capture_values: true,
+            ..InspectorLimits::default()
+        });
+        view.insert_text("0123456789");
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+        let events = records_of(&view, is_event);
+        let input_event = events
+            .iter()
+            .rev()
+            .find(|record| {
+                matches!(&record.kind, TraceRecordKind::Event(event) if event.kind == "input")
+            })
+            .expect("the opt-in input event is recorded");
+        match &input_event.kind {
+            TraceRecordKind::Event(record) => {
+                // The event carries the control's full current value
+                // (the second insert appended to the first).
+                assert_eq!(
+                    record.value_preview.as_deref(),
+                    Some("s3cr3t-typ3d-value0123456789")
+                );
+            }
+            other => panic!("expected an event record, got {other:?}"),
+        }
     }
 
     /// Interaction changes are precise, not conservative: without an

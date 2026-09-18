@@ -83,12 +83,13 @@ Local app runner, reload, inspector, diagnostics.
 Executed in slices (reviewer-directed): **M6a.1 event ownership**
 (`pump_reactive` takes a caller-owned batch, never the queue; replay
 is explicit; turn-generated events wait for the next drain — ADR 0019,
-done); **M6a inspector** — Rust-owned snapshot outside the rendered
-document (generation, sources, plan summary, selected element's
-attrs/computed style/box geometry, diagnostics, an event→turn→
-mutations→invalidation trace with monotonic trace ids and bounded
-retention, performance counters, and a "why did layout happen"
-invalidation panel); **M6b transactional hot reload** — candidate
+done); **M6a inspector** (ADR 0020, done) — recorded-outcome trace
+(Event/Turn/Invalidation/Render records linked by monotonic ids,
+attempted-vs-committed and requested-vs-completed distinctions,
+coalesced bounded causes, byte- and count-bounded retention with
+honest loss reporting, metadata-default capture), observational
+snapshots (`&self`, cached-only, coherence/staleness exposed), and
+`velqu-lab --inspect`; **M6b transactional hot reload** — candidate
 builds fully (parse/compile/runtime/initial validation) before an
 atomic generation swap; failures keep the old document running with
 diagnostics; CSS-only reload upserts the sheet and preserves reactive

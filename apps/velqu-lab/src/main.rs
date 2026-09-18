@@ -29,6 +29,7 @@ struct Args {
     exit_after: Option<Duration>,
     tailwind: bool,
     reactive: bool,
+    inspect: bool,
 }
 
 const USAGE: &str = "\
@@ -45,6 +46,8 @@ OPTIONS:
     --tailwind         Compile Tailwind utility classes into CSS (ADR 0009)
     --reactive         Enable Velqu Reactive: compile vx-* markup into the
                        bounded execution plan and drive reactive turns (ADR 0016/0017)
+    --inspect          Enable the inspector trace (ADR 0020) and print the
+                       snapshot + retained trace after the headless run
     --size WxH         Logical viewport size (default 1024x640)
     --scale F          DPI scale factor (default 1.0)
     --frames N         Headless: render N frames and verify determinism (default 1)
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Args, String> {
         exit_after: None,
         tailwind: false,
         reactive: false,
+        inspect: false,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut argv = std::env::args().skip(1);
@@ -77,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
             "--window" => args.headless = false,
             "--tailwind" => args.tailwind = true,
             "--reactive" => args.reactive = true,
+            "--inspect" => args.inspect = true,
             "--size" => {
                 let value = argv.next().ok_or("--size requires WxH")?;
                 args.size = parse_size(&value)?;
@@ -194,6 +199,147 @@ fn human_bytes(n: usize) -> String {
         format!("{n} B")
     } else {
         format!("{:.1} KiB", n as f64 / 1024.0)
+    }
+}
+
+/// Prints the inspector snapshot and the retained trace (ADR 0020) —
+/// the lab's developer surface for "what did Velqu actually do".
+/// Reads recorded outcomes only; it runs after the frames, so it can
+/// never perturb them.
+fn print_inspection(view: &VelquView, viewport: velqu_view::Viewport) {
+    use velqu_view::{LayoutCacheState, TraceRecordKind};
+
+    let snapshot = view.inspector_snapshot(viewport, None);
+    println!(
+        "inspector: generation {}, state revision {}, layout revision {}, frame {}",
+        snapshot.generation,
+        snapshot.state_revision,
+        snapshot.layout_revision,
+        snapshot.frame_index
+    );
+    let layout = match snapshot.layout {
+        LayoutCacheState::Fresh => "fresh",
+        LayoutCacheState::Stale => "stale (different viewport)",
+        LayoutCacheState::NotAvailable => "not available yet",
+    };
+    let mut state = format!("layout {layout}");
+    if snapshot.awaiting_relayout {
+        state.push_str(", relayout pending");
+    }
+    if snapshot.awaiting_repaint {
+        state.push_str(", repaint pending");
+    }
+    println!("inspector: {state}");
+    println!(
+        "inspector: {} pass(es), {} repaint(s), {} turn(s), {} display item(s)",
+        snapshot.counters.layout_passes,
+        snapshot.counters.repaints,
+        snapshot.counters.reactive_turns,
+        snapshot.counters.display_items_last
+    );
+    if !snapshot.pending.structural.is_empty() || !snapshot.pending.presentation.is_empty() {
+        println!(
+            "inspector: pending causes: structural {:?}, presentation {:?}",
+            snapshot.pending.structural, snapshot.pending.presentation
+        );
+    }
+    for diagnostic in &snapshot.diagnostics {
+        println!(
+            "inspector: [{}] {}",
+            diagnostic.subsystem, diagnostic.message
+        );
+    }
+
+    let summary = view.inspector_trace_summary();
+    println!(
+        "trace: {} record(s) retained (first #{}, {} appended, {} evicted, {} truncated)",
+        summary.retained,
+        summary.first_retained,
+        summary.appended,
+        summary.evicted,
+        summary.truncated
+    );
+    const SHOWN: usize = 24;
+    let records = view.inspector_records();
+    let start = records.len().saturating_sub(SHOWN);
+    if start > 0 {
+        println!("trace: … {} earlier record(s) elided", start);
+    }
+    for record in &records[start..] {
+        match &record.kind {
+            TraceRecordKind::Event(event) => {
+                let target = event.target_id.as_deref().unwrap_or("-");
+                let generation = match event.event_generation {
+                    Some(generation) if generation != event.generation => {
+                        format!(" (gen {generation}→{})", event.generation)
+                    }
+                    _ => String::new(),
+                };
+                let value = event
+                    .value_len
+                    .map(|len| format!(" value[{len}]"))
+                    .unwrap_or_default();
+                println!(
+                    "#{} event {} {}{generation}{value}",
+                    record.seq, event.kind, target
+                );
+            }
+            TraceRecordKind::Turn(turn) => {
+                let trigger = turn
+                    .trigger
+                    .map_or_else(|| "init".to_owned(), |seq| format!("#{seq}"));
+                match &turn.outcome {
+                    velqu_view::TurnOutcomeRecord::Committed { count } => {
+                        println!(
+                            "#{} turn ←{trigger}: {} proposed, {count} committed (revision {}→{})",
+                            record.seq,
+                            turn.attempted_mutations,
+                            turn.state_revision_before,
+                            turn.state_revision_after
+                        );
+                    }
+                    velqu_view::TurnOutcomeRecord::Rejected => {
+                        println!(
+                            "#{} turn ←{trigger}: {} proposed, REJECTED",
+                            record.seq, turn.attempted_mutations
+                        );
+                    }
+                    velqu_view::TurnOutcomeRecord::RolledBack => {
+                        println!("#{} turn ←{trigger}: rolled back", record.seq);
+                    }
+                    velqu_view::TurnOutcomeRecord::NoMatch => {
+                        println!("#{} turn ←{trigger}: no match", record.seq);
+                    }
+                }
+            }
+            TraceRecordKind::Invalidation(invalidation) => {
+                let class = match invalidation.classification {
+                    velqu_view::InvalidationClass::Presentation => "presentation",
+                    velqu_view::InvalidationClass::Structural => "structural",
+                };
+                let dropped = invalidation.truncated_causes;
+                println!(
+                    "#{} invalidation {class}: {:?}{}",
+                    record.seq,
+                    invalidation.causes,
+                    (dropped > 0)
+                        .then_some(format!(" (+{dropped} truncated)"))
+                        .unwrap_or_default()
+                );
+            }
+            TraceRecordKind::Render(render) => {
+                let settled = render
+                    .settled
+                    .iter()
+                    .map(|seq| format!("#{seq}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!(
+                    "#{} render frame {}: +{} pass, +{} repaint (settled {settled})",
+                    record.seq, render.frame_index, render.layout_pass_delta, render.repaint_delta
+                );
+            }
+        }
     }
 }
 
@@ -332,6 +478,9 @@ fn main() -> ExitCode {
     if args.reactive {
         view.enable_reactive();
     }
+    if args.inspect {
+        view.enable_inspector();
+    }
     if let Err(message) = load_app(&mut view, &args.app_dir) {
         eprintln!("velqu-lab: {message}");
         return ExitCode::from(2);
@@ -342,6 +491,14 @@ fn main() -> ExitCode {
     } else {
         run_window(&args, &mut view)
     };
+    if args.inspect && args.headless && result.is_ok() {
+        let physical = |logical: u32| (logical as f32 * args.scale).round() as u32;
+        if let Ok(viewport) =
+            Viewport::try_new(physical(args.size.0), physical(args.size.1), args.scale)
+        {
+            print_inspection(&view, viewport);
+        }
+    }
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
