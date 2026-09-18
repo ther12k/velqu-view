@@ -90,5 +90,6 @@ View level (`velqu-view` lib tests, 10 tests):
   `cargo +1.87.0 check --workspace --all-targets --locked`; headless
   dashboard smoke digest unchanged (`770b933b…`).
 
-Landing: implementation + docs pushed to `main`; GitHub CI green (run
-recorded in the evidence addendum).
+Landing: `433162e` + `1a3bbac` pushed to `main`; GitHub CI green —
+run [35366406880](https://github.com/ther12k/velqu-view/actions/runs/35366406880)
+(fmt/clippy/test/build + MSRV 1.87).
