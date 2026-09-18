@@ -48,3 +48,7 @@ yet; the contract is structural.)
   `cargo +1.87.0 check --workspace --all-targets --locked`; headless
   dashboard smoke digest unchanged (`770b933b…`); the three reactive
   examples still conform (their harness pumps drained batches).
+
+Landing: `b262500` pushed to `main`; GitHub CI green — run
+[35390581440](https://github.com/ther12k/velqu-view/actions/runs/35390581440)
+(fmt/clippy/test/build + MSRV 1.87, both jobs).
