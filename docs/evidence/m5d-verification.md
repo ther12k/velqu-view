@@ -82,3 +82,7 @@ never pixels.
   (278 tests: 6 new M5d + all prior suites);
   `cargo +1.87.0 check --workspace --all-targets --locked`; headless
   dashboard smoke digest unchanged (`770b933b…`).
+
+Landing: `07fca43` pushed to `main`; GitHub CI green — run
+[35372713562](https://github.com/ther12k/velqu-view/actions/runs/35372713562)
+(fmt/clippy/test/build + MSRV 1.87, both jobs).
