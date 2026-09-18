@@ -232,7 +232,11 @@ pub(crate) fn build_boxes(
     root: NodeId,
     styles: &StyleMap,
     images: &ImageStore,
+    hidden: &std::collections::HashSet<NodeId>,
 ) -> Option<BoxNode> {
+    if hidden.contains(&root) {
+        return None;
+    }
     let style = styles.get(&root)?.clone();
     if style.display == Display::None {
         return None;
@@ -282,14 +286,14 @@ pub(crate) fn build_boxes(
                     .unwrap_or(Display::Inline);
                 match display {
                     Display::Block | Display::Flex | Display::Grid => {
-                        if let Some(child_box) = build_boxes(dom, child, styles, images) {
+                        if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
                             box_node.children.push(child_box);
                         }
                     }
                     // A replaced element never flattens into inline words:
                     // it is a real box even where display is inline.
                     Display::Inline if dom.tag_name(child) == Some("img") => {
-                        if let Some(child_box) = build_boxes(dom, child, styles, images) {
+                        if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
                             box_node.children.push(child_box);
                         }
                     }
@@ -449,6 +453,7 @@ pub(crate) fn count_box_tree(root: &BoxNode) -> usize {
 ///
 /// The box tree is built here (Velqu-canonical), then laid out by the
 /// private Taffy backend (ADR 0007), then lowered to a display list.
+#[allow(clippy::too_many_arguments)] // one pass, every input is load-bearing (M5c hidden set)
 pub(crate) fn layout_document(
     dom: &Dom,
     viewport: Viewport,
@@ -457,11 +462,12 @@ pub(crate) fn layout_document(
     images: &ImageStore,
     scroll_offsets: &ScrollOffsets,
     interaction: Option<&crate::style::InteractionState>,
+    hidden: &std::collections::HashSet<NodeId>,
 ) -> Option<LaidOutDocument> {
     let root_element = layout_root(dom);
 
     let styles = compute_all_styles(dom, root_element, cascade, interaction);
-    let mut root = build_boxes(dom, root_element, &styles, images)?;
+    let mut root = build_boxes(dom, root_element, &styles, images, hidden)?;
 
     crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts, scroll_offsets);
 
@@ -974,6 +980,7 @@ mod tests {
             images,
             scroll_offsets,
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let mut facts = LayoutFacts {
@@ -1092,6 +1099,7 @@ mod tests {
             &ImageStore::new(),
             &Vec::new(),
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1147,6 +1155,7 @@ mod tests {
             &ImageStore::new(),
             &Vec::new(),
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let list = &laid.display_list;
@@ -1260,6 +1269,7 @@ mod tests {
             &ImageStore::new(),
             &Vec::new(),
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1433,6 +1443,7 @@ mod tests {
             &ImageStore::new(),
             &vec![(Some(pane_node), (500.0, -25.0))],
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         let pane = &laid.root.children[0];
@@ -1447,6 +1458,7 @@ mod tests {
             &ImageStore::new(),
             &Vec::new(),
             None,
+            &std::collections::HashSet::new(),
         )
         .unwrap();
         assert_eq!(plain.root.children[0].applied_scroll, (0.0, 0.0));

@@ -216,6 +216,42 @@ impl Dom {
         }
     }
 
+    // -- reactive mutation (M5c, ADR 0017) --------------------------------
+    // Crate-internal, host-sanctioned only: validated MutationBatch
+    // entries apply through these. JavaScript never touches them.
+
+    /// Replaces `node`'s children with a single text node carrying
+    /// `text` (a `SetText` mutation).
+    pub(crate) fn set_text(&mut self, node: NodeId, text: String) {
+        self.nodes[node].children.clear();
+        let child = self.create_detached(NodeData::Text(text));
+        self.nodes[child].parent = Some(node);
+        self.nodes[node].children.push(child);
+    }
+
+    /// Sets (replaces or inserts) one attribute on an element (a
+    /// `SetClass`/`SetStyle` mutation). Returns the previous value.
+    pub(crate) fn set_attribute(
+        &mut self,
+        node: NodeId,
+        name: &str,
+        value: String,
+    ) -> Option<String> {
+        let NodeData::Element { attrs, .. } = &mut self.nodes[node].data else {
+            return None;
+        };
+        match attrs.iter_mut().find(|attr| attr.name == name) {
+            Some(attr) => Some(std::mem::replace(&mut attr.value, value)),
+            None => {
+                attrs.push(Attribute {
+                    name: name.to_owned(),
+                    value,
+                });
+                None
+            }
+        }
+    }
+
     // -- construction (used by the html5ever sink) ------------------------
 
     /// Allocates a detached node (no parent, no children).

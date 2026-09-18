@@ -288,8 +288,35 @@ fn walk<N: Copy + Eq>(
         node_ordinal: this_ordinal,
         attribute: attribute.to_owned(),
     };
-    let current_scope = scope_stack.last().copied();
-    let scopes_before = plan.scopes.len();
+    // Pass 0: a `vx-state` on this node encloses the node itself — its
+    // own handlers and bindings resolve against its scope regardless of
+    // attribute order. The scope is created first and stays on the
+    // stack for the whole node visit.
+    let enclosing = scope_stack.last().copied();
+    let own_scope: Option<Option<usize>> = attributes.iter().find_map(|(name, value)| {
+        (name == "vx-state").then(|| {
+            let span = span_for(name);
+            if let Err(reason) = check_expression_shape(value) {
+                plan.diagnostics.push(ReactiveDiagnostic {
+                    span,
+                    message: format!("scope initializer {reason}"),
+                });
+                return None;
+            }
+            let index = plan.scopes.len();
+            plan.scopes.push(ScopePlan {
+                node,
+                parent: enclosing,
+                initializer_source: value.to_owned(),
+                span,
+            });
+            Some(index)
+        })
+    });
+    let pushed_scope = own_scope.unwrap_or(None);
+    if let Some(index) = pushed_scope {
+        scope_stack.push(index);
+    }
     let mut seen: Vec<&str> = Vec::new();
     let mut has_model = false;
     let mut value_binding_attribute: Option<String> = None;
@@ -333,7 +360,19 @@ fn walk<N: Copy + Eq>(
                 });
                 continue;
             }
-            lower_directive(node, &tag, directive, value, &span, current_scope, plan);
+            if directive == Directive::State {
+                // Created in pass 0; this visit already encloses it.
+                continue;
+            }
+            lower_directive(
+                node,
+                &tag,
+                directive,
+                value,
+                &span,
+                scope_stack.last().copied(),
+                plan,
+            );
             if directive == Directive::Model {
                 has_model = true;
             }
@@ -369,7 +408,7 @@ fn walk<N: Copy + Eq>(
                 });
                 continue;
             }
-            match current_scope {
+            match scope_stack.last().copied() {
                 Some(scope) => plan.events.push(EventBinding {
                     node,
                     scope,
@@ -426,7 +465,7 @@ fn walk<N: Copy + Eq>(
                 });
                 continue;
             }
-            match current_scope {
+            match scope_stack.last().copied() {
                 Some(scope) => plan.bindings.push(Binding {
                     node,
                     scope,
@@ -457,16 +496,11 @@ fn walk<N: Copy + Eq>(
         }
     }
 
-    // Pass 2: descend, with this node's scope (if it declared one, it is
-    // the only scope pushed while processing this node) enclosing.
-    let declared_scope = (plan.scopes.len() > scopes_before).then_some(scopes_before);
-    if let Some(index) = declared_scope {
-        scope_stack.push(index);
-    }
+    // Pass 2: descend inside this node's scope, then pop it.
     for child in dom.children(node) {
         walk(dom, child, scope_stack, ordinal, plan);
     }
-    if declared_scope.is_some() {
+    if pushed_scope.is_some() {
         scope_stack.pop();
     }
 }

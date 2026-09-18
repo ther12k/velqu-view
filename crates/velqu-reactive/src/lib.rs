@@ -25,9 +25,15 @@
 //! execution plan; runtime JavaScript never discovers or traverses
 //! the DOM.** No dynamic tree creation in this slice.
 //!
-//! **M5c–M5d scope (next):** state + events (M4 events → JS turn →
-//! transactional mutation batch) and invalidation batching
-//! (presentation → zero Taffy passes, structural → one pass).
+//! **M5c scope (done, ADR 0017):** reactive turns — M4 events drive
+//! bounded, non-reentrant, transactional turns through the
+//! [`ReactiveMachine`]: plain-data state (no functions, cycles, or
+//! exotic values), compile-once units, frozen event payloads, whole-
+//! batch validation, and atomic commit/rollback of state + UI
+//! mutations.
+//!
+//! **M5d scope (next):** invalidation batching — presentation-only
+//! turns with zero Taffy passes, structural turns with at most one.
 //!
 //! The UI QuickJS context receives no browser APIs — no `document`, `window`,
 //! `navigator`, storage, network, or filesystem — and never owns the DOM:
@@ -35,14 +41,21 @@
 
 use std::fmt;
 
+mod machine;
 mod plan;
 mod runtime;
+mod state;
 
+pub use machine::{
+    EventPayload, Mutation, MutationKind, PayloadTooLarge, PayloadValue, PendingTurn,
+    ReactiveMachine, TurnOutcome,
+};
 pub use plan::{
     Binding, BindingKind, EventBinding, ReactiveDiagnostic, ReactiveDocument, ReactiveDom,
     ScopePlan, SourceSpan, compile,
 };
 pub use runtime::{InvalidJsLimits, JsFailure, JsLimits, LOGICAL_EPOCH_MS, ReactiveRuntime};
+pub use state::{MAX_STATE_DEPTH, ReactiveValue, StateError};
 
 /// v0 directives (`vx-*` attribute names), per the Velqu Reactive v0 spec.
 pub const DIRECTIVES: &[&str] = &[

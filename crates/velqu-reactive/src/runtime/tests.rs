@@ -179,6 +179,13 @@ fn no_ambient_host_surface_exists() {
         }
         const velquKeys = Object.keys(velqu).sort().join(",");
         if (velquKeys !== "log") { throw new Error("velqu surface: " + velquKeys); }
+        // __velquCore is host machinery, not an ambient capability: pure
+        // data helpers only, frozen, non-enumerable on the global.
+        const coreKeys = Object.keys(globalThis.__velquCore).sort().join(",");
+        if (coreKeys !== "freeze,isPlain,string,truthy") {
+            throw new Error("core surface: " + coreKeys);
+        }
+        Object.freeze; // (presence sanity for the freeze primitive itself)
         "#,
     )
     .expect("the profile is exactly the sanctioned surface");

@@ -601,7 +601,7 @@ fn ua_default(tag: &str) -> ComputedStyle {
         }
         "div" | "p" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "ul" | "ol" | "li" | "section"
         | "article" | "header" | "footer" | "nav" | "aside" | "main" | "form" | "figure"
-        | "blockquote" | "table" | "img" | "input" | "textarea" => {
+        | "blockquote" | "table" | "img" | "input" | "textarea" | "button" | "select" => {
             // Replaced controls and images participate as real boxes
             // (block/flex items); inline text flow around them is deferred.
             style.display = Display::Block;

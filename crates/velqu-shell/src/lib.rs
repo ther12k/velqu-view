@@ -437,6 +437,10 @@ impl ShellApp<'_> {
     }
 
     fn redraw_inner(&mut self) -> Result<(), ShellError> {
+        // Reactive turns run before the frame: one queued M4 event =
+        // one bounded transactional turn (M5c, ADR 0017). A no-op for
+        // documents without reactive markup.
+        self.view.pump_reactive();
         let Some(window) = self.window.clone() else {
             return Ok(());
         };

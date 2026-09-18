@@ -259,6 +259,33 @@ impl ReactiveRuntime {
         self.generation
     }
 
+    /// The wrapped context (machine-internal, M5c).
+    pub(crate) fn context(&self) -> &Context {
+        &self.ctx
+    }
+
+    /// Host-compiles `source` (already a whole-program expression) into
+    /// a function under the armed deadline — the privileged path M5a.1
+    /// preserved. Machine-internal, M5c.
+    pub(crate) fn eval_function<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        source: &str,
+    ) -> Result<Function<'js>, JsFailure> {
+        self.arm_deadline();
+        // Units compile in sloppy mode: `with`-scoping over the state
+        // snapshot (bare-identifier reads AND writes) is sloppy-only.
+        // Event payloads are Object.frozen, so a handler writing
+        // `__velquEvent.value` is silently contained — the payload and
+        // M4 state stay intact by construction. (rquickjs's eval
+        // default is strict; the flag is explicit here.)
+        use rquickjs::context::EvalOptions;
+        let mut options = EvalOptions::default();
+        options.strict = false;
+        ctx.eval_with_options::<Function, _>(source, options)
+            .map_err(|error| self.classify(ctx, error))
+    }
+
     /// The budgets in force.
     pub fn limits(&self) -> &JsLimits {
         &self.limits
@@ -328,6 +355,12 @@ impl ReactiveRuntime {
     /// output and, later, reactive diagnostics.
     pub fn diagnostics(&self) -> Vec<String> {
         self.diagnostics.borrow().clone()
+    }
+
+    /// Arms the execution deadline (machine phases that call compiled
+    /// functions directly, outside `evaluate`/`drain_jobs`).
+    pub(crate) fn arm(&self) {
+        self.arm_deadline();
     }
 
     /// Arms a fresh execution deadline for the next phase.
@@ -459,6 +492,48 @@ impl ReactiveRuntime {
                     })();"#,
                 )
                 .map_err(|_| self.take_exception(&ctx, "codegen refusal failed"))?;
+                // Pure data helpers for the reactive machine (M5c, ADR
+                // 0017): exact ECMAScript String()/truthiness semantics,
+                // the plain-object predicate, and deep freeze for event
+                // payloads. Frozen and non-enumerable; every helper is a
+                // pure function over its argument — no capability.
+                ctx.eval::<(), _>(
+                    r#"(() => {
+                    // The machine's compiled-unit holder: hidden and
+                    // non-enumerable. (Not part of the frozen core —
+                    // units are installed per generation; the functions
+                    // inside are the application's own, so tampering
+                    // only corrupts the application itself.)
+                    Object.defineProperty(globalThis, "__velquUnits", {
+                        value: { init: {}, bindings: {}, handlers: {} },
+                        enumerable: false,
+                        configurable: false,
+                        writable: false,
+                    });
+                    })();
+                    Object.defineProperty(globalThis, "__velquCore", {
+                        value: Object.freeze({
+                            isPlain: (v) => {
+                                const proto = Object.getPrototypeOf(v);
+                                return proto === Object.prototype || proto === null;
+                            },
+                            freeze: function deep(value) {
+                                if (value !== null && typeof value === "object") {
+                                    Object.freeze(value);
+                                    for (const key of Object.keys(value)) {
+                                        deep(value[key]);
+                                    }
+                                }
+                                return value;
+                            },
+                            string: (v) => String(v),
+                            truthy: (v) => !!v,
+                        }),
+                        enumerable: false,
+                        configurable: false,
+                    });"#,
+                )
+                .map_err(|_| self.take_exception(&ctx, "core helpers failed"))?;
                 Ok(())
             })
             .map_err(|failure: JsFailure| failure)?;

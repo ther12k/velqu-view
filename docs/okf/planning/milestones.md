@@ -62,9 +62,10 @@ clock/random, no ambient I/O, hostile-script battery — ADR 0015,
 done); **M5b** binding compiler (vx-*/:attr/@event markup lowers to a
 validated Rust-owned plan — semantic checks, deterministic conflicts,
 generation-scoped ids; static docs byte-identical — ADR 0016, done);
-**M5c** state + events (M4 events → JS turn → transactional mutation
-batch) and **M5d** invalidation/batching (presentation → zero Taffy,
-structural → one pass) next.
+**M5c** state + events (M4 events → bounded non-reentrant
+transactional turns; atomic state+UI commits, model-before-handler,
+silent control writes — ADR 0017, done); **M5d** invalidation/batching
+(presentation → zero Taffy, structural → one pass) next.
 
 Exit: counter/forms/tabs examples pass reactive conformance.
 

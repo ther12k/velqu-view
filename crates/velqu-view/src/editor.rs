@@ -113,6 +113,17 @@ impl EditorState {
         self.move_focus(destination, extend);
     }
 
+    /// Replaces the whole value (a reactive `SetControlValue`
+    /// mutation, M5c): silent — no events, selection clamped into the
+    /// new value.
+    pub(crate) fn set_value(&mut self, value: &str) {
+        self.value = value.to_owned();
+        self.anchor = self.anchor.min(self.value.len());
+        self.focus = self.focus.min(self.value.len());
+        self.anchor = self.normalize_boundary(self.anchor);
+        self.focus = self.normalize_boundary(self.focus);
+    }
+
     /// Deletes the current selection, if any (M4c2: cut). A collapsed
     /// selection deletes nothing.
     pub(crate) fn delete_selection(&mut self) -> bool {

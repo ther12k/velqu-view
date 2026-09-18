@@ -118,8 +118,10 @@ pub use source::{
 };
 pub use style::CursorStyle;
 pub use velqu_reactive::{
-    Binding, BindingKind, EventBinding, ReactiveDiagnostic, ReactiveDocument, ScopePlan, SourceSpan,
+    Binding, BindingKind, EventBinding, MutationKind, PendingTurn, ReactiveDiagnostic,
+    ReactiveDocument, ScopePlan, SourceSpan, TurnOutcome,
 };
+use velqu_reactive::{EventPayload, PayloadValue};
 pub use viewport::{InvalidViewport, InvalidViewportReason, MAX_PIXELS, Viewport};
 
 use crate::image::ImageStore;
@@ -392,9 +394,17 @@ pub struct VelquView {
     /// Rust-owned plan. Compilation is read-only and changes no
     /// rendering path; the runtime that consumes the plan lands in M5c.
     reactive_enabled: bool,
-    /// The compiled plan for the current document generation, with the
-    /// generation it was compiled against. Reload replaces it wholly.
+    /// The compiled plan + turn machine for the current document
+    /// generation, with the generation it was compiled against. Reload
+    /// replaces it wholly (the machine's QuickJS world dies with it).
     reactive: Option<ReactiveState>,
+    /// Budgets for the reactive runtime (M5c); development defaults.
+    reactive_limits: velqu_reactive::JsLimits,
+    /// Nodes hidden by `SetVisible(false)` mutations (M5c): absent from
+    /// the box tree (layout, paint, and hit-testing) like display:none.
+    reactive_hidden: std::collections::HashSet<dom::NodeId>,
+    /// A reactive-runtime construction failure (kept for diagnostics).
+    reactive_setup_diagnostic: Option<String>,
     /// Runtime state for supported editable controls. Keys are current-
     /// document DOM nodes; the store is cleared on document replacement.
     controls: std::collections::HashMap<dom::NodeId, control::ControlState>,
@@ -490,6 +500,9 @@ impl VelquView {
             style_blocks: Vec::new(),
             reactive_enabled: false,
             reactive: None,
+            reactive_limits: velqu_reactive::JsLimits::default(),
+            reactive_hidden: std::collections::HashSet::new(),
+            reactive_setup_diagnostic: None,
             controls: std::collections::HashMap::new(),
             control_diagnostics_list: Vec::new(),
             control_geometry: std::collections::HashMap::new(),
@@ -603,20 +616,38 @@ impl VelquView {
         self.reactive.as_ref().map(|state| &state.plan)
     }
 
+    /// The committed reactive state (plain data), for diagnostics and
+    /// tests. `None` when reactive is disabled or no document is loaded.
+    pub fn reactive_state(&self) -> Option<&velqu_reactive::ReactiveValue> {
+        self.reactive.as_ref().and_then(|state| {
+            if state.plan.is_empty() {
+                None
+            } else {
+                state.machine.as_deref()
+            }
+            .map(velqu_reactive::ReactiveMachine::state)
+        })
+    }
+
     /// Deterministic reactive diagnostics for the current document, in
     /// compile order.
     pub fn reactive_diagnostics(&self) -> Vec<String> {
-        self.reactive
-            .as_ref()
-            .map(|state| {
-                state
-                    .plan
-                    .diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Some(state) = self.reactive.as_ref() else {
+            return Vec::new();
+        };
+        let mut diagnostics: Vec<String> = state
+            .plan
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect();
+        if let Some(message) = &self.reactive_setup_diagnostic {
+            diagnostics.push(message.clone());
+        }
+        if let Some(machine) = state.machine.as_deref() {
+            diagnostics.extend(machine.diagnostics().iter().cloned());
+        }
+        diagnostics
     }
 
     /// A generation-scoped id for binding `index` of the current plan
@@ -647,10 +678,36 @@ impl VelquView {
         if !self.reactive_enabled {
             return;
         }
+        let plan = velqu_reactive::compile(&self.dom);
+        let (machine, initial) = match velqu_reactive::ReactiveMachine::new(
+            self.document_generation,
+            self.reactive_limits,
+            &plan,
+        ) {
+            Ok((machine, initial)) => (machine, initial),
+            Err(failure) => {
+                // The runtime itself failed to build (allocation-class):
+                // keep the compiled plan for diagnostics, run no turns.
+                self.reactive_setup_diagnostic = Some(format!("reactive runtime: {failure}"));
+                self.reactive = Some(ReactiveState {
+                    generation: self.document_generation,
+                    plan,
+                    machine: None,
+                    pending_initial: Vec::new(),
+                });
+                return;
+            }
+        };
+        self.reactive_setup_diagnostic = None;
         self.reactive = Some(ReactiveState {
             generation: self.document_generation,
-            plan: velqu_reactive::compile(&self.dom),
+            plan,
+            machine: Some(Box::new(machine)),
+            pending_initial: initial,
         });
+        // Turn zero (initial binding evaluation) already committed
+        // inside the machine; `pump_reactive` applies its mutations to
+        // the document before the first render.
     }
 
     /// Deterministic diagnostics for controls outside the M4c1 profile.
@@ -847,6 +904,7 @@ impl VelquView {
         // (M5b, ADR 0016): reload is the sanctioned reset, exactly like
         // scroll/hover/focus/control state.
         self.reactive = None;
+        self.reactive_hidden.clear();
         self.rebuild_reactive();
         // Utility classes are per-document too: recompile when enabled.
         self.rebuild_tailwind();
@@ -1079,6 +1137,7 @@ impl VelquView {
             &self.images,
             &self.scroll_offsets,
             interaction,
+            &self.reactive_hidden,
         );
         self.layout_passes += 1;
         self.layout_duration_last = started.elapsed();
@@ -2143,6 +2202,352 @@ impl VelquView {
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
+
+    // -- reactive turns (M5c, ADR 0017) -----------------------------------
+
+    /// Runs pending reactive turns: one queued M4 event = one bounded,
+    /// non-reentrant, transactional turn. Call before rendering after
+    /// input (the shell pumps once per event batch).
+    ///
+    /// * `Click` drives `@click` handlers along the target → ancestor
+    ///   chain (target first, `.stop` ends the walk).
+    /// * `ValueChanged` (a user edit) first writes the `vx-model` path
+    ///   of the edited control, **then** runs `@input` handlers — the
+    ///   model-before-handler ordering contract.
+    /// * Everything else leaves the reactive world alone
+    ///   (`@keydown`/`@keyup`/`@submit` compile but have no M4 event
+    ///   source yet; `@focus`/`@blur`/`@scroll` are not in the frozen
+    ///   v0 event set).
+    ///
+    /// A turn's mutations are validated wholesale before anything is
+    /// touched; an invalid batch (or any JS failure) rolls the turn
+    /// back — state and UI unchanged. Applied `SetControlValue`
+    /// mutations update control runtime state **silently**: they never
+    /// synthesize a user `ValueChanged` (no feedback loops). Events
+    /// still reach the host through [`VelquView::take_events`].
+    /// Documents without reactive markup pump as a no-op.
+    pub fn pump_reactive(&mut self) {
+        let Some(state) = self.reactive.take() else {
+            return;
+        };
+        let mut state = state;
+        if state.machine.is_none() || state.plan.is_empty() {
+            self.reactive = Some(state);
+            return;
+        }
+
+        // Disjoint field borrows of the local `state`: the plan is
+        // read-only for the whole pump, the machine slot is moved in
+        // and out per event. (`self.reactive` stays taken, so nothing
+        // below may read it back.)
+        let ReactiveState {
+            plan,
+            machine: machine_slot,
+            pending_initial,
+            ..
+        } = &mut state;
+        let pending_initial = std::mem::take(pending_initial);
+        let plan: &ReactiveDocument<dom::NodeId> = plan;
+
+        // Turn zero: initial binding outputs from document load.
+        if !pending_initial.is_empty() && !self.apply_mutations_validated(plan, &pending_initial) {
+            // Initial batch invalid (should not happen: the plan was
+            // compiled against this DOM): drop it with a diagnostic.
+            if let Some(machine) = machine_slot.as_mut() {
+                machine.record_host_diagnostic("initial mutation batch rejected");
+            }
+        }
+
+        // One event = one turn, in order. The queue is copied because
+        // turns never mutate it (appliers are silent by contract). The
+        // machine moves in and out of `state` per event: preparing a
+        // turn needs &mut self (DOM reads) alongside &mut machine.
+        let events: Vec<Event> = self.events.clone();
+        for event in events {
+            let flow = match machine_slot.take() {
+                Some(mut machine) => {
+                    let flow = self.prepare_turn_for(plan, &mut machine, &event);
+                    *machine_slot = Some(machine);
+                    flow
+                }
+                None => TurnFlow::Nothing,
+            };
+            match flow {
+                TurnFlow::Nothing => {}
+                TurnFlow::Prepared(pending) => {
+                    if let Some(machine) = machine_slot.as_mut() {
+                        if !self.mutations_valid(plan, &pending.mutations) {
+                            machine.record_host_diagnostic(
+                                "mutation batch rejected: a target failed validation",
+                            );
+                            continue;
+                        }
+                        let mutations = pending.mutations.clone();
+                        machine.commit(pending);
+                        self.apply_mutations(plan, &mutations);
+                    }
+                }
+                TurnFlow::NeedsReload => break,
+            }
+        }
+        self.reactive = Some(state);
+    }
+
+    /// Maps one M4 event onto a machine turn. `NeedsReload` signals the
+    /// machine's generation no longer matches (rebuild on next load).
+    fn prepare_turn_for(
+        &mut self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        machine: &mut velqu_reactive::ReactiveMachine,
+        event: &Event,
+    ) -> TurnFlow {
+        if machine.generation() != self.document_generation {
+            return TurnFlow::NeedsReload;
+        }
+        match event {
+            Event::Click { target } => {
+                let Some(target_node) = self.resolve_handle(target.handle) else {
+                    return TurnFlow::Nothing;
+                };
+                let handlers = self.handlers_on_chain(plan, target_node, "click");
+                if handlers.is_empty() {
+                    return TurnFlow::Nothing;
+                }
+                let payload = EventPayload::new(
+                    vec![
+                        ("type".to_owned(), PayloadValue::Str("click".to_owned())),
+                        (
+                            "id".to_owned(),
+                            target
+                                .id
+                                .clone()
+                                .map(PayloadValue::Str)
+                                .unwrap_or(PayloadValue::Null),
+                        ),
+                    ],
+                    self.reactive_limits.max_event_payload_bytes,
+                )
+                .unwrap_or_default();
+                match machine.prepare(Some(&payload), &handlers, None) {
+                    velqu_reactive::TurnOutcome::Prepared(pending) => TurnFlow::Prepared(pending),
+                    _ => TurnFlow::Nothing,
+                }
+            }
+            Event::ValueChanged { target, value } => {
+                // The model write precedes the handlers (ADR 0017).
+                let Some(target_node) = self.resolve_handle(target.handle) else {
+                    return TurnFlow::Nothing;
+                };
+                let model_path = plan.bindings.iter().find_map(|binding| {
+                    (binding.node == target_node && binding.kind == BindingKind::Model)
+                        .then(|| binding.expression_source.clone())
+                });
+                let mut model_write = None;
+                if let Some(path) = &model_path {
+                    if is_state_path(path) {
+                        model_write = Some((path.clone(), value.clone()));
+                    } else {
+                        machine.record_host_diagnostic(&format!(
+                            "vx-model expression {path:?} is not a writable state path; the model write was skipped"
+                        ));
+                    }
+                }
+                let handlers = self.handlers_on_chain(plan, target_node, "input");
+                if model_write.is_none() && handlers.is_empty() {
+                    return TurnFlow::Nothing;
+                }
+                let payload = EventPayload::new(
+                    vec![
+                        ("type".to_owned(), PayloadValue::Str("input".to_owned())),
+                        ("value".to_owned(), PayloadValue::Str(value.clone())),
+                    ],
+                    self.reactive_limits.max_event_payload_bytes,
+                )
+                .unwrap_or_default();
+                let write = model_write
+                    .as_ref()
+                    .map(|(path, value)| (path.as_str(), value.as_str()));
+                match machine.prepare(Some(&payload), &handlers, write) {
+                    velqu_reactive::TurnOutcome::Prepared(pending) => TurnFlow::Prepared(pending),
+                    _ => TurnFlow::Nothing,
+                }
+            }
+            _ => TurnFlow::Nothing,
+        }
+    }
+
+    /// Plan event-handler indices for `event_name` on `node` and its
+    /// ancestors, target-first (the v0 propagation rule).
+    fn handlers_on_chain(
+        &self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        node: dom::NodeId,
+        event_name: &str,
+    ) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(node);
+        while let Some(current) = cursor {
+            chain.push(current);
+            cursor = self.dom.node(current).parent;
+        }
+        let mut handlers = Vec::new();
+        for chain_node in chain {
+            for (index, event) in plan.events.iter().enumerate() {
+                if event.node == chain_node && event.handler.event == event_name {
+                    handlers.push(index);
+                }
+            }
+        }
+        handlers
+    }
+
+    /// Validates a whole mutation batch against the current DOM:
+    /// every target must be a live element of this generation, and
+    /// control mutations must target controls. False rejects the batch
+    /// (and with it the turn — full atomicity).
+    fn mutations_valid(
+        &self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        mutations: &[velqu_reactive::Mutation],
+    ) -> bool {
+        mutations.iter().all(|mutation| {
+            let node = plan
+                .bindings
+                .get(mutation.binding)
+                .map(|binding| binding.node);
+            let Some(node) = node else { return false };
+            if node >= self.dom.node_count()
+                || !matches!(self.dom.node(node).data, dom::NodeData::Element { .. })
+            {
+                return false;
+            }
+            match &mutation.kind {
+                MutationKind::SetControlValue(_) | MutationKind::SetControlDisabled(_) => {
+                    self.controls.contains_key(&node)
+                }
+                MutationKind::SetControlChecked(_) => false, // outside the M4c1 profile
+                _ => true,
+            }
+        })
+    }
+
+    /// Applies a validated batch. Each kind routes to the renderer
+    /// surface that owns it; the JS side never chose invalidation.
+    fn apply_mutations(
+        &mut self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        mutations: &[velqu_reactive::Mutation],
+    ) {
+        let plan_bindings: Vec<(dom::NodeId, BindingKind)> = plan
+            .bindings
+            .iter()
+            .map(|binding| (binding.node, binding.kind.clone()))
+            .collect();
+        let mut structural = false;
+        let mut presentation = false;
+        let mut tailwind = false;
+        for mutation in mutations {
+            let Some((node, _kind)) = plan_bindings.get(mutation.binding).cloned() else {
+                continue;
+            };
+            match &mutation.kind {
+                MutationKind::SetText(text) => {
+                    self.dom.set_text(node, text.clone());
+                    structural = true;
+                }
+                MutationKind::SetVisible(visible) => {
+                    let was_hidden = self.reactive_hidden.contains(&node);
+                    let now_hidden = !visible;
+                    if was_hidden != now_hidden {
+                        if now_hidden {
+                            self.reactive_hidden.insert(node);
+                        } else {
+                            self.reactive_hidden.remove(&node);
+                        }
+                        structural = true;
+                    }
+                }
+                MutationKind::SetClass(class) => {
+                    self.dom.set_attribute(node, "class", class.clone());
+                    structural = true;
+                    tailwind = true;
+                }
+                MutationKind::SetStyle(style) => {
+                    self.dom.set_attribute(node, "style", style.clone());
+                    structural = true;
+                }
+                MutationKind::SetControlValue(value) => {
+                    // Silent: control runtime state only, no ValueChanged,
+                    // no focus change — no feedback loops (ADR 0017).
+                    if let Some(state) = self.controls.get_mut(&node) {
+                        state.editor.set_value(value);
+                    }
+                    presentation = true;
+                }
+                MutationKind::SetControlDisabled(disabled) => {
+                    if let Some(state) = self.controls.get_mut(&node) {
+                        state.disabled = *disabled;
+                    }
+                    presentation = true;
+                }
+                MutationKind::SetControlChecked(_) => {
+                    // Rejected by mutations_valid; unreachable.
+                }
+            }
+        }
+        if tailwind && self.tailwind_enabled {
+            self.rebuild_tailwind();
+        }
+        if structural {
+            self.structure_dirty = true;
+            self.last_laid = None;
+        }
+        if presentation {
+            self.rebuild_control_presentation();
+        }
+    }
+
+    /// Validates and (if valid) applies: the initial-batch path.
+    fn apply_mutations_validated(
+        &mut self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        mutations: &[velqu_reactive::Mutation],
+    ) -> bool {
+        if !self.mutations_valid(plan, mutations) {
+            return false;
+        }
+        self.apply_mutations(plan, mutations);
+        true
+    }
+}
+
+/// The flow of mapping one M4 event to a machine turn.
+enum TurnFlow {
+    /// No handlers/model matched, or the turn rolled back (diagnostic
+    /// already recorded): nothing changed.
+    Nothing,
+    /// A validated-pending turn: the caller validates the batch,
+    /// commits, and applies. (The machine stays in its slot.)
+    Prepared(velqu_reactive::PendingTurn),
+    /// The machine's generation is stale: stop pumping (reload will
+    /// rebuild).
+    NeedsReload,
+}
+
+/// A dotted-identifier state path (`name`, `user.name`) — the writable
+/// vx-model surface for v0.
+fn is_state_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+                && segment.chars().all(|character| {
+                    character.is_alphanumeric() || character == '_' || character == '$'
+                })
+        })
 }
 
 /// The compiled reactive plan plus the document generation it belongs
@@ -2151,6 +2556,12 @@ impl VelquView {
 struct ReactiveState {
     generation: u64,
     plan: ReactiveDocument<dom::NodeId>,
+    /// The M5c turn machine for this generation (Box: it owns a QuickJS
+    /// runtime and is not Clone). Diagnostics merge the compile-time and
+    /// turn-time streams.
+    machine: Option<Box<velqu_reactive::ReactiveMachine>>,
+    /// Turn zero's mutations, applied on the first `pump_reactive`.
+    pending_initial: Vec<velqu_reactive::Mutation>,
 }
 
 /// A generation-scoped reference to one binding in the reactive plan
@@ -4535,6 +4946,373 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    // -- M5c reactive turns (ADR 0017) -------------------------------------
+
+    /// Clicks a known element by scanning for its hit target (buttons
+    /// have no intrinsic position knowledge pre-render).
+    fn click_element(view: &mut VelquView, vp: Viewport, id: &str) {
+        let mut found = None;
+        for y in (0..vp.height()).step_by(4) {
+            for x in (0..vp.width()).step_by(8) {
+                if view
+                    .hit_test(vp, x as f32 + 0.5, y as f32 + 0.5)
+                    .is_some_and(|target| target.element_id.as_deref() == Some(id))
+                {
+                    found = Some((x as f32 + 0.5, y as f32 + 0.5));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let (x, y) = found.unwrap_or_else(|| panic!("no hit target for {id}"));
+        view.pointer_press(vp, x, y);
+        view.pointer_release(vp, x, y);
+    }
+
+    fn text_of(view: &mut VelquView, vp: Viewport, fixture: &str) -> Vec<String> {
+        view.layout_facts(vp)
+            .unwrap()
+            .nodes
+            .into_iter()
+            .find(|fact| fact.fixture_id == fixture)
+            .unwrap_or_else(|| panic!("no fact {fixture}"))
+            .text_runs
+    }
+
+    #[test]
+    fn m5c_click_to_state_to_text_end_to_end() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        // Turn zero: the initial binding output replaces the placeholder.
+        view.render(vp).unwrap();
+        assert_eq!(text_of(&mut view, vp, "label"), ["Count: 0"]);
+
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+        assert_eq!(text_of(&mut view, vp, "label"), ["Count: 1"]);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+    }
+
+    #[test]
+    fn m5c_binding_throw_rolls_back_state_and_ui() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count + missing.x\">x</p>\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        // Turn zero also rolled back (the binding always throws): the
+        // placeholder text survived.
+        view.render(vp).unwrap();
+        let hash_before = view.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(text_of(&mut view, vp, "label"), ["x"]);
+
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        let hash_after = view.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(hash_before, hash_after, "the UI is unchanged");
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(0.0)),
+            "the handler's state write was rolled back"
+        );
+        assert!(
+            view.reactive_diagnostics()
+                .iter()
+                .any(|d| d.contains("binding 0 threw"))
+        );
+    }
+
+    #[test]
+    fn m5c_job_bomb_rolls_back_state_and_ui() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = 1; (function chain() { Promise.resolve().then(chain); })()\">boom</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        let hash_before = view.render(vp).unwrap().frame.sha256_hex();
+
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        let hash_after = view.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(hash_before, hash_after, "the UI is unchanged");
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(0.0)),
+            "the candidate state was discarded"
+        );
+    }
+
+    #[test]
+    fn m5c_model_write_precedes_the_input_handler() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: '', seen: 'none' }\">\
+             <input id=box vx-model=\"name\" @input=\"seen = name\" value=\"\">\
+             <p data-vv-test=label vx-text=\"seen\">none</p>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+
+        // The user types: M4 ValueChanged drives the turn.
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.insert_text("Alice"));
+        view.pump_reactive();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+
+        // The handler observed the model value, and the sibling binding
+        // committed in the same turn.
+        assert_eq!(text_of(&mut view, vp, "label"), ["Alice"]);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("name")),
+            Some(velqu_reactive::ReactiveValue::String("Alice".into()))
+        );
+    }
+
+    #[test]
+    fn m5c_state_to_model_updates_the_control_without_new_events() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: '' }\">\
+             <input id=box vx-model=\"name\" value=\"\">\
+             <button id=set @click=\"name = 'Bob'\">set</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+
+        click_element(&mut view, vp, "set");
+        view.pump_reactive();
+        let _ = view.take_events();
+
+        // The control now shows the state value...
+        assert_eq!(
+            view.control_value(view.node_target(view.element_node("box").unwrap()).handle),
+            Some("Bob"),
+            "the model binding wrote the control"
+        );
+        // ...and applying it synthesized no user ValueChanged.
+        let events = view.take_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ValueChanged { .. })),
+            "no feedback loop: {events:?}"
+        );
+    }
+
+    #[test]
+    fn m5c_five_properties_commit_in_one_layout_pass() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ a: 0, b: 0, c: 0, d: 0, e: 0 }\">\
+             <p data-vv-test=ta vx-text=\"a\">0</p>\
+             <p data-vv-test=tb vx-text=\"b\">0</p>\
+             <p data-vv-test=tc vx-text=\"c\">0</p>\
+             <p data-vv-test=td vx-text=\"d\">0</p>\
+             <p data-vv-test=te vx-text=\"e\">0</p>\
+             <button id=inc @click=\"a = 1; b = 2; c = 3; d = 4; e = 5\">all</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 400, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+        assert_eq!(
+            view.layout_stats().passes,
+            passes + 1,
+            "five structural mutations, exactly one Taffy pass"
+        );
+        assert_eq!(text_of(&mut view, vp, "ta"), ["1"]);
+        assert_eq!(text_of(&mut view, vp, "te"), ["5"]);
+    }
+
+    #[test]
+    fn m5c_ancestors_run_target_first_and_stop_ends_the_walk() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=outer vx-state=\"{ order: '' }\" @click=\"order = order + 'o'\">\
+             <button id=plain @click=\"order = order + 'p'\">plain</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        click_element(&mut view, vp, "plain");
+        view.pump_reactive();
+        let _ = view.take_events();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("order")),
+            Some(velqu_reactive::ReactiveValue::String("po".into())),
+            "target first, then the ancestor"
+        );
+
+        // .stop on the target: the ancestor does not run.
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=outer vx-state=\"{ order: '' }\" @click=\"order = order + 'o'\">\
+             <button id=plain @click.stop=\"order = order + 'p'\">plain</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        click_element(&mut view, vp, "plain");
+        view.pump_reactive();
+        let _ = view.take_events();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("order")),
+            Some(velqu_reactive::ReactiveValue::String("p".into())),
+            "the ancestor handler was not invoked"
+        );
+    }
+
+    #[test]
+    fn m5c_reload_restarts_state_and_handlers() {
+        let html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click.once=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>";
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(html).unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+
+        // Reload: fresh machine — initial state, the once-handler armed
+        // again, the old QuickJS world destroyed with the old generation.
+        view.load_html(html).unwrap();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(0.0)),
+            "state restarts from the initializers"
+        );
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0)),
+            "the new generation's once-handler fires again"
+        );
+    }
+
+    #[test]
+    fn m5c_static_documents_pump_as_a_noop() {
+        // Reactive enabled, zero markup: queued events cause no turns,
+        // and the raster/facts stay byte-identical to a plain view.
+        let html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=card style=\"width: 100px; height: 60px; background-color: #3b82f6\" id=card></div>\
+             </body></html>";
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let mut plain = VelquView::new();
+        plain.load_html(html).unwrap();
+        let facts_plain = plain.layout_facts(vp).unwrap();
+        let hash_plain = plain.render(vp).unwrap().frame.sha256_hex();
+
+        let mut reactive = VelquView::new();
+        reactive.enable_reactive();
+        reactive.load_html(html).unwrap();
+        let facts_reactive = reactive.layout_facts(vp).unwrap();
+        let hash_reactive = reactive.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(facts_plain, facts_reactive);
+        assert_eq!(hash_plain, hash_reactive);
+
+        // Events queue and pump without turning anything.
+        click_element(&mut reactive, vp, "card");
+        reactive.pump_reactive();
+        let _ = reactive.take_events();
+        assert_eq!(reactive.render(vp).unwrap().frame.sha256_hex(), hash_plain);
+        assert_eq!(reactive.reactive_state(), None);
     }
 
     #[test]
