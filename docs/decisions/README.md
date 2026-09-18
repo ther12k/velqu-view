@@ -21,6 +21,7 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0015](0015-m5a-runtime-gate.md) | M5a: isolated QuickJS runtime gate — hard budgets, per-generation isolation, deterministic clock/random, no ambient I/O | accepted |
 | [0016](0016-m5b-binding-compiler.md) | M5b: reactive binding compiler — vx-* markup lowers to a validated Rust-owned plan; JS never discovers the DOM | accepted |
 | [0017](0017-m5c-reactive-turns.md) | M5c: reactive turns — atomic state+UI commits, plain-data state, compile-once units, model-before-handler, silent control writes | accepted |
+| [0018](0018-m5d-invalidation-batching.md) | M5d: invalidation batching — presentation_dirty gating, precise interaction paint, measured renderer cost per turn (0 Taffy / ≤1 pass / 0 repaint) | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how

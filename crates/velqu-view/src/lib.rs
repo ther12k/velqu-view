@@ -55,6 +55,12 @@
 //!   edit the wrong control; the shell owns enablement via `wants_ime`
 //!   and `ime_cursor_rect`
 //!   ([ADR 0014](docs/decisions/0014-m4c3-ime.md)).
+//! * **M5 (in progress):** Velqu Reactive v0 — the bounded QuickJS
+//!   runtime, the vx-* binding compiler, atomic reactive turns, and
+//!   measured invalidation batching: a presentation-only turn costs zero
+//!   Taffy passes, a structural turn exactly one, and a no-op turn zero
+//!   repaints; a render nothing dirtied paints the cached display list
+//!   unchanged ([ADRs 0015–0018](docs/decisions/0018-m5d-invalidation-batching.md)).
 //!
 //! # Example
 //!
@@ -423,6 +429,19 @@ pub struct VelquView {
     /// Set when document content or stylesheets changed: the next render
     /// must run a full layout, not the presentation-only path.
     structure_dirty: bool,
+    /// Memoized probe: does any sheet in the cascade carry an interaction
+    /// selector (`:hover`/`:focus`/`:active`)? `None` = recompute on the
+    /// next ask; dropped whenever structure changes (sheets may differ).
+    /// Interaction events on documents without stateful paint cannot
+    /// change pixels and never re-emit the display list (M5d, ADR 0018).
+    interaction_paint: Option<bool>,
+    /// Set when presentation-only state changed since the last emitted
+    /// frame (interaction state, control edits, IME composition, baked
+    /// scroll offsets). Cleared by the repaint and layout paths — a
+    /// render with neither flag set re-paints the cached display list
+    /// unchanged: zero Taffy passes, zero repaint accounting (M5d,
+    /// ADR 0018).
+    presentation_dirty: bool,
     /// Last pointer position (viewport device px) from input; hover is
     /// re-derived from it when scrolling moves content underneath.
     pointer_pos: Option<(f32, f32)>,
@@ -509,6 +528,8 @@ impl VelquView {
             last_laid: None,
             last_viewport: None,
             structure_dirty: true,
+            interaction_paint: None,
+            presentation_dirty: false,
             document_generation: 0,
             pointer_pos: None,
             pointer_capture: None,
@@ -580,6 +601,8 @@ impl VelquView {
     pub fn enable_tailwind(&mut self) {
         self.tailwind_enabled = true;
         self.rebuild_tailwind();
+        // Enabling injects a utility sheet into the cascade: restyle.
+        self.mark_structure_dirty();
     }
 
     /// Whether the Tailwind utility pipeline is enabled.
@@ -884,7 +907,8 @@ impl VelquView {
         self.control_diagnostics_list = control_diagnostics;
         self.last_laid = None;
         self.last_viewport = None;
-        self.structure_dirty = true;
+        self.mark_structure_dirty();
+        self.presentation_dirty = false;
         self.pointer_pos = None;
         self.pointer_capture = None;
         self.pointer_anchor = None;
@@ -961,6 +985,10 @@ impl VelquView {
             None => self.stylesheets.push(source),
         }
         self.rebuild_css();
+        // A stylesheet can change layout-affecting properties, not just
+        // paint: the next render runs a full pass (M5d — previously this
+        // only worked because steady-state renders always repainted).
+        self.mark_structure_dirty();
         Ok(())
     }
 
@@ -1068,16 +1096,19 @@ impl VelquView {
         if self.structure_dirty || self.cached_layout(viewport).is_none() {
             // Structural change or new viewport: full layout. The current
             // interaction state feeds stateful selectors so pixels are
-            // correct after resize/reload too (M4b).
+            // correct after resize/restyle too (M4b).
             let interaction = self.interaction_state();
             self.run_layout(viewport, &mut cascade, Some(&interaction));
             self.structure_dirty = false;
-        } else {
-            // Steady state: only presentation can have changed. Recompute
+        } else if self.presentation_dirty {
+            // Steady state with a presentation-only change. Recompute
             // styles with the current interaction state, patch the cached
             // tree, re-emit — no Taffy pass (ADR 0011).
             self.repaint_presentation(viewport, &mut cascade);
         }
+        // Otherwise nothing changed since the last emitted frame: paint
+        // the cached display list unchanged — zero Taffy passes, zero
+        // repaint accounting (M5d, ADR 0018).
         self.record_style_diagnostics(&cascade);
         if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
@@ -1117,6 +1148,55 @@ impl VelquView {
         })
     }
 
+    /// Marks the next render for a full layout pass. Sheet content may
+    /// have changed with the structure, so the interaction-paint probe
+    /// memo drops with it.
+    fn mark_structure_dirty(&mut self) {
+        self.structure_dirty = true;
+        self.interaction_paint = None;
+    }
+
+    /// Whether any stylesheet in the cascade carries an interaction
+    /// selector. Memoized; recomputed only after a structural change
+    /// (every sheet mutation marks structure dirty). The UA sheet is
+    /// empty, so the probe scans parsed author sheets, the generated
+    /// utility sheet, and `<style>` blocks.
+    fn interaction_paint(&mut self) -> bool {
+        if let Some(present) = self.interaction_paint {
+            return present;
+        }
+        fn scan(rules: &[css::Rule]) -> bool {
+            rules.iter().any(|rule| {
+                rule.selectors.iter().any(|selector| {
+                    selector.segments.iter().any(|segment| {
+                        segment
+                            .compound
+                            .simples
+                            .iter()
+                            .any(css::Simple::is_interaction)
+                    })
+                })
+            })
+        }
+        let mut present = self.parsed_css.iter().any(|sheet| scan(&sheet.rules));
+        if !present {
+            if let Some(text) = &self.tailwind_css {
+                let source = StylesheetSource::new("velqu:tailwind", text.clone());
+                let parsed = css::parse(&source, 0);
+                present = scan(&parsed.rules);
+            }
+        }
+        if !present {
+            present = self.style_blocks.iter().any(|block| {
+                let source = StylesheetSource::new("velqu:style", block.clone());
+                let parsed = css::parse(&source, 0);
+                scan(&parsed.rules)
+            });
+        }
+        self.interaction_paint = Some(present);
+        present
+    }
+
     /// Shared cascade+layout pass behind [`VelquView::render`] and
     /// [`VelquView::layout_facts`]; records layout instrumentation.
     /// `interaction` feeds stateful-selector matching (M4b): layout facts
@@ -1151,6 +1231,8 @@ impl VelquView {
         self.last_viewport = Some(viewport);
         self.last_laid = laid;
         self.rebuild_control_presentation();
+        // A full pass re-emits everything, presentation included.
+        self.presentation_dirty = false;
     }
 
     /// Presentation-only repaint (M4b, ADR 0011): recompute styles with
@@ -1167,11 +1249,14 @@ impl VelquView {
         }
         self.rebuild_control_presentation();
         self.repaint_passes += 1;
+        self.presentation_dirty = false;
     }
 
     /// Rebuilds runtime control paint from the cached outer layout. This is a
     /// presentation-only operation: it never invokes Taffy or changes layout
-    /// facts.
+    /// facts. Any caller besides the repaint/layout paths changes pixels, so
+    /// it marks the next render's presentation repaint (those two clear the
+    /// flag once the frame is re-emitted).
     fn rebuild_control_presentation(&mut self) {
         let Some(viewport) = self.last_viewport else {
             return;
@@ -1191,6 +1276,7 @@ impl VelquView {
         laid.display_list =
             layout::build_display_list_with_controls(&laid.root, scale, offset, Some(&items));
         self.control_geometry = geometry;
+        self.presentation_dirty = true;
     }
 
     /// Snapshots the node-keyed interaction state for the cascade.
@@ -1326,6 +1412,12 @@ impl VelquView {
             },
         };
         let entry = (key, (x.max(0.0), y.max(0.0)));
+        let previous = self
+            .scroll_offsets
+            .iter()
+            .find(|(existing, _)| *existing == entry.0)
+            .map(|(_, offset)| *offset);
+        let changed = previous != Some(entry.1);
         match self
             .scroll_offsets
             .iter_mut()
@@ -1333,6 +1425,11 @@ impl VelquView {
         {
             Some(slot) => slot.1 = entry.1,
             None => self.scroll_offsets.push(entry),
+        }
+        if changed {
+            // The applied offset changes the frame's pixels: the next
+            // render re-emits from the baked tree (presentation-only).
+            self.presentation_dirty = true;
         }
         // Bake the clamped offset into the cached tree (mirroring what the
         // next layout's apply stage computes from the raw request), so hit
@@ -1475,6 +1572,10 @@ impl VelquView {
             });
         }
         self.hover = hit;
+        // :hover styling changes pixels only when a sheet matches on it.
+        if self.interaction_paint() {
+            self.presentation_dirty = true;
+        }
     }
 
     /// Builds the opaque public handle for a current-document DOM node.
@@ -1546,7 +1647,13 @@ impl VelquView {
                 self.begin_control_selection(viewport, node, x, y);
             }
         }
-        before != self.pressed
+        let changed = before != self.pressed;
+        if changed && self.interaction_paint() {
+            // :active styling changes pixels only when a sheet matches
+            // on it (a control press dirties via its caret placement).
+            self.presentation_dirty = true;
+        }
+        changed
     }
 
     /// Releases at `(x, y)` (viewport device px). If the press and release
@@ -1558,6 +1665,11 @@ impl VelquView {
         let Some(pressed) = self.pressed.take() else {
             return false;
         };
+        // The release clears `:active`; pixels change only when a sheet
+        // matches on it. A click's focus side effects dirty on their own.
+        if self.interaction_paint() {
+            self.presentation_dirty = true;
+        }
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
         let released = self
@@ -1708,7 +1820,8 @@ impl VelquView {
         // wheel events (a real pointer delivers many between frames)
         // accumulate and hit tests stay coherent — no invalidation, no
         // relayout; the next render reproduces the same values from the
-        // stored offsets.
+        // stored offsets. The frame still must be re-emitted from the
+        // baked tree: a presentation repaint.
         if let Some(laid) = self.last_laid.as_mut() {
             match result.node {
                 Some(node) => {
@@ -1717,6 +1830,7 @@ impl VelquView {
                 None => laid.root_offset = result.offset,
             }
         }
+        self.presentation_dirty = true;
         self.events.push(Event::Scrolled {
             target: match result.node {
                 None => ScrollTarget::Document,
@@ -1805,6 +1919,17 @@ impl VelquView {
         let from = self.focus.take().map(|node| self.node_target(node));
         self.focus = to;
         self.focus_origin = Some(origin);
+        // :focus styling changes pixels only when a sheet matches on it;
+        // moving focus to or from a control always repaints (the caret's
+        // editor paint reads focus).
+        let caret_moves = to.is_some_and(|node| self.controls.contains_key(&node))
+            || from.as_ref().is_some_and(|target| {
+                self.resolve_handle(target.handle)
+                    .is_some_and(|node| self.controls.contains_key(&node))
+            });
+        if caret_moves || self.interaction_paint() {
+            self.presentation_dirty = true;
+        }
         self.events.push(Event::FocusChanged {
             from,
             to: to.map(|node| self.node_target(node)),
@@ -2184,6 +2309,10 @@ impl VelquView {
             self.events.push(Event::PointerLeave {
                 target: self.node_target(old),
             });
+            // :hover styling changes pixels only when a sheet matches it.
+            if self.interaction_paint() {
+                self.presentation_dirty = true;
+            }
         }
     }
 
@@ -2313,21 +2442,30 @@ impl VelquView {
                 if handlers.is_empty() {
                     return TurnFlow::Nothing;
                 }
-                let payload = EventPayload::new(
-                    vec![
-                        ("type".to_owned(), PayloadValue::Str("click".to_owned())),
-                        (
-                            "id".to_owned(),
-                            target
-                                .id
-                                .clone()
-                                .map(PayloadValue::Str)
-                                .unwrap_or(PayloadValue::Null),
-                        ),
-                    ],
+                let entries = vec![
+                    ("type".to_owned(), PayloadValue::Str("click".to_owned())),
+                    (
+                        "id".to_owned(),
+                        target
+                            .id
+                            .clone()
+                            .map(PayloadValue::Str)
+                            .unwrap_or(PayloadValue::Null),
+                    ),
+                ];
+                let payload = match EventPayload::new(
+                    entries,
                     self.reactive_limits.max_event_payload_bytes,
-                )
-                .unwrap_or_default();
+                ) {
+                    Ok(payload) => payload,
+                    Err(too_large) => {
+                        machine.record_host_diagnostic(&format!(
+                            "click payload of {} bytes exceeds the {}-byte budget; turn skipped",
+                            too_large.size, too_large.max
+                        ));
+                        return TurnFlow::Nothing;
+                    }
+                };
                 match machine.prepare(Some(&payload), &handlers, None) {
                     velqu_reactive::TurnOutcome::Prepared(pending) => TurnFlow::Prepared(pending),
                     _ => TurnFlow::Nothing,
@@ -2356,14 +2494,23 @@ impl VelquView {
                 if model_write.is_none() && handlers.is_empty() {
                     return TurnFlow::Nothing;
                 }
-                let payload = EventPayload::new(
-                    vec![
-                        ("type".to_owned(), PayloadValue::Str("input".to_owned())),
-                        ("value".to_owned(), PayloadValue::Str(value.clone())),
-                    ],
+                let entries = vec![
+                    ("type".to_owned(), PayloadValue::Str("input".to_owned())),
+                    ("value".to_owned(), PayloadValue::Str(value.clone())),
+                ];
+                let payload = match EventPayload::new(
+                    entries,
                     self.reactive_limits.max_event_payload_bytes,
-                )
-                .unwrap_or_default();
+                ) {
+                    Ok(payload) => payload,
+                    Err(too_large) => {
+                        machine.record_host_diagnostic(&format!(
+                            "input payload of {} bytes exceeds the {}-byte budget; turn skipped",
+                            too_large.size, too_large.max
+                        ));
+                        return TurnFlow::Nothing;
+                    }
+                };
                 let write = model_write
                     .as_ref()
                     .map(|(path, value)| (path.as_str(), value.as_str()));
@@ -2499,7 +2646,7 @@ impl VelquView {
             self.rebuild_tailwind();
         }
         if structural {
-            self.structure_dirty = true;
+            self.mark_structure_dirty();
             self.last_laid = None;
         }
         if presentation {
@@ -5313,6 +5460,248 @@ mod tests {
         let _ = reactive.take_events();
         assert_eq!(reactive.render(vp).unwrap().frame.sha256_hex(), hash_plain);
         assert_eq!(reactive.reactive_state(), None);
+    }
+
+    // -- M5d invalidation batching (ADR 0018) ------------------------------
+
+    /// A presentation-only turn (control value/disabled mutations and
+    /// nothing else) re-emits the display list from cached geometry and
+    /// never touches Taffy.
+    #[test]
+    fn m5d_presentation_only_turn_costs_zero_taffy_one_repaint() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: 'a' }\">\
+             <input id=field vx-model=\"name\">\
+             <button id=set @click=\"name = 'b'\">set</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(); // turn zero: SetControlValue("a")
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let before = view.layout_stats();
+        assert_eq!(before.repaints, 1, "turn zero cost one repaint");
+
+        click_element(&mut view, vp, "set");
+        view.pump_reactive();
+        let _ = view.take_events();
+
+        let after = view.layout_stats();
+        assert_eq!(after.passes, before.passes, "no Taffy pass for the turn");
+        view.render(vp).unwrap();
+        let after = view.layout_stats();
+        assert_eq!(after.passes, before.passes, "still no Taffy pass");
+        assert_eq!(
+            after.repaints,
+            before.repaints + 1,
+            "one presentation repaint"
+        );
+        // The control did update — silently, through runtime state.
+        let field = view
+            .control_facts(vp)
+            .unwrap()
+            .controls
+            .into_iter()
+            .find(|fact| fact.target.id.as_deref() == Some("field"))
+            .unwrap();
+        assert_eq!(field.value_length, 1);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("name")),
+            Some(velqu_reactive::ReactiveValue::String("b".to_owned()))
+        );
+    }
+
+    /// A structural turn runs exactly one Taffy pass per render — however
+    /// many bindings changed — and does not count as a repaint.
+    #[test]
+    fn m5d_structural_turn_runs_exactly_one_taffy_pass() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ a: 0, b: 0, c: 0, d: 0, e: 0 }\">\
+             <p data-vv-test=a vx-text=\"'a' + a\">a0</p>\
+             <p data-vv-test=b vx-text=\"'b' + b\">b0</p>\
+             <p data-vv-test=c vx-text=\"'c' + c\">c0</p>\
+             <p data-vv-test=d vx-text=\"'d' + d\">d0</p>\
+             <p data-vv-test=e vx-text=\"'e' + e\">e0</p>\
+             <button id=go @click=\"a = 1; b = 1; c = 1; d = 1; e = 1\">go</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 300, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let before = view.layout_stats();
+
+        click_element(&mut view, vp, "go");
+        view.pump_reactive();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+
+        let after = view.layout_stats();
+        assert_eq!(after.passes, before.passes + 1, "five SetText, one pass");
+        assert_eq!(
+            after.repaints, before.repaints,
+            "a layout pass is not a repaint"
+        );
+        for name in ["a", "b", "c", "d", "e"] {
+            assert_eq!(text_of(&mut view, vp, name), [format!("{name}1")]);
+        }
+    }
+
+    /// A turn whose diff is empty — handlers ran, state committed, no
+    /// binding output moved — dirties nothing: the next render paints the
+    /// cached display list unchanged, with zero repaints and zero passes.
+    #[test]
+    fn m5d_noop_turn_repaints_nothing() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ label: 'x', spare: 0 }\">\
+             <p data-vv-test=label vx-text=\"label\">x</p>\
+             <button id=ping @click=\"spare = spare + 1\">ping</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        // An idle render produces the reference frame at zero cost.
+        let frame_before = view.render(vp).unwrap().frame.sha256_hex();
+        let before = view.layout_stats();
+
+        click_element(&mut view, vp, "ping");
+        view.pump_reactive();
+        let _ = view.take_events();
+        // The turn committed state (spare advanced)…
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("spare")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+        // …but produced no mutations: the frame is byte-identical and
+        // neither counter moved.
+        let frame_after = view.render(vp).unwrap().frame.sha256_hex();
+        let after = view.layout_stats();
+        assert_eq!(frame_after, frame_before);
+        assert_eq!(after.passes, before.passes, "no Taffy pass");
+        assert_eq!(after.repaints, before.repaints, "no repaint");
+    }
+
+    /// A steady-state render with nothing dirty is free: cached display
+    /// list, zero accounting, byte-identical frame.
+    #[test]
+    fn m5d_idle_render_costs_nothing() {
+        let mut view = VelquView::new();
+        view.load_html("<!doctype html><html><body>hello</body></html>")
+            .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let before = view.layout_stats();
+        let first = view.render(vp).unwrap().frame.sha256_hex();
+        let middle = view.layout_stats();
+        let second = view.render(vp).unwrap().frame.sha256_hex();
+        let after = view.layout_stats();
+        assert_eq!(first, second, "byte-identical frame");
+        assert_eq!(after.passes, before.passes);
+        assert_eq!(middle.repaints, before.repaints);
+        assert_eq!(after.repaints, before.repaints, "no repaint accounting");
+    }
+
+    /// However many turns queue between frames, one render pays for all
+    /// of them: at most one Taffy pass.
+    #[test]
+    fn m5d_multiple_turns_settle_in_one_pass() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">increment</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive();
+        view.render(vp).unwrap();
+        let _ = view.take_events();
+        let before = view.layout_stats();
+
+        // Two queued clicks → two atomic turns, one settling render.
+        click_element(&mut view, vp, "inc");
+        click_element(&mut view, vp, "inc");
+        view.pump_reactive();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+
+        let after = view.layout_stats();
+        assert_eq!(after.passes, before.passes + 1, "two turns, one pass");
+        assert_eq!(text_of(&mut view, vp, "label"), ["Count: 2"]);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(2.0))
+        );
+    }
+
+    /// Interaction changes are precise, not conservative: without an
+    /// interaction selector anywhere in the cascade, hovering never
+    /// re-emits the display list; adding one flips the memo and hover
+    /// repaints again.
+    #[test]
+    fn m5d_hover_without_stateful_paint_is_free() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div id=one style=\"width: 100px; height: 50px\">one</div>\
+             <div id=two style=\"width: 100px; height: 50px\">two</div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let before = view.layout_stats();
+
+        // Hover across both panes: PointerEnter/Leave events queue, but
+        // no sheet matches :hover — nothing repaints.
+        view.pointer_move(vp, 50.0, 20.0);
+        view.pointer_move(vp, 50.0, 80.0);
+        let _ = view.take_events();
+        let frame_quiet = view.render(vp).unwrap().frame.sha256_hex();
+        let quiet = view.layout_stats();
+        assert_eq!(
+            quiet.repaints, before.repaints,
+            "no stateful paint, no repaint"
+        );
+        assert_eq!(quiet.passes, before.passes);
+
+        // A :hover rule joins the cascade: the memo recomputes on the
+        // structural change and hover becomes a presentation repaint.
+        view.load_css("div:hover { color: red }").unwrap();
+        view.render(vp).unwrap(); // restyle: one structural pass
+        let with_rules = view.layout_stats();
+        view.pointer_move(vp, 50.0, 20.0); // hover #one (was #two)
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+        let after = view.layout_stats();
+        assert_eq!(after.passes, with_rules.passes, "hover adds no pass");
+        assert_eq!(after.repaints, with_rules.repaints + 1, "hover repaints");
+        assert_ne!(view.render(vp).unwrap().frame.sha256_hex(), frame_quiet);
     }
 
     #[test]

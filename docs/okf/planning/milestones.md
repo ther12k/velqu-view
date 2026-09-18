@@ -64,8 +64,11 @@ validated Rust-owned plan — semantic checks, deterministic conflicts,
 generation-scoped ids; static docs byte-identical — ADR 0016, done);
 **M5c** state + events (M4 events → bounded non-reentrant
 transactional turns; atomic state+UI commits, model-before-handler,
-silent control writes — ADR 0017, done); **M5d** invalidation/batching
-(presentation → zero Taffy, structural → one pass) next.
+silent control writes — ADR 0017, done); **M5d**
+invalidation/batching (presentation-only turn → zero Taffy passes,
+structural turn → exactly one pass, no-op turn → zero repaints;
+`presentation_dirty` gating plus a precise interaction-paint probe —
+ADR 0018, done).
 
 Exit: counter/forms/tabs examples pass reactive conformance.
 
