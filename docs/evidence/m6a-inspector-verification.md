@@ -69,3 +69,7 @@ clock — the API is `&self`, so the compiler enforces most of it.
   --locked`; headless dashboard smoke digest unchanged
   (`770b933b…`); counter/forms/tabs conformance unchanged; the lab's
   `--inspect` run shown above.
+
+Landing: `4471722` pushed to `main`; GitHub CI green — run
+[35397858504](https://github.com/ther12k/velqu-view/actions/runs/35397858504)
+(fmt/clippy/test/build + MSRV 1.87, both jobs).
