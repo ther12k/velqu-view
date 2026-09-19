@@ -154,6 +154,40 @@ cargo test -p velqu-view --test reference_dashboard m7_regenerate \
 
 Review the PNGs, then pin the printed digests as the new constants.
 
+## Developing against it
+
+Interactive run (renders a real window):
+
+```sh
+velqu-lab --tailwind --reactive --size 1280x800 examples/reference-dashboard
+```
+
+Add `--watch` (native notifications) or `--watch=poll` to hot-reload.
+The dev loop uses the transactional reload APIs (ADR 0021/0022):
+
+- **CSS edit** → `reload_stylesheets`: styling publishes only when it
+  accepts; model values, selection, focus, and live scroll state
+  survive (pinned by `m7_css_reload_preserves_live_state`).
+- **HTML edit** → `reload_bundle` (document + sheets as one
+  transaction): a candidate that fails acceptance (e.g. a reactive
+  initializer that throws) is rejected and the running application
+  stays usable on its generation; a valid one publishes fresh
+  source-defined state (pinned by
+  `m7_full_reload_rejection_then_publication`).
+
+Run `--inspect` headless to print the inspector record (generations,
+layout passes, repaints, turns, display items) alongside the frame
+digest; `--out DIR` writes PNGs. The headless digest is byte-identical
+to the test harness's, which is what makes the frozen baselines in
+`crates/velqu-view/tests/reference_dashboard.rs` reviewable from
+either path.
+
+Restyling guidance: change utilities in `index.html`, or interaction
+states in `app.css` (restricted to the interaction paint properties
+above). Unknown unprefixed utilities are diagnosed, never silently
+dropped; `vv-`-prefixed classes are the document's own hook namespace
+(ADR 0023) and carry no utility declarations.
+
 ## Acceptance
 
 The M7 acceptance matrix — initial dashboard, filter and clear search,

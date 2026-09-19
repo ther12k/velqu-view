@@ -589,3 +589,69 @@ fn m7_visual_baselines() {
         assert_eq!(first, second, "scale {scale}: deterministic");
     }
 }
+
+/// Resource baseline (docs/evidence/m7-reference-dashboard.md): a
+/// scripted journey's cumulative turn/layout/repaint counters and RSS
+/// across bounded full reloads. Ignored — run explicitly with
+/// `--ignored --nocapture` after intentional changes; counters are
+/// deterministic for the journey, memory is indicative only.
+#[test]
+#[ignore = "resource-baseline measurement tool; see docs/evidence/m7-reference-dashboard.md"]
+fn m7_resource_journey() {
+    let vp = viewport(VP.0, VP.1, 1.0);
+    let mut view = load_reference();
+    settle(&mut view, vp);
+
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("/proc available")
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1).map(String::from))
+            .and_then(|kb| kb.parse().ok())
+            .expect("VmRSS line")
+    }
+
+    let print_step = |view: &VelquView, label: &str| {
+        let counters = view.inspector_snapshot(vp, None).counters;
+        println!(
+            "{label}: turns={} layouts={} repaints={} items={} rss={}kB",
+            counters.reactive_turns,
+            counters.layout_passes,
+            counters.repaints,
+            counters.display_items_last,
+            rss_kb(),
+        );
+    };
+
+    // The scripted journey: filter → select → edit → save → clear.
+    print_step(&view, "initial");
+    type_into(&mut view, vp, "search", "waiting");
+    print_step(&view, "filter-waiting");
+    click_id(&mut view, vp, "row-2210");
+    print_step(&mut view, "select-2210");
+    type_into(&mut view, vp, "edit-name-2210", "Siti Rahayu (vip)");
+    print_step(&mut view, "edit-name");
+    click_id(&mut view, vp, "save-2210");
+    print_step(&mut view, "save");
+    type_into(&mut view, vp, "search", "");
+    print_step(&mut view, "clear-filter");
+
+    // Memory across bounded full reloads (same source): indicative.
+    let html = std::fs::read_to_string(app_dir().join("index.html")).unwrap();
+    let sheets = view.stylesheets().to_vec();
+    for cycle in 1..=5 {
+        view.reload_bundle(
+            velqu_view::DocumentSource::new("index.html", html.clone()),
+            sheets.clone(),
+            vp,
+        )
+        .expect("reload publishes");
+        settle(&mut view, vp);
+        println!(
+            "reload-cycle-{cycle}: generation={} rss={}kB",
+            view.inspector_snapshot(vp, None).generation,
+            rss_kb()
+        );
+    }
+}

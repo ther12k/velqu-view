@@ -40,7 +40,7 @@ native lightweight application UI
 | M4c3 | IME: preedit presentation + atomic commit, session-scoped composition, shell-side enablement ([ADR 0014](docs/decisions/0014-m4c3-ime.md)) | **done** |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) — **M5a runtime gate** (ADR 0015), **M5b binding compiler** (ADR 0016), **M5c reactive turns** (ADR 0017), **M5d invalidation batching** (ADR 0018); exit conformance: counter/forms/tabs examples run (`velqu-lab --tailwind --reactive`) and are test-pinned | **done** |
 | M6 | VelquView Lab inspector + reload — **M6a.1 event ownership** (ADR 0019), **M6a inspector** (ADR 0020), **M6b transactional reload** (ADR 0021), **M6c file watching** (ADR 0022: host-side reconciliation over the transactional reload APIs, `velqu-lab --watch`) done | **done** |
-| M7 | reference dashboard — fixture page + documented profile (ADR 0023, [`docs/reference-dashboard.md`](docs/reference-dashboard.md)); interactions, conformance matrix, visual baselines, dev-loop evidence landing in sequence | in progress |
+| M7 | reference dashboard — fixture + documented profile (ADR 0023), conformance matrix, reviewed visual baselines, dev-loop + resource baseline ([`docs/reference-dashboard.md`](docs/reference-dashboard.md), [`docs/evidence/m7-reference-dashboard.md`](docs/evidence/m7-reference-dashboard.md)) | **done** |
 | M8 | Mini IDE benchmark shell | |
 | M9 | Electron/Tauri/VelquView comparative benchmark | |
 | M10 | GO / NO-GO decision | |
