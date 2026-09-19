@@ -14,10 +14,11 @@ documented public surface.
 
 | Item | Value |
 |---|---|
-| Baseline commit (M7 acceptance) | `199ccb0335f8121802582b483e2a0de25a3814f2` |
-| Closure commit (this record + 0%-basis scoping) | recorded in git at the tip that carries this file |
-| CI on baseline | run `35447937753` — fmt/clippy(-D warnings)/test/release-build and MSRV 1.87 lanes, both green (2m16s) |
-| Gate at closure | `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --locked` zero warnings; `cargo test --workspace --locked` 338 passed / 0 failed; `cargo +1.87.0 check --workspace --all-targets --locked` clean |
+| M7 evidence anchor (original acceptance) | `199ccb0335f8121802582b483e2a0de25a3814f2` |
+| Phase-1 closure point | `624bd1e` (closure record + 0%-basis scoping; CI run `35451329843` green) |
+| Deviation-record amendment | the commit carrying the reclassified scroll-basis wording (follows the closure point; same gates) |
+| CI on M7 anchor | run `35447937753` — fmt/clippy(-D warnings)/test/release-build and MSRV 1.87 lanes, both green (2m16s) |
+| Gate at closure | `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --locked` zero warnings; `cargo test --workspace --locked` 338 passed / 0 failed (339 after the deviation pin); `cargo +1.87.0 check --workspace --all-targets --locked` clean |
 | Reference application | `examples/reference-dashboard` (ADR 0023; profile: [`docs/reference-dashboard.md`](../reference-dashboard.md); evidence: [`m7-reference-dashboard.md`](m7-reference-dashboard.md)) |
 
 Milestone table: M1 foundation → M2a/b/c layout/text/images → M3
@@ -69,20 +70,42 @@ The M7 review asked for one narrow engine-correctness resolution
 before unconditional sign-off; it is closed here, and the two
 precision items alongside it:
 
-1. **`flex-basis: 0%` vs `0px` distinction preserved** (the WPT
+1. **`flex-basis: 0%` vs `0px` distinction preserved — except one
+   recorded deviation** (the WPT
    `flex-one-sets-flex-basis-to-zero-px.html` concern). The M7-era
    projection converted every `0%` basis to an absolute zero — too
    broad: a percentage basis is content-based when the container's
    main size is indefinite, exactly where browsers distinguish it from
-   `0px`. The conversion is now scoped to **scroll-container flex
-   items only** (computed overflow neither `visible` nor `clip` on an
-   axis), where browsers size the intrinsic contribution at zero and
-   Taffy's content-based measurement diverged — the dashboard's
-   original failure. Pinned by
-   `explicit_zero_percent_basis_stays_content_based` (auto-height
+   `0px`. Non-scroll items now keep their declared percentage, pinned
+   by `explicit_zero_percent_basis_stays_content_based` (auto-height
    column: `0%` item content-based, `0px` item zero-based,
-   `min-height: 0` on both; definite height: identical). Non-scroll
-   items keep their declared percentage through layout.
+   `min-height: 0` on both; definite height: identical).
+
+   **Compatibility deviation (recorded, deliberate):** the backend
+   retains a scrollable-overflow-specific zero-basis workaround for
+   the reference layout — flex items whose computed overflow is
+   neither `visible` nor `clip` still project an explicit `0%` as an
+   absolute zero. This is what makes the dashboard's `flex-1
+   overflow-y-auto` records list share a row with the fixed panel
+   under Taffy's content-based intrinsic measurement; it is a
+   workaround for that layout class, not a browser-equivalence rule.
+   Independent browser evidence (Chromium 144.0.7559.96, font-free
+   fixture: two column flex items with `min-height: 0`, a 40px child
+   each, bases `0%` vs `0px`): in an auto-height container the `0%`
+   item measures 40px and the `0px` item 0px — for *every* overflow
+   value in {visible, auto, hidden, clip, scroll}; with a definite
+   100px container both measure 50px. Zero *automatic minimum*
+   (Flexbox §4.5) does not make the *flex base* zero: explicit
+   percentage and length zero bases can still differ in
+   indefinite-size containers, including items with scrollable
+   overflow. Velqu erases that difference for scroll-container items
+   on purpose and pins the current behavior as a deviation
+   (`scrollable_zero_percent_is_a_documented_deviation` — its
+   assertions flip when the workaround is retired). When the backend
+   path is next revised, the correction should preserve the authored
+   basis and address the relevant measurement/definiteness
+   calculation separately; that revision is a named future change,
+   not an M8.
 2. **Overflow normalization stated precisely.** When one axis is
    neither `visible` nor `clip`: the other axis's `visible` computes
    to `auto` and its `clip` computes to `hidden`; `visible`/`clip`
@@ -149,9 +172,12 @@ gate):
 
 ## Disposition
 
-Phase 1 is closed as a completed implementation, not an unlimited
-compatibility promise: the frozen scope is the documented v0 profiles
-(Tailwind utilities, reactive v0, CSS named profile) plus the
-deviation records above. No M8 is opened by this record; renderer
-rewrites, new reactive subsystems, or profile expansions are
-separately named future proposals.
+Phase 1 is complete against its documented contract — not an
+unrestricted CSS compatibility claim, and not a release-readiness
+claim. The frozen scope is the documented v0 profiles (Tailwind
+utilities, reactive v0, CSS named profile) plus the recorded
+deviations: the scrollable-overflow zero-basis workaround above, the
+parse-time `scroll`→`auto` fold, and the flex-acquired-height
+percentage limitation. No M8 is opened by this record; retiring a
+deviation, a renderer rewrite, a new reactive subsystem, or a profile
+expansion is a separately named future proposal.

@@ -370,20 +370,31 @@ fn map_style(
         },
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
-        // Zero-basis scoping (constrained workaround, not a rewrite): an
-        // explicit `0%` basis (Tailwind's `flex-1`) stays a percentage in
-        // general — under an indefinite main size a percentage basis is
-        // content-based, the `0%` ≠ `0px` distinction browsers pin for
-        // auto-sized columns (WPT flex-one-sets-flex-basis-to-zero-px).
-        // The exception is scroll-container flex items (computed overflow
-        // neither `visible` nor `clip` on an axis — Taffy's automatic-
-        // minimum trigger): their intrinsic contribution is zero in
-        // browsers (scrollable content never widens an ancestor's
-        // intrinsic size), while Taffy's intrinsic measurement is
-        // content-based. Projecting `0%` as an absolute zero for exactly
-        // those items reproduces browser intrinsic sizing — the
-        // reference-dashboard failure shape — without touching anyone
-        // else's declared semantics.
+        // Zero-basis handling. In general an explicit `0%` basis
+        // (Tailwind's `flex-1`) stays a percentage — under an indefinite
+        // main size a percentage basis is content-based, the `0%` ≠ `0px`
+        // distinction browsers pin for auto-sized columns (WPT
+        // flex-one-sets-flex-basis-to-zero-px).
+        //
+        // The backend additionally carries a scrollable-overflow-specific
+        // zero-basis workaround for the reference layout: items whose
+        // computed overflow is scrollable (neither `visible` nor `clip`
+        // on an axis — Taffy's automatic-minimum trigger) project the
+        // absolute zero, which is what lets the dashboard's `flex-1
+        // overflow-y-auto` records list share a row with a fixed panel
+        // under Taffy's content-based intrinsic measurement. This is a
+        // **known compatibility deviation**, not a browser-equivalence
+        // rule: zero automatic minimum (Flexbox §4.5) does not make the
+        // flex base zero, and Chromium 144 measures an explicit `0%`
+        // scroll-container item at its content height in an auto-height
+        // column (40px vs 0px for a `0px` basis). Explicit percentage and
+        // length zero bases can still differ in indefinite-size
+        // containers, including items with scrollable overflow; that
+        // difference is deliberately erased here, pinned as a deviation
+        // (layout::tests::scrollable_zero_percent_is_a_documented_deviation,
+        // docs/evidence/phase1-closure.md). When this path is next
+        // revised, preserve the authored basis and fix the relevant
+        // measurement/definiteness calculation instead.
         flex_basis: style
             .flex_basis
             .map(|len| match len {

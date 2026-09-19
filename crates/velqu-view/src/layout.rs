@@ -1204,12 +1204,14 @@ mod tests {
     #[test]
     fn flex_zero_basis_distributes_free_space_not_content() {
         // `flex: 1 1 0%` (Tailwind `flex-1`) on a scroll-container item:
-        // the zero basis (projected absolute for scroll containers) means
-        // the item grows from zero into the *free space*, not from its
-        // content size — the item takes exactly the remainder after the
-        // fixed sibling, even when its content is wider. Non-scroll
-        // items keep the percentage basis; their distinction is pinned
-        // by explicit_zero_percent_basis_stays_content_based.
+        // via the documented zero-basis deviation (see
+        // scrollable_zero_percent_is_a_documented_deviation) the zero
+        // basis means the item grows from zero into the *free space*,
+        // not from its content size — the item takes exactly the
+        // remainder after the fixed sibling, even when its content is
+        // wider. Non-scroll items keep the percentage basis; their
+        // distinction is pinned by
+        // explicit_zero_percent_basis_stays_content_based.
         let facts = facts_for(
             "<body><div data-vv-test=row class=row>\
              <div data-vv-test=fixed class=fixed></div>\
@@ -1230,10 +1232,15 @@ mod tests {
 
     #[test]
     fn scroll_container_flex_item_drops_content_minimum() {
-        // Flexbox §4.5: a scroll container's automatic minimum size is
-        // zero, so `flex-1 overflow-y-auto` shares a row with a fixed
-        // panel even when its content's min-content width is larger
-        // than the space left (the reference-dashboard failure shape).
+        // The reference-dashboard failure shape: `flex-1
+        // overflow-y-auto` shares a row with a fixed panel even when its
+        // content's min-content width is larger than the space left.
+        // Both mechanisms contribute: Taffy's automatic minimum is zero
+        // for scroll containers (Flexbox §4.5), and the explicit `0%`
+        // basis projects as the documented zero-basis deviation for
+        // scroll-container items. The outcome is browser-matching for
+        // this definite-width row; the deviation record covers the
+        // indefinite-size cases.
         let facts = facts_for(
             "<body><div data-vv-test=row class=row>\
              <div data-vv-test=fixed class=fixed></div>\
@@ -1303,6 +1310,52 @@ mod tests {
         let pc = fact(&definite, "pc");
         assert_eq!(px.height, 50.0, "0px grows from zero: {}", px.height);
         assert_eq!(pc.height, 50.0, "0% resolves to zero: {}", pc.height);
+    }
+
+    /// The scroll-container half of the zero-basis rule is a **documented
+    /// compatibility deviation**, and this test pins it as such — it is
+    /// the executable form of the deviation record in
+    /// docs/evidence/phase1-closure.md. Velqu projects an explicit `0%`
+    /// basis as an absolute zero for items with scrollable overflow (the
+    /// reference dashboard's `flex-1 overflow-y-auto` list), so in an
+    /// auto-height column the `0%` and `0px` items lay out identically.
+    /// Chromium 144 measures them differently there (content-based 0%
+    /// item at its 40px child vs a 0px item at zero): zero *automatic
+    /// minimum* (Flexbox §4.5) does not make the *flex base* zero. When
+    /// the backend path is revised to preserve the authored basis, flip
+    /// these assertions to the browser split and retire the deviation
+    /// record.
+    #[test]
+    fn scrollable_zero_percent_is_a_documented_deviation() {
+        let html = "<body><div data-vv-test=col class=column>\
+             <div data-vv-test=pc class=\"item pc\"><div class=content></div></div>\
+             <div data-vv-test=px class=\"item pxl\"><div class=content></div></div>\
+             </div></body>";
+        let css = |height: &str| {
+            format!(
+                "body {{ margin: 0 }} .column {{ display: flex; flex-direction: column; width: 200px; height: {height} }} \
+                 .item {{ flex-grow: 1; flex-shrink: 1; min-height: 0; overflow: auto }} \
+                 .pc {{ flex-basis: 0% }} .pxl {{ flex-basis: 0px }} \
+                 .content {{ height: 40px }}"
+            )
+        };
+        // Auto-height column: Velqu collapses both items to the zero base
+        // (equal heights). Chromium 144.0.7559.96 measures the 0% item at
+        // 40px and the 0px item at 0px — the erased distinction.
+        let auto = facts_for(html, &css("auto"), 400, 300);
+        let pc = fact(&auto, "pc");
+        let px = fact(&auto, "px");
+        assert_eq!(
+            pc.height, px.height,
+            "deviation pinned: Velqu treats 0% as 0px for scroll-container items"
+        );
+        // Definite height: both resolve to zero and split evenly — no
+        // divergence from the browser in this case.
+        let definite = facts_for(html, &css("100px"), 400, 300);
+        let pc = fact(&definite, "pc");
+        let px = fact(&definite, "px");
+        assert_eq!(px.height, 50.0);
+        assert_eq!(pc.height, 50.0);
     }
 
     #[test]

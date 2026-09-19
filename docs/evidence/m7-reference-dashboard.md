@@ -79,31 +79,42 @@ a named regression:
    parse time (paint-side scrolling).
    `style::tests::overflow_visible_coerces_to_auto_on_the_other_axis`
    (covers all pairing rows, including visible/clip uncoerced).
-2. **Zero flex-basis projection — scoped to scroll-container items**
-   (a constrained workaround, not a general rewrite). An explicit
-   `flex-basis: 0%` (Tailwind's `flex-1`) is **not** equivalent to
-   `0px`: a percentage basis resolves against the flex container's
-   main size, and when that size is indefinite the used basis is
-   content-based — the `0%` ≠ `0px` distinction browsers pin for
-   auto-sized columns (WPT
-   `flex-one-sets-flex-basis-to-zero-px.html`). Velqu therefore keeps
-   the declared percentage for items in general
+2. **Zero flex-basis: percentage preserved, with one recorded
+   deviation.** An explicit `flex-basis: 0%` (Tailwind's `flex-1`) is
+   **not** equivalent to `0px`: a percentage basis resolves against the
+   flex container's main size, and when that size is indefinite the
+   used basis is content-based — the `0%` ≠ `0px` distinction browsers
+   pin for auto-sized columns (WPT
+   `flex-one-sets-flex-basis-to-zero-px.html`). Velqu keeps the
+   declared percentage for items in general
    (`layout::tests::explicit_zero_percent_basis_stays_content_based`:
    an auto-height column sizes the `0%` item from content while the
    `0px` item starts at zero, with `min-height: 0` keeping the
    automatic minimum out of the way; against a definite height both
-   resolve to zero and the distinction disappears). The exception is
-   scroll-container flex items (computed overflow neither `visible`
-   nor `clip` on an axis): their intrinsic contribution is zero in
-   browsers — scrollable content never widens an ancestor's intrinsic
-   size — while Taffy's intrinsic measurement is content-based;
-   projecting `0%` as an absolute zero for exactly those items
-   reproduces browser intrinsic sizing without touching anyone else's
-   declared semantics.
+   resolve to zero and the distinction disappears).
+   **Known compatibility deviation:** the backend additionally
+   projects an explicit `0%` as an absolute zero for flex items with
+   scrollable overflow (computed overflow neither `visible` nor
+   `clip` on an axis). That workaround is what lets the dashboard's
+   `flex-1 overflow-y-auto` records list share a row with a fixed
+   panel under Taffy's content-based intrinsic measurement — it is a
+   compatibility workaround for this layout class, **not** a general
+   browser-equivalence rule. Zero automatic minimum (Flexbox §4.5)
+   does not make the flex base zero: Chromium 144 measures an
+   explicit `0%` scroll-container item at its content height in an
+   auto-height column (40px vs 0px for a `0px` basis, for every
+   overflow value in {visible, auto, hidden, clip, scroll}; definite
+   heights agree at 50/50). Explicit percentage and length zero
+   bases can still differ in indefinite-size containers, including
+   items with scrollable overflow; the projection erases that
+   difference deliberately and pins it as a deviation
+   (`layout::tests::scrollable_zero_percent_is_a_documented_deviation`
+   — flip its assertions when the backend is revised to preserve the
+   authored basis and fix the relevant measurement/definiteness
+   calculation). Dashboard-shape outcomes:
    `layout::tests::flex_zero_basis_distributes_free_space_not_content`,
    `layout::tests::scroll_container_flex_item_drops_content_minimum`
-   (the dashboard's failure shape; `scroll_width` still reports the
-   full extent).
+   (`scroll_width` still reports the full extent).
 3. **Percentage height needs a definite parent** (CSS2 §10.5) —
    `height: 100%` resolves against a parent height that is definite;
    against a content-sized parent the percentage *behaves as* `auto`
