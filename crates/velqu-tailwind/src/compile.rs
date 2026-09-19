@@ -67,6 +67,14 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
             continue;
         }
         seen.push(class);
+        // The reserved author-hook namespace (M7, ADR 0023): classes
+        // prefixed `vv-` are the document's own semantic/test hooks
+        // (paired with `data-vv-test`), never utilities. Skipping them
+        // is a documented convention, not a disabled check — unknown
+        // unprefixed utilities still diagnose.
+        if class.starts_with("vv-") {
+            continue;
+        }
         match utility_declarations(class) {
             Ok(declarations) => {
                 let body = declarations
@@ -704,6 +712,22 @@ mod tests {
         assert!(has("mx-auto", "margin: auto"));
         assert!(has("underline", "renderer profile"));
         assert!(has("unknown-class", "not a known utility"));
+    }
+
+    #[test]
+    fn vv_prefixed_author_hooks_are_skipped_not_diagnosed() {
+        // The reserved author-hook namespace (M7, ADR 0023): `vv-`
+        // classes are the document's own semantic/test hooks, skipped
+        // by the compiler. Unknown unprefixed utilities still
+        // diagnose — the check is a convention, not a disable.
+        let build =
+            compile_utilities(&["vv-rail", "vv-row-selected", "bg-zinc-950", "typo-utlity"]);
+        assert!(build.diagnostics.iter().any(|d| d.class == "typo-utlity"));
+        assert!(
+            !build.diagnostics.iter().any(|d| d.class.starts_with("vv-")),
+            "author hooks never diagnose"
+        );
+        assert_eq!(build.rules, 1, "only the real utility compiled");
     }
 
     #[test]
