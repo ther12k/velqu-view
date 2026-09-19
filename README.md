@@ -39,7 +39,7 @@ native lightweight application UI
 | M4c2 | clipboard: Copy/Cut/Paste through a host `ClipboardProvider`, arboard in the shell ([ADR 0013](docs/decisions/0013-m4c2-clipboard.md)) | **done** |
 | M4c3 | IME: preedit presentation + atomic commit, session-scoped composition, shell-side enablement ([ADR 0014](docs/decisions/0014-m4c3-ime.md)) | **done** |
 | M5 | Velqu Reactive v0 (isolated UI QuickJS) — **M5a runtime gate** (ADR 0015), **M5b binding compiler** (ADR 0016), **M5c reactive turns** (ADR 0017), **M5d invalidation batching** (ADR 0018); exit conformance: counter/forms/tabs examples run (`velqu-lab --tailwind --reactive`) and are test-pinned | **done** |
-| M6 | VelquView Lab inspector + reload — **M6a.1 event ownership** (ADR 0019), **M6a inspector** (ADR 0020: recorded-outcome trace, bounded retention, observational snapshots, `velqu-lab --inspect`) done; M6b transactional reload, M6c file watching next | in progress |
+| M6 | VelquView Lab inspector + reload — **M6a.1 event ownership** (ADR 0019), **M6a inspector** (ADR 0020), **M6b transactional reload** (ADR 0021: candidates publish through the first frame; CSS-only reload stages the committed document; acceptance is a policy) done; M6c file watching next | in progress |
 | M7 | reference Tailwind dashboard | |
 | M8 | Mini IDE benchmark shell | |
 | M9 | Electron/Tauri/VelquView comparative benchmark | |

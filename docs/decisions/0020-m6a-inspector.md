@@ -62,9 +62,14 @@ full text (event values, previews) only under the explicit
 
 ### 6. Snapshots are observational
 
-`inspector_snapshot(viewport, selection)` takes `&self`: no pumping,
-draining, rendering, layout, or JS-runtime access; the logical clock
-and deterministic random stream cannot advance through inspection.
+`inspector_snapshot(viewport, selection)` uses shared access to
+cached, recorded data. Its implementation and regression tests
+establish that it does not execute application work: no pumping,
+draining, rendering, layout, or JS-runtime access, and the logical
+clock and deterministic random stream cannot advance through
+inspection. (The `&self` signature is a guardrail that reinforces
+this, not proof of purity — shared references permit interior
+mutability in general; the tests are the evidence.)
 Geometry and styles come from the **cached** box tree (effective,
 interaction-patched, as of the last paint — with the interaction flags
 *now* shown alongside); a missing cache reports `NotAvailable`, a

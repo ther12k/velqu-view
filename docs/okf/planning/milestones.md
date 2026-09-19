@@ -89,7 +89,18 @@ attempted-vs-committed and requested-vs-completed distinctions,
 coalesced bounded causes, byte- and count-bounded retention with
 honest loss reporting, metadata-default capture), observational
 snapshots (`&self`, cached-only, coherence/staleness exposed), and
-`velqu-lab --inspect`; **M6b transactional hot reload** — candidate
+`velqu-lab --inspect`; **M6b transactional hot reload** (ADR 0021,
+done) — `reload_document` prepares a candidate through its first
+rendered frame and publishes a new generation atomically (host
+lifetime survives; failed candidates leave generation gaps, never
+collisions); `reload_stylesheets` stages in-place `SourceId` upserts
+against the committed document — no reparse, no initializers, no new
+runtime — with snapshot/restore on rejection and interaction-state
+reconciliation on success; reload acceptance is a policy table
+(Source / ReactiveInitialization / InitialMutations / FirstFrame),
+distinct from parser recovery and from "any diagnostic"; the attempt
+ledger and `Reload` trace records separate failed candidates from the
+active application; **M6c file watching** — candidate
 builds fully (parse/compile/runtime/initial validation) before an
 atomic generation swap; failures keep the old document running with
 diagnostics; CSS-only reload upserts the sheet and preserves reactive

@@ -56,6 +56,16 @@ impl Default for InspectorLimits {
     }
 }
 
+/// A rollback point for the trace (speculative staging, M6b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TraceCheckpoint {
+    len: usize,
+    seq: u64,
+    appended: u64,
+    evicted: u64,
+    truncated: u64,
+}
+
 /// One trace record. `seq` is monotonically increasing across the
 /// view's lifetime and never renumbers; evicted records leave visible
 /// gaps in the retained window.
@@ -71,6 +81,9 @@ pub struct TraceRecord {
 /// relationship exists — a rigid pipeline is deliberately not assumed
 /// (events with no handler, initialization turns with no event,
 /// several turns per frame, presentation updates without any turn).
+/// Reloads (M6b) append their own record: published or rejected, with
+/// generations — a rejected candidate's speculative work never enters
+/// the trace because it ran on the candidate, not the application.
 #[derive(Debug, Clone)]
 pub enum TraceRecordKind {
     /// An event the pump observed in a caller-owned batch.
@@ -84,6 +97,25 @@ pub enum TraceRecordKind {
     /// One completed render's actual work (the only source of
     /// pass-count deltas).
     Render(RenderRecord),
+    /// One reload attempt's outcome (M6b, ADR 0021).
+    Reload(ReloadTraceRecord),
+}
+
+/// One reload attempt in the trace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadTraceRecord {
+    /// Monotonic attempt id.
+    pub attempt: u64,
+    /// "document" or "stylesheets".
+    pub kind: &'static str,
+    /// Whether the attempt published.
+    pub published: bool,
+    /// Active generation before the attempt.
+    pub generation_before: u64,
+    /// Active generation after the attempt (unchanged on rejection).
+    pub generation_after: u64,
+    /// Rejecting stage label (empty on publication).
+    pub stage: &'static str,
 }
 
 /// An observed event: metadata by default, never captured user text
@@ -274,6 +306,7 @@ impl Trace {
             }
             TraceRecordKind::Invalidation(invalidation) => BASE + text(&invalidation.causes),
             TraceRecordKind::Render(render) => BASE + render.settled.len() * 8,
+            TraceRecordKind::Reload(_) => BASE,
         }
     }
 
@@ -298,6 +331,7 @@ impl Trace {
                 }
             }
             TraceRecordKind::Render(_) => {}
+            TraceRecordKind::Reload(_) => {}
         }
     }
 
@@ -334,6 +368,44 @@ impl Trace {
     pub(crate) fn clear(&mut self) {
         self.records.clear();
         self.bytes = 0;
+    }
+
+    /// Drops records appended after `len` (a rejected speculative
+    /// attempt's records never happened to the application, M6b).
+    /// Eviction counters only ever grow; seqs stay monotonic.
+    pub(crate) fn truncate_to(&mut self, len: usize) {
+        while self.records.len() > len {
+            if let Some(record) = self.records.pop_back() {
+                let size = self.record_bytes(&record.kind);
+                self.bytes = self.bytes.saturating_sub(size);
+                self.appended = self.appended.saturating_sub(1);
+                if self.seq > 0 {
+                    self.seq -= 1;
+                }
+            }
+        }
+    }
+
+    /// Captures the trace's full bookkeeping for a rollback point
+    /// (speculative CSS staging, M6b).
+    pub(crate) fn checkpoint(&self) -> TraceCheckpoint {
+        TraceCheckpoint {
+            len: self.records.len(),
+            seq: self.seq,
+            appended: self.appended,
+            evicted: self.evicted,
+            truncated: self.truncated,
+        }
+    }
+
+    /// Restores a checkpoint: speculative records vanish as if they
+    /// never happened; ids rewound here were never observed outside.
+    pub(crate) fn restore(&mut self, checkpoint: TraceCheckpoint) {
+        self.truncate_to(checkpoint.len);
+        self.seq = checkpoint.seq;
+        self.appended = checkpoint.appended;
+        self.evicted = checkpoint.evicted;
+        self.truncated = checkpoint.truncated;
     }
 }
 
@@ -378,6 +450,9 @@ pub struct InspectorSnapshot {
     pub selected: Option<ElementInspection>,
     /// Why the selection is absent, when it is.
     pub selection_note: Option<&'static str>,
+    /// The last reload attempt, if any (host lifetime; survives
+    /// generation swaps) — M6b, ADR 0021.
+    pub last_reload: Option<crate::reload::ReloadAttempt>,
 }
 
 /// What the cached layout is relative to the asked viewport.

@@ -104,6 +104,7 @@ mod inspect;
 mod keyboard;
 mod layout;
 mod painter;
+mod reload;
 mod source;
 mod style;
 mod taffy_backend;
@@ -122,11 +123,12 @@ pub use image::{ImageLimits, InvalidImageLimits, InvalidImageLimitsReason};
 pub use input::{ElementHandle, ElementTarget, Event, FocusOrigin, HitTarget, ScrollTarget};
 pub use inspect::{
     DiagnosticEntry, ElementInspection, InspectorCounters, InspectorLimits, InspectorSnapshot,
-    InvalidationClass, InvalidationRecord, LayoutCacheState, PendingCauses, RenderRecord,
-    TraceRecord, TraceRecordKind, TraceSummary, TurnOutcomeRecord, TurnRecord,
+    InvalidationClass, InvalidationRecord, LayoutCacheState, PendingCauses, ReloadTraceRecord,
+    RenderRecord, TraceRecord, TraceRecordKind, TraceSummary, TurnOutcomeRecord, TurnRecord,
 };
 pub use keyboard::{KeyCommand, KeyModifiers};
 pub use layout::{LAYOUT_FACTS_SCHEMA_VERSION, LayoutFacts, LayoutNodeFact};
+pub use reload::{ReloadAttempt, ReloadKind, ReloadOutcome, ReloadRejection, ReloadStage};
 pub use source::{
     Asset, AssetRequest, AssetResolver, DocumentSource, NullAssetResolver, SharedAssetResolver,
     SourceId, StylesheetSource,
@@ -466,6 +468,11 @@ pub struct VelquView {
     ime_session: Option<(dom::NodeId, u64)>,
     /// Monotonic document identity used to scope public element handles.
     document_generation: u64,
+    /// Lifetime authority for generation ids (M6b, ADR 0021): every
+    /// load and every reload candidate mints from this counter, so a
+    /// failed candidate leaves a gap but can never collide with a
+    /// published generation.
+    generations_minted: u64,
     /// The element under the pointer (for `:hover`), if any.
     hover: Option<dom::NodeId>,
     /// Focused element (for `:focus`), if any.
@@ -480,6 +487,9 @@ pub struct VelquView {
     /// The bounded trace store; `None` = capture disabled (every
     /// recording hook no-ops, cause strings are never formatted).
     inspector: Option<inspect::Trace>,
+    /// Reload attempt ledger (M6b, ADR 0021): bounded, monotonic ids,
+    /// host lifetime (survives generation swaps).
+    reload_ledger: reload::Ledger,
     /// Committed reactive turns for the current generation.
     state_revision: u64,
     /// Completed layout passes for the current generation.
@@ -558,6 +568,7 @@ impl VelquView {
             interaction_paint: None,
             presentation_dirty: false,
             document_generation: 0,
+            generations_minted: 0,
             pointer_pos: None,
             pointer_capture: None,
             pointer_anchor: None,
@@ -568,6 +579,7 @@ impl VelquView {
             pressed: None,
             events: Vec::new(),
             inspector: None,
+            reload_ledger: reload::Ledger::default(),
             state_revision: 0,
             layout_revision: 0,
             reactive_turns: 0,
@@ -754,6 +766,7 @@ impl VelquView {
                     plan,
                     machine: None,
                     pending_initial: Vec::new(),
+                    initial_batch_rejected: false,
                 });
                 return;
             }
@@ -764,6 +777,7 @@ impl VelquView {
             plan,
             machine: Some(Box::new(machine)),
             pending_initial: initial,
+            initial_batch_rejected: false,
         });
         // Turn zero (initial binding evaluation) already committed
         // inside the machine; `pump_reactive` applies its mutations to
@@ -921,7 +935,12 @@ impl VelquView {
         }
         self.dom = html::parse(&source.html);
         self.document = Some(source);
-        self.document_generation = self.document_generation.wrapping_add(1).max(1);
+        // Generation identity comes from the lifetime authority
+        // (M6b, ADR 0021): a monotonic mint counter shared by loads and
+        // reload candidates — a failed candidate may leave a gap, but it
+        // can never re-mint an already-published generation.
+        self.generations_minted = self.generations_minted.wrapping_add(1).max(1);
+        self.document_generation = self.generations_minted;
         // Image identity is per-document, like the DOM: a new document
         // invalidates every decoded asset — and the input state belongs to
         // the old tree (M4a/M4b).
@@ -2489,6 +2508,7 @@ impl VelquView {
             plan,
             machine: machine_slot,
             pending_initial,
+            initial_batch_rejected,
             ..
         } = &mut state;
         let pending_initial = std::mem::take(pending_initial);
@@ -2498,6 +2518,7 @@ impl VelquView {
         if !pending_initial.is_empty() && !self.apply_mutations_validated(plan, &pending_initial) {
             // Initial batch invalid (should not happen: the plan was
             // compiled against this DOM): drop it with a diagnostic.
+            *initial_batch_rejected = true;
             if let Some(machine) = machine_slot.as_mut() {
                 machine.record_host_diagnostic("initial mutation batch rejected");
             }
@@ -2593,6 +2614,425 @@ impl VelquView {
     pub fn pump_reactive_queued(&mut self) {
         let batch = self.take_events();
         self.pump_reactive(&batch);
+    }
+
+    // -- transactional reload (M6b, ADR 0021) ------------------------------
+
+    /// The last reload attempt, if any (published or rejected), with
+    /// its kind, stage, and generations. Host lifetime: the ledger
+    /// survives generation swaps.
+    pub fn last_reload_attempt(&self) -> Option<&ReloadAttempt> {
+        self.reload_ledger.last()
+    }
+
+    /// Records a rejection (ledger + trace) and builds the error.
+    fn reject_reload(
+        &mut self,
+        kind: ReloadKind,
+        stage: ReloadStage,
+        message: String,
+    ) -> ReloadRejection {
+        let generation = self.document_generation;
+        let attempt = self.reload_ledger.record(
+            kind,
+            ReloadOutcome::Rejected { stage },
+            generation,
+            generation,
+            Some(message.clone()),
+        );
+        self.trace_reload_record(attempt, kind, false, generation, generation, stage);
+        ReloadRejection {
+            kind,
+            stage,
+            message,
+        }
+    }
+
+    /// Records a publication (ledger + trace).
+    fn record_reload_publication(
+        &mut self,
+        kind: ReloadKind,
+        generation_before: u64,
+        generation_after: u64,
+    ) {
+        let attempt = self.reload_ledger.record(
+            kind,
+            ReloadOutcome::Published {
+                generation: generation_after,
+            },
+            generation_before,
+            generation_after,
+            None,
+        );
+        self.trace_reload_record(
+            attempt,
+            kind,
+            true,
+            generation_before,
+            generation_after,
+            ReloadStage::Source,
+        );
+    }
+
+    fn trace_reload_record(
+        &mut self,
+        attempt: u64,
+        kind: ReloadKind,
+        published: bool,
+        generation_before: u64,
+        generation_after: u64,
+        stage: ReloadStage,
+    ) {
+        let Some(trace) = self.inspector.as_mut() else {
+            return;
+        };
+        trace.push(inspect::TraceRecordKind::Reload(
+            inspect::ReloadTraceRecord {
+                attempt,
+                kind: kind.label(),
+                published,
+                generation_before,
+                generation_after,
+                stage: stage.label(),
+            },
+        ));
+    }
+
+    /// Reloads the document **transactionally** (M6b, ADR 0021): a
+    /// candidate is prepared all the way through its first rendered
+    /// frame — parse, Tailwind + reactive compilation, runtime and
+    /// initializers, the initial mutation batch, first-frame assets,
+    /// style, layout, display list, raster — and only a fully prepared,
+    /// coherent candidate publishes as a new generation.
+    ///
+    /// A rejection (empty source, failing initializers or poisoned
+    /// units, rejected initial mutations, first-frame error) leaves the
+    /// active document running unchanged, except for reload
+    /// diagnostics. The reserved generation id may leave a gap in the
+    /// sequence; it can never collide with a published generation.
+    /// Publication replaces document-owned state only — installed
+    /// providers, limits, inspector history, and the reload ledger are
+    /// host lifetime and survive.
+    ///
+    /// Call between completed event batches/turns: queued events of the
+    /// old generation do not survive publication (their handles are
+    /// stale by construction); on rejection they remain for the old
+    /// document. A successful reload cancels any active IME composition
+    /// with the old document's state.
+    pub fn reload_document(
+        &mut self,
+        source: DocumentSource,
+        viewport: Viewport,
+    ) -> Result<u64, ReloadRejection> {
+        if source.html.trim().is_empty() {
+            return Err(self.reject_reload(
+                ReloadKind::FullDocument,
+                ReloadStage::Source,
+                "the document source is empty".to_owned(),
+            ));
+        }
+        // Reserve the candidate generation (the lifetime authority).
+        // A failed attempt consumes the id (a visible gap) but never
+        // changes the active generation.
+        self.generations_minted = self.generations_minted.wrapping_add(1).max(1);
+        let reserved = self.generations_minted;
+
+        // One candidate at a time, under the host's existing budgets.
+        // Host services transfer in; document-owned state is fresh.
+        let mut candidate = VelquView::new();
+        candidate.assets = self.assets.clone();
+        candidate.tailwind_enabled = self.tailwind_enabled;
+        candidate.reactive_enabled = self.reactive_enabled;
+        candidate.reactive_limits = self.reactive_limits;
+        candidate.image_limits = self.image_limits;
+        // `load_document` bumps by one, so presetting `reserved - 1`
+        // mints exactly `reserved` inside the candidate — its handles,
+        // plan, and machine are already generation-correct at publish.
+        candidate.generations_minted = reserved - 1;
+        candidate.document_generation = reserved - 1;
+
+        if let Err(error) = candidate.load_document(source) {
+            return Err(self.reject_reload(
+                ReloadKind::FullDocument,
+                ReloadStage::Source,
+                format!("the document source was rejected: {error}"),
+            ));
+        }
+
+        // Turn zero: the initial binding outputs must apply cleanly.
+        candidate.pump_reactive(&[]);
+        if let Some(state) = &candidate.reactive {
+            if let Some(machine) = &state.machine {
+                let failures = machine.initializer_failures();
+                if failures > 0 {
+                    return Err(self.reject_reload(
+                        ReloadKind::FullDocument,
+                        ReloadStage::ReactiveInitialization,
+                        format!("{failures} scope initializer(s) failed"),
+                    ));
+                }
+                let poisoned = machine.poisoned_units();
+                if poisoned > 0 {
+                    return Err(self.reject_reload(
+                        ReloadKind::FullDocument,
+                        ReloadStage::ReactiveInitialization,
+                        format!("{poisoned} executable unit(s) failed to compile"),
+                    ));
+                }
+            } else if let Some(setup) = &candidate.reactive_setup_diagnostic {
+                return Err(self.reject_reload(
+                    ReloadKind::FullDocument,
+                    ReloadStage::ReactiveInitialization,
+                    setup.clone(),
+                ));
+            }
+            if state.initial_batch_rejected {
+                return Err(self.reject_reload(
+                    ReloadKind::FullDocument,
+                    ReloadStage::InitialMutations,
+                    "the initial mutation batch failed validation".to_owned(),
+                ));
+            }
+        }
+
+        // Prepare through the first frame under the declared asset
+        // policy (missing images are diagnostics, not failures).
+        if let Err(error) = candidate.render(viewport) {
+            return Err(self.reject_reload(
+                ReloadKind::FullDocument,
+                ReloadStage::FirstFrame,
+                format!("first-frame preparation failed: {error}"),
+            ));
+        }
+
+        // Publish: move document-owned state; adopt the prepared
+        // frame's accounting as deltas on the lifetime counters.
+        let generation_before = self.document_generation;
+        self.publish_document(candidate, reserved);
+        self.record_reload_publication(ReloadKind::FullDocument, generation_before, reserved);
+        Ok(reserved)
+    }
+
+    /// Publishes a prepared candidate: document-owned state moves,
+    /// host lifetime (providers, flags, limits, inspector, ledger,
+    /// generation authority, fonts) stays.
+    fn publish_document(&mut self, candidate: VelquView, generation: u64) {
+        let VelquView {
+            dom,
+            document,
+            images,
+            controls,
+            control_diagnostics_list,
+            control_geometry,
+            last_laid,
+            last_viewport,
+            structure_dirty,
+            presentation_dirty,
+            interaction_paint,
+            pointer_pos,
+            pointer_capture,
+            pointer_anchor,
+            ime_session,
+            hover,
+            focus,
+            focus_origin,
+            pressed,
+            events,
+            scroll_offsets,
+            style_diagnostics_list,
+            style_blocks,
+            reactive,
+            reactive_hidden,
+            tailwind_css,
+            tailwind_diagnostics_list,
+            state_revision,
+            layout_revision,
+            structural_causes,
+            presentation_causes,
+            structural_causes_dropped,
+            presentation_causes_dropped,
+            layout_passes: prepared_passes,
+            repaint_passes: prepared_repaints,
+            display_items_last: prepared_items,
+            ..
+        } = candidate;
+        self.dom = dom;
+        self.document = document;
+        self.document_generation = generation;
+        self.images = images;
+        self.controls = controls;
+        self.control_diagnostics_list = control_diagnostics_list;
+        self.control_geometry = control_geometry;
+        self.last_laid = last_laid;
+        self.last_viewport = last_viewport;
+        self.structure_dirty = structure_dirty;
+        self.presentation_dirty = presentation_dirty;
+        self.interaction_paint = interaction_paint;
+        self.pointer_pos = pointer_pos;
+        self.pointer_capture = pointer_capture;
+        self.pointer_anchor = pointer_anchor;
+        self.ime_session = ime_session;
+        self.hover = hover;
+        self.focus = focus;
+        self.focus_origin = focus_origin;
+        self.pressed = pressed;
+        self.events = events;
+        self.scroll_offsets = scroll_offsets;
+        self.style_diagnostics_list = style_diagnostics_list;
+        self.style_blocks = style_blocks;
+        self.reactive = reactive;
+        self.reactive_hidden = reactive_hidden;
+        self.tailwind_css = tailwind_css;
+        self.tailwind_diagnostics_list = tailwind_diagnostics_list;
+        self.state_revision = state_revision;
+        self.layout_revision = layout_revision;
+        self.structural_causes = structural_causes;
+        self.presentation_causes = presentation_causes;
+        self.structural_causes_dropped = structural_causes_dropped;
+        self.presentation_causes_dropped = presentation_causes_dropped;
+        self.layout_passes += prepared_passes;
+        self.repaint_passes += prepared_repaints;
+        self.frame_index += 1; // the prepared first frame
+        self.display_items_last = prepared_items;
+    }
+
+    /// Replaces a set of stylesheets **transactionally** (M6b, ADR
+    /// 0021) while preserving the document, the reactive runtime and
+    /// its committed state, control values, selection, focus, scroll
+    /// offsets, and the active composition: no reparse of the original
+    /// HTML, no scope initializers, no turn zero, no new QuickJS
+    /// generation.
+    ///
+    /// Staging happens against the **current committed document**: each
+    /// replacement upserts **in place** by [`SourceId`] (cascade
+    /// position preserved; unknown ids append), the recascade and full
+    /// layout run, and the frame must render. Publication keeps the
+    /// staged frame; rejection restores the previous sheets, caches,
+    /// counters, and trace — the application is bit-identical except
+    /// for reload diagnostics. Interaction state is reconciled with
+    /// the new layout (a focus hidden by the new CSS clears; hover
+    /// refreshes under the stationary pointer; scroll offsets re-clamp
+    /// on the next render).
+    pub fn reload_stylesheets(
+        &mut self,
+        replacements: Vec<StylesheetSource>,
+        viewport: Viewport,
+    ) -> Result<(), ReloadRejection> {
+        if self.document.is_none() {
+            return Err(self.reject_reload(
+                ReloadKind::Stylesheets,
+                ReloadStage::Source,
+                "no document is loaded".to_owned(),
+            ));
+        }
+        if replacements.is_empty() {
+            return Err(self.reject_reload(
+                ReloadKind::Stylesheets,
+                ReloadStage::Source,
+                "the replacement set is empty".to_owned(),
+            ));
+        }
+        for sheet in &replacements {
+            if sheet.css.trim().is_empty() {
+                return Err(self.reject_reload(
+                    ReloadKind::Stylesheets,
+                    ReloadStage::Source,
+                    format!(
+                        "stylesheet {:?} is empty: the existing stylesheet primitive defines empty sources as errors",
+                        sheet.id
+                    ),
+                ));
+            }
+        }
+
+        // Snapshot everything the staging render can observably touch.
+        let sheets_before = self.stylesheets.clone();
+        let parsed_before = self.parsed_css.clone();
+        let style_diagnostics_before = self.style_diagnostics_list.clone();
+        let passes_before = self.layout_passes;
+        let repaints_before = self.repaint_passes;
+        let frame_before = self.frame_index;
+        let items_before = self.display_items_last;
+        let layout_revision_before = self.layout_revision;
+        let structural_causes_before = self.structural_causes.clone();
+        let presentation_causes_before = self.presentation_causes.clone();
+        let structural_dropped_before = self.structural_causes_dropped;
+        let presentation_dropped_before = self.presentation_causes_dropped;
+        let trace_checkpoint = self.inspector.as_mut().map(|trace| trace.checkpoint());
+
+        // Stage: in-place upserts (order preserved), recascade, and the
+        // full pass — all against the committed live document.
+        for sheet in replacements {
+            let id = sheet.id.to_string();
+            match self
+                .stylesheets
+                .iter_mut()
+                .find(|existing| existing.id == sheet.id)
+            {
+                Some(slot) => *slot = sheet,
+                None => self.stylesheets.push(sheet),
+            }
+            self.note_structural_cause(&format!("reload stylesheet {id}"));
+        }
+        self.rebuild_css();
+        self.mark_structure_dirty();
+        self.last_laid = None;
+
+        match self.render(viewport) {
+            Ok(_frame) => {
+                // Publish: the staged frame is the live one. Reconcile
+                // interaction state with the new layout.
+                self.reconcile_after_restyle(viewport);
+                let generation = self.document_generation;
+                self.record_reload_publication(ReloadKind::Stylesheets, generation, generation);
+                Ok(())
+            }
+            Err(error) => {
+                // Reject: restore the snapshot wholesale. The restored
+                // sheets rebuild from the same inputs, so behavior is
+                // bit-identical to before the attempt.
+                self.stylesheets = sheets_before;
+                self.parsed_css = parsed_before;
+                self.style_diagnostics_list = style_diagnostics_before;
+                self.layout_passes = passes_before;
+                self.repaint_passes = repaints_before;
+                self.frame_index = frame_before;
+                self.display_items_last = items_before;
+                self.layout_revision = layout_revision_before;
+                self.structural_causes = structural_causes_before;
+                self.presentation_causes = presentation_causes_before;
+                self.structural_causes_dropped = structural_dropped_before;
+                self.presentation_causes_dropped = presentation_dropped_before;
+                if let (Some(trace), Some(checkpoint)) = (&mut self.inspector, trace_checkpoint) {
+                    trace.restore(checkpoint);
+                }
+                self.last_laid = None;
+                self.mark_structure_dirty();
+                Err(self.reject_reload(
+                    ReloadKind::Stylesheets,
+                    ReloadStage::FirstFrame,
+                    format!("restaged presentation failed to render: {error}"),
+                ))
+            }
+        }
+    }
+
+    /// Post-restyle reconciliation (CSS-only publication): legitimate
+    /// consequences of the new sheets, not state resets — a focus hidden
+    /// by the new CSS clears, hover re-derives under the stationary
+    /// pointer; scroll offsets re-clamp in the next render's apply
+    /// stage.
+    fn reconcile_after_restyle(&mut self, viewport: Viewport) {
+        if let Some(node) = self.focus {
+            let still_laid_out = self
+                .last_laid
+                .as_ref()
+                .is_some_and(|laid| find_box_node(&laid.root, node).is_some());
+            if !still_laid_out {
+                self.set_focus_node_with(None, input::FocusOrigin::Programmatic);
+            }
+        }
+        self.refresh_hover(viewport);
     }
 
     // -- inspector (M6a, ADR 0020) ----------------------------------------
@@ -2708,6 +3148,7 @@ impl VelquView {
             diagnostics: self.inspector_diagnostics(),
             selected,
             selection_note,
+            last_reload: self.reload_ledger.last().cloned(),
         }
     }
 
@@ -3225,6 +3666,9 @@ struct ReactiveState {
     machine: Option<Box<velqu_reactive::ReactiveMachine>>,
     /// Turn zero's mutations, applied on the first `pump_reactive`.
     pending_initial: Vec<velqu_reactive::Mutation>,
+    /// Set when the initial mutation batch failed validation (M6b
+    /// reload acceptance reads it; M5 semantics just diagnose).
+    initial_batch_rejected: bool,
 }
 
 /// A generation-scoped reference to one binding in the reactive plan
@@ -6996,6 +7440,449 @@ mod tests {
             }
             other => panic!("expected an event record, got {other:?}"),
         }
+    }
+
+    // -- M6b transactional reload (ADR 0021) -------------------------------
+
+    /// A doc with counter + input + scroll pane for the reload probes.
+    fn reload_probe_view() -> VelquView {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.enable_inspector();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0, name: '' }\">\
+             <p id=t data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <input id=field vx-model=\"name\">\
+             <div id=pane style=\"overflow: auto; height: 40px\">\
+             <div id=tall style=\"height: 300px\"></div>\
+             </div>\
+             <button id=inc @click=\"count = count + 1\">+</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view
+    }
+
+    /// Drains and pumps in the canonical order.
+    fn pump_drained(view: &mut VelquView) {
+        let batch = view.take_events();
+        view.pump_reactive(&batch);
+    }
+
+    /// The viewport point over a known element's box (hit-test scan).
+    fn point_over(view: &VelquView, vp: Viewport, id: &str) -> (f32, f32) {
+        for y in (0..vp.height()).step_by(4) {
+            for x in (0..vp.width()).step_by(8) {
+                if view
+                    .hit_test(vp, x as f32 + 0.5, y as f32 + 0.5)
+                    .is_some_and(|target| target.element_id.as_deref() == Some(id))
+                {
+                    return (x as f32 + 0.5, y as f32 + 0.5);
+                }
+            }
+        }
+        panic!("no hit target for {id}");
+    }
+
+    /// Clicks `inc` and settles one frame.
+    fn click_inc(view: &mut VelquView, vp: Viewport) {
+        click_element(view, vp, "inc");
+        pump_drained(view);
+        view.render(vp).unwrap();
+    }
+
+    /// The counter end-to-end probe: state continuity through a
+    /// rejected CSS reload, a color-only CSS reload, a throwing-HTML
+    /// rejection, and a valid full reload.
+    #[test]
+    fn m6b_counter_probe_end_to_end() {
+        let vp = Viewport::try_new(400, 600, 1.0).unwrap();
+        let mut view = reload_probe_view();
+        view.load_stylesheet(StylesheetSource::new("A", "#t { color: #ff0000 }"))
+            .unwrap();
+        view.load_stylesheet(StylesheetSource::new("B", "#t { color: #0000ff }"))
+            .unwrap();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        let generation = view.inspector_snapshot(vp, None).generation;
+        let t_handle = view.node_target(view.element_node("t").unwrap()).handle;
+        let color = |view: &VelquView| {
+            view.inspector_snapshot(vp, Some(t_handle))
+                .selected
+                .as_ref()
+                .unwrap()
+                .color
+        };
+
+        // 1. Run to 7; edit a control, establish a selection, focus it,
+        //    and scroll.
+        for _ in 0..7 {
+            click_inc(&mut view, vp);
+        }
+        assert_eq!(text_of(&mut view, vp, "label"), ["Count: 7"]);
+        view.set_focus(Some("field"));
+        view.insert_text("Ada");
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        view.set_scroll_offset(Some("pane"), 0.0, 40.0).unwrap();
+        let _ = view.take_events();
+        view.render(vp).unwrap();
+        let facts = |view: &mut VelquView| {
+            view.control_facts(vp)
+                .unwrap()
+                .controls
+                .into_iter()
+                .find(|fact| fact.target.id.as_deref() == Some("field"))
+                .unwrap()
+        };
+        let before_facts = facts(&mut view);
+        assert_eq!(before_facts.value_length, 3);
+        assert_eq!(view.focused(), Some("field"));
+        // Sheet order: A then B, B wins the tie.
+        let sheet_ids = |view: &VelquView| {
+            view.stylesheets()
+                .iter()
+                .map(|sheet| sheet.id.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sheet_ids(&view), ["A", "B"]);
+        assert_eq!(color(&view), Color::from_hex("#0000ff").unwrap());
+
+        // 2. A stylesheet replacement rejected by policy: nothing about
+        //    the application moves except reload diagnostics.
+        let rejection = view
+            .reload_stylesheets(vec![StylesheetSource::new("A", "  ")], vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::Source);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(7.0))
+        );
+        assert_eq!(facts(&mut view), before_facts, "control state untouched");
+        assert_eq!(view.focused(), Some("field"));
+        assert_eq!(color(&view), Color::from_hex("#0000ff").unwrap());
+
+        // 3. A valid color-only stylesheet replacement (A in place):
+        //    runtime state survives, the cascade order survives (B
+        //    still wins), and no JS reinitialization happened.
+        view.reload_stylesheets(
+            vec![StylesheetSource::new("A", "#t { color: #00ff00 }")],
+            vp,
+        )
+        .unwrap();
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(7.0)),
+            "counter still 7"
+        );
+        assert_eq!(facts(&mut view), before_facts, "value/selection intact");
+        assert_eq!(view.focused(), Some("field"), "focus intact");
+        assert_eq!(sheet_ids(&view), ["A", "B"], "position preserved");
+        assert_eq!(
+            color(&view),
+            Color::from_hex("#0000ff").unwrap(),
+            "B still wins the equal-specificity tie"
+        );
+        // Scroll survived: the pane still scrolls from its offset (a
+        // point over the pane's content — the wheel walks up to the
+        // scrollable ancestor).
+        let (pane_x, pane_y) = point_over(&view, vp, "tall");
+        view.wheel(vp, pane_x, pane_y, 0.0, 40.0);
+        assert_eq!(
+            view.take_events(),
+            vec![Event::Scrolled {
+                target: ScrollTarget::Element {
+                    handle: view.node_target(view.element_node("pane").unwrap()).handle,
+                    id: Some("pane".into())
+                },
+                x: 0.0,
+                y: 80.0,
+            }],
+            "the offset accumulated across the restyle"
+        );
+        view.render(vp).unwrap();
+        // Reload B in place: now B's new declaration shows.
+        view.reload_stylesheets(
+            vec![StylesheetSource::new("B", "#t { color: #010101 }")],
+            vp,
+        )
+        .unwrap();
+        view.render(vp).unwrap();
+        assert_eq!(color(&view), Color::from_hex("#010101").unwrap());
+
+        // 4. The preserved runtime still operates.
+        click_inc(&mut view, vp);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(8.0)),
+            "counter becomes 8"
+        );
+
+        // 5. HTML whose reactive initializer throws: rejected, the old
+        //    document keeps running and accepts input.
+        let throwing = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0, boom: (function () { throw new Error('x') })() }\">\
+             <button id=inc @click=\"count = count + 1\">+</button>\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_document(DocumentSource::new("document", throwing), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::ReactiveInitialization);
+        assert_eq!(
+            view.inspector_snapshot(vp, None).generation,
+            generation,
+            "active generation unchanged"
+        );
+        click_inc(&mut view, vp);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(9.0)),
+            "the old UI still accepts input"
+        );
+
+        // 6. A valid replacement HTML: fresh generation, source-defined
+        //    state, old handles cannot address it.
+        let replacement = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 100 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">+</button>\
+             </div>\
+             </body></html>";
+        let new_generation = view
+            .reload_document(DocumentSource::new("document", replacement), vp)
+            .unwrap();
+        assert_eq!(
+            new_generation,
+            generation + 2,
+            "the failed attempt left a gap"
+        );
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(100.0)),
+            "source-defined initial state"
+        );
+        let snapshot = view.inspector_snapshot(vp, Some(t_handle));
+        assert_eq!(
+            snapshot.selection_note,
+            Some("the selection belongs to an older generation")
+        );
+        // Inspector history survived the publication.
+        let last = view.last_reload_attempt().unwrap();
+        assert_eq!(
+            last.outcome,
+            ReloadOutcome::Published {
+                generation: new_generation
+            }
+        );
+        assert_eq!(last.generation_before, generation);
+    }
+
+    /// Full reload publishes only a fully prepared candidate: the
+    /// first frame exists, counters adopt it, and stale batches from
+    /// the old generation cannot operate on the replacement.
+    #[test]
+    fn m6b_full_reload_publishes_a_fully_prepared_generation() {
+        let mut view = inspected_counter_view();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+
+        // A stale batch: click taken but not pumped before the reload.
+        click_element(&mut view, vp, "inc");
+        let stale = view.take_events();
+
+        let replacement = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 5 }\">\
+             <p data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             </div>\
+             </body></html>";
+        let generation = view
+            .reload_document(DocumentSource::new("document", replacement), vp)
+            .unwrap();
+        assert_eq!(text_of(&mut view, vp, "label"), ["Count: 5"]);
+        // The prepared frame is presentable without another pass.
+        let passes = view.layout_stats().passes;
+        let digest = view.render(vp).unwrap().frame.sha256_hex();
+        assert_eq!(view.layout_stats().passes, passes, "cached frame");
+        // The stale batch is inert against the replacement.
+        view.pump_reactive(&stale);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(5.0))
+        );
+        // Host lifetime survived: the inspector trace kept its history
+        // and records the publication.
+        let records = records_of(&view, |_| true);
+        assert!(records.iter().any(
+            |record| matches!(&record.kind, TraceRecordKind::Reload(reload)
+                    if reload.published && reload.generation_after == generation)
+        ));
+        assert_eq!(view.render(vp).unwrap().frame.sha256_hex(), digest);
+    }
+
+    /// Parse-succeeds-but-unpublishable candidates: a poisoned binding
+    /// (compile) and a rejected initial mutation batch (`:checked`)
+    /// both reject at the reactive stage.
+    #[test]
+    fn m6b_initial_batch_rejection_blocks_reload() {
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let mut base = inspected_counter_view();
+        base.render(vp).unwrap();
+        pump_drained(&mut base);
+        base.render(vp).unwrap();
+        let generation = base.inspector_snapshot(vp, None).generation;
+
+        let mut view = base;
+        let checked = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ on: true }\">\
+             <input id=box :checked=\"on\">\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_document(DocumentSource::new("document", checked), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::InitialMutations);
+        assert_eq!(
+            view.inspector_snapshot(vp, None).generation,
+            generation,
+            "the active document is unchanged"
+        );
+
+        // A poisoned binding expression: balanced (it passes the compile
+        // shape check) but invalid JavaScript — the unit compilation
+        // fails → reactive initialization stage.
+        let poisoned = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ n: 0 }\">\
+             <p vx-text=\"(+)\">x</p>\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_document(DocumentSource::new("document", poisoned), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::ReactiveInitialization);
+        assert_eq!(view.inspector_snapshot(vp, None).generation, generation);
+
+        // Empty source rejects at the source stage.
+        let rejection = view
+            .reload_document(DocumentSource::new("document", "   "), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::Source);
+        // The old document still works after all three rejections.
+        click_inc(&mut view, vp);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+    }
+
+    /// A rejected CSS reload restores the previous presentation
+    /// bit-identically: sheets, counters, trace, and the frame.
+    #[test]
+    fn m6b_rejected_css_reload_restores_the_previous_presentation() {
+        let mut view = reload_probe_view();
+        let vp = Viewport::try_new(400, 600, 1.0).unwrap();
+        view.load_stylesheet(StylesheetSource::new("A", "#t { color: #ff0000 }"))
+            .unwrap();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        for _ in 0..3 {
+            click_inc(&mut view, vp);
+        }
+        let digest_before = view.render(vp).unwrap().frame.sha256_hex();
+        let stats_before = view.layout_stats();
+        let appended_before = view.inspector_trace_summary().appended;
+        let passes_before = stats_before.passes;
+
+        let rejection = view
+            .reload_stylesheets(vec![StylesheetSource::new("A", "")], vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::Source);
+        // Nothing moved: raster, counters, trace, state. The rejection
+        // was classified before staging, so the only new trace record is
+        // the reload-rejected one (this verification render adds one
+        // more).
+        assert_eq!(
+            view.render(vp).unwrap().frame.sha256_hex(),
+            digest_before,
+            "bit-identical presentation"
+        );
+        assert_eq!(view.layout_stats().passes, passes_before);
+        assert_eq!(
+            view.inspector_trace_summary().appended,
+            appended_before + 2,
+            "only the rejection record and this verification render"
+        );
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(3.0))
+        );
+        // And the ledger explains itself, distinct from the active
+        // document's diagnostics.
+        let last = view.last_reload_attempt().unwrap();
+        assert_eq!(
+            last.outcome,
+            ReloadOutcome::Rejected {
+                stage: ReloadStage::Source
+            }
+        );
+        assert_eq!(last.generation_after, last.generation_before);
+    }
+
+    /// Composition semantics: a rejected reload keeps the live control
+    /// and its composition active; a successful full reload cancels
+    /// the old session with the old document.
+    #[test]
+    fn m6b_reload_during_composition() {
+        let vp = Viewport::try_new(400, 600, 1.0).unwrap();
+        let mut view = reload_probe_view();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        view.set_focus(Some("field"));
+        let _ = view.take_events();
+        assert!(view.ime_preedit("ABC", Some((3, 3))));
+
+        // Rejected full reload: the composition stays live.
+        view.reload_document(DocumentSource::new("document", " "), vp)
+            .unwrap_err();
+        assert!(view.ime_commit("ABC"), "the old composition still commits");
+        let facts = view.control_facts(vp).unwrap();
+        let field = facts
+            .controls
+            .iter()
+            .find(|fact| fact.target.id.as_deref() == Some("field"))
+            .unwrap();
+        assert_eq!(field.value_length, 3);
+
+        // Successful full reload: the session died with the document.
+        view.set_focus(Some("field"));
+        view.ime_preedit("XY", Some((2, 2)));
+        let _ = view.take_events();
+        view.reload_document(
+            DocumentSource::new(
+                "document",
+                "<!doctype html><html><body style=\"margin: 0\"><input id=field></body></html>",
+            ),
+            vp,
+        )
+        .unwrap();
+        assert!(
+            !view.ime_commit("XY"),
+            "a stale commit cannot touch the replacement"
+        );
+        let facts = view.control_facts(vp).unwrap();
+        let field = facts
+            .controls
+            .iter()
+            .find(|fact| fact.target.id.as_deref() == Some("field"))
+            .unwrap();
+        assert_eq!(field.value_length, 0, "source-defined initial value");
     }
 
     /// Interaction changes are precise, not conservative: without an

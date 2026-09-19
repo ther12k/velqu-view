@@ -339,6 +339,23 @@ fn print_inspection(view: &VelquView, viewport: velqu_view::Viewport) {
                     record.seq, render.frame_index, render.layout_pass_delta, render.repaint_delta
                 );
             }
+            TraceRecordKind::Reload(reload) => {
+                let outcome = if reload.published {
+                    format!(
+                        "published (generation {}→{})",
+                        reload.generation_before, reload.generation_after
+                    )
+                } else {
+                    format!(
+                        "rejected at {} (generation {} unchanged)",
+                        reload.stage, reload.generation_after
+                    )
+                };
+                println!(
+                    "#{} reload {} attempt {}: {outcome}",
+                    record.seq, reload.kind, reload.attempt
+                );
+            }
         }
     }
 }

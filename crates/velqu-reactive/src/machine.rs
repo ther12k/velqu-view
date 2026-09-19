@@ -160,6 +160,8 @@ pub struct ReactiveMachine {
     /// invoking one rolls the turn back deterministically.
     poisoned_bindings: std::collections::HashMap<usize, String>,
     poisoned_handlers: std::collections::HashMap<usize, String>,
+    /// Initializers that failed during construction (M6b observability).
+    initializer_failures: u32,
     /// Bounded turn diagnostics, newest last.
     diagnostics: Vec<String>,
 }
@@ -190,6 +192,7 @@ impl ReactiveMachine {
                 .collect(),
             poisoned_bindings: std::collections::HashMap::new(),
             poisoned_handlers: std::collections::HashMap::new(),
+            initializer_failures: 0,
             diagnostics: Vec::new(),
         };
         machine.compile_units(plan);
@@ -221,6 +224,22 @@ impl ReactiveMachine {
     /// Bounded turn diagnostics, oldest first.
     pub fn diagnostics(&self) -> &[String] {
         &self.diagnostics
+    }
+
+    /// How many scope initializers failed (threw, returned non-plain
+    /// data, or failed state capture) during construction. M5c
+    /// semantics keep these as diagnostics-not-failures for a normal
+    /// load; reload acceptance (M6b) reads the counter to classify a
+    /// candidate as unpublishable.
+    pub fn initializer_failures(&self) -> u32 {
+        self.initializer_failures
+    }
+
+    /// How many executable units (bindings/handlers) failed to compile
+    /// and are poisoned. Turn-time semantics are frozen (a poisoned
+    /// unit rolls back its turns); reload acceptance reads the count.
+    pub fn poisoned_units(&self) -> usize {
+        self.poisoned_bindings.len() + self.poisoned_handlers.len()
     }
 
     /// Records a host-side turn diagnostic (batch rejection, invalid
@@ -631,6 +650,7 @@ impl ReactiveMachine {
             return;
         }
         let context = self.runtime.context().clone();
+        let mut failures: u32 = 0;
         let outcome = context.with(|ctx| {
             let core: Object = ctx
                 .globals()
@@ -657,16 +677,22 @@ impl ReactiveMachine {
                 let function: Function = init_store
                     .get(index.to_string())
                     .map_err(|_| format!("initializer {index} missing"))?;
-                let result: Value =
-                    function
-                        .call::<_, Value>((state_obj.clone(),))
-                        .map_err(|error| {
-                            self.call_failure(&ctx, &format!("initializer {index}"), error)
-                        })?;
+                let result: Value = match function.call::<_, Value>((state_obj.clone(),)) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        failures += 1;
+                        return Err(self.call_failure(
+                            &ctx,
+                            &format!("initializer {index}"),
+                            error,
+                        ));
+                    }
+                };
                 let plain: bool = is_plain
                     .call((result.clone(),))
                     .map_err(|_| "isPlain failed".to_owned())?;
                 if !plain {
+                    failures += 1;
                     self.push_diagnostic(format!(
                         "scope initializer {index} returned a non-plain object; skipped"
                     ));
@@ -676,15 +702,20 @@ impl ReactiveMachine {
                     .call((state_obj, result))
                     .map_err(|_| "merge failed".to_owned())?;
             }
-            let captured = state::capture(
+            match state::capture(
                 &ctx,
                 &state_obj.into_value(),
                 &is_plain,
                 self.limits.max_output_string_bytes,
-            )
-            .map_err(|error| format!("initial state: {error}"))?;
-            Ok(captured)
+            ) {
+                Ok(captured) => Ok(captured),
+                Err(error) => {
+                    failures += 1;
+                    Err(format!("initial state: {error}"))
+                }
+            }
         });
+        self.initializer_failures += failures;
         match outcome {
             Ok(state) => self.state = state,
             Err(message) => {
