@@ -129,6 +129,27 @@ fn pump_until(
 }
 
 fn harness(backend: WatchBackend) -> (TempApp, VelquView, Coordinator, Wakeups, WatcherHandle) {
+    let (app, mut view, mut coordinator, wakeups, watcher) = raw_harness(backend);
+    // Drain the watcher's forced post-registration rescan (startup
+    // reconciliation) so the tests below start from a settled baseline.
+    std::thread::sleep(Duration::from_millis(500));
+    let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(4) {
+        let now_ms = start.elapsed().as_millis() as u64;
+        wakeups.drain_into(&mut coordinator, now_ms);
+        if coordinator.due(now_ms) {
+            let _ = coordinator.reconcile(now_ms, real_read, &mut view, vp);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    (app, view, coordinator, wakeups, watcher)
+}
+
+/// The raw harness: files written, view loaded (published = disk),
+/// watcher spawned, nothing drained yet.
+fn raw_harness(backend: WatchBackend) -> (TempApp, VelquView, Coordinator, Wakeups, WatcherHandle) {
     let app = TempApp::new(match backend {
         WatchBackend::Native => "native",
         WatchBackend::Poll => "poll",
@@ -143,9 +164,6 @@ fn harness(backend: WatchBackend) -> (TempApp, VelquView, Coordinator, Wakeups, 
     let coordinator = Coordinator::new(registry(&app), published, 60);
     let (sender, wakeups) = Wakeups::channel();
     let watcher = spawn(backend, &registry(&app).paths(), sender).expect("watcher starts");
-    // Let the backend establish its baseline (the poller snapshots on
-    // its first interval; a write racing that snapshot is invisible).
-    std::thread::sleep(Duration::from_millis(500));
     (app, view, coordinator, wakeups, watcher)
 }
 
@@ -262,6 +280,129 @@ fn native_document_save_routes_to_a_full_bundle() {
         Some(velqu_reactive::ReactiveValue::Number(100.0))
     );
     watcher.shutdown();
+}
+
+/// The startup registration gap, as the real sequence runs: the app
+/// reads A, the file becomes B **before** the watcher registers (no
+/// event will ever come), and the watcher's forced post-registration
+/// rescan displays B without another save. Pinned under the native
+/// backend; the coordinator-level sequence is the synthetic twin.
+#[test]
+fn native_startup_registration_gap_closes_without_a_save() {
+    let (app, mut view, mut coordinator, wakeups, mut watcher) = raw_harness(WatchBackend::Native);
+    let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+    // Pre-registration edit: the on-disk content is B, the published
+    // snapshot is A, and no notification exists or will.
+    std::fs::write(app.dir.join("a.css"), "#t { color: #00ff00 }").unwrap();
+    let start = Instant::now();
+    let published = loop {
+        let now_ms = start.elapsed().as_millis() as u64;
+        wakeups.drain_into(&mut coordinator, now_ms);
+        if coordinator.due(now_ms) {
+            if let ReconcileOutcome::Published { .. } = coordinator
+                .reconcile(now_ms, real_read, &mut view, vp)
+                .outcome
+            {
+                break true;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "no startup reconciliation ran"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    assert!(published, "the post-registration rescan published B");
+    view.render(vp).unwrap();
+    let (t_x, t_y) = point_over(&view, vp, "t");
+    let handle = view.hit_test(vp, t_x, t_y).unwrap().handle;
+    let color = view
+        .inspector_snapshot(vp, Some(handle))
+        .selected
+        .unwrap()
+        .color;
+    assert_eq!(color, velqu_view::Color::from_hex("#00ff00").unwrap());
+    watcher.shutdown();
+}
+
+/// A timestamp-preserving edit under the poll backend: notify truncates
+/// mtimes to whole seconds and compares "newer or content-different",
+/// so an in-place edit inside the same recorded second is invisible to
+/// timestamp-only polling. With content comparison enabled the poll
+/// route still converges to the new bytes. (Waits are for the
+/// observable outcome; `PollWatcher::poll()` is a request, not a
+/// completion barrier.)
+#[test]
+fn polling_detects_same_second_edits_via_content_comparison() {
+    let (app, mut view, mut coordinator, wakeups, mut watcher) = raw_harness(WatchBackend::Poll);
+    let vp = Viewport::try_new(400, 300, 1.0).unwrap();
+    // Align into a fresh wall-second, then write the baseline and the
+    // edit inside that one second: the file's whole-second mtime never
+    // advances past the baseline's.
+    wait_for_fresh_second();
+    let css = app.dir.join("a.css");
+    std::fs::write(&css, "#t { color: #ff0000 }").unwrap();
+    let before_mtime = whole_seconds(&css);
+    std::fs::write(&css, "#t { color: #010101 }").unwrap();
+    let after_mtime = whole_seconds(&css);
+    assert_eq!(
+        before_mtime, after_mtime,
+        "the edit preserved the recorded whole-second timestamp"
+    );
+    let start = Instant::now();
+    let published = loop {
+        let now_ms = start.elapsed().as_millis() as u64;
+        wakeups.drain_into(&mut coordinator, now_ms);
+        if coordinator.due(now_ms) {
+            if let ReconcileOutcome::Published { .. } = coordinator
+                .reconcile(now_ms, real_read, &mut view, vp)
+                .outcome
+            {
+                break true;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "the content-comparing poller never converged"
+        );
+        std::thread::sleep(Duration::from_millis(15));
+    };
+    assert!(published);
+    view.render(vp).unwrap();
+    let (t_x, t_y) = point_over(&view, vp, "t");
+    let handle = view.hit_test(vp, t_x, t_y).unwrap().handle;
+    let color = view
+        .inspector_snapshot(vp, Some(handle))
+        .selected
+        .unwrap()
+        .color;
+    assert_eq!(color, velqu_view::Color::from_hex("#010101").unwrap());
+    watcher.shutdown();
+}
+
+/// Waits until a new wall-clock second has just begun (the test then
+/// has ~1s of headroom for its two writes).
+fn wait_for_fresh_second() {
+    let entry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let into_second = entry.subsec_millis();
+    if into_second < 900 {
+        std::thread::sleep(Duration::from_millis((1000 - into_second + 20).into()));
+    }
+}
+
+/// The file's whole-second mtime (notify's comparison granularity).
+fn whole_seconds(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|mtime| {
+            mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        })
+        .unwrap_or(0)
 }
 
 /// Shutdown stops the work: after `shutdown`, a save produces no

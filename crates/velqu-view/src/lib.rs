@@ -2719,6 +2719,11 @@ impl VelquView {
     /// stale by construction); on rejection they remain for the old
     /// document. A successful reload cancels any active IME composition
     /// with the old document's state.
+    ///
+    /// **This convenience resets the author stylesheet set** (the
+    /// bundle form below replaces it with the given set). Hosts that
+    /// must preserve or update sheets across a full reload use
+    /// [`VelquView::reload_bundle`].
     pub fn reload_document(
         &mut self,
         source: DocumentSource,
@@ -2734,6 +2739,13 @@ impl VelquView {
     /// the given order (their cascade position in the candidate);
     /// publication moves the candidate's sheet state with everything
     /// else. Acceptance policy is `reload_document`'s.
+    ///
+    /// **Replacement semantics** (explicit, all three reload APIs):
+    /// the candidate's stylesheet set becomes exactly `stylesheets`.
+    /// An HTML-only edit that must keep the current sheets passes them
+    /// along (the lab's coordinator does); `reload_document` resets
+    /// the set to empty; `reload_stylesheets` is the in-place upsert
+    /// for same-generation restyles.
     pub fn reload_bundle(
         &mut self,
         source: DocumentSource,
@@ -7720,6 +7732,150 @@ mod tests {
             }
         );
         assert_eq!(last.generation_before, generation);
+    }
+
+    /// The focused `reload_bundle` regression (M6c.1 review): an
+    /// HTML-only edit published through the **full-bundle** route must
+    /// carry the author sheets along — present, in order, with their
+    /// computed-style effect — and a combined edit that rejects must
+    /// publish **neither** source change. (Before the bundle form,
+    /// full reloads silently dropped author sheets: preserving the old
+    /// application on failure was only half the contract.)
+    #[test]
+    fn m6c_reload_bundle_preserves_author_sheets_or_publishes_nothing() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 0 }\">\
+             <p id=t data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">+</button>\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view.load_stylesheet(StylesheetSource::new("A", "#t { color: #ff0000 }"))
+            .unwrap();
+        view.load_stylesheet(StylesheetSource::new("B", "#t { color: #0000ff }"))
+            .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        // Resolve #t through a hit-test scan (public identity).
+        let handle_of = |view: &VelquView, id: &str| {
+            let mut found = None;
+            for y in (0..vp.height()).step_by(4) {
+                for x in (0..vp.width()).step_by(8) {
+                    if let Some(target) = view.hit_test(vp, x as f32 + 0.5, y as f32 + 0.5) {
+                        if target.element_id.as_deref() == Some(id) {
+                            found = Some(target.handle);
+                        }
+                    }
+                }
+            }
+            found.unwrap_or_else(|| panic!("no hit target for {id}"))
+        };
+        let t_handle = handle_of(&view, "t");
+        let color = |view: &VelquView| {
+            view.inspector_snapshot(vp, Some(t_handle))
+                .selected
+                .as_ref()
+                .unwrap()
+                .color
+        };
+        assert_eq!(color(&view), Color::from_hex("#0000ff").unwrap(), "B wins");
+        let generation = view.inspector_snapshot(vp, None).generation;
+
+        // An HTML-only edit through the bundle route carries the
+        // intended sheet set (replacement semantics: the host passes
+        // the current sheets, as the lab's coordinator does).
+        let new_html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 100 }\">\
+             <p id=t data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             <button id=inc @click=\"count = count + 1\">+</button>\
+             </div>\
+             </body></html>";
+        let new_generation = view
+            .reload_bundle(
+                DocumentSource::new("document", new_html),
+                vec![
+                    StylesheetSource::new("A", "#t { color: #ff0000 }"),
+                    StylesheetSource::new("B", "#t { color: #0000ff }"),
+                ],
+                vp,
+            )
+            .unwrap();
+        assert_ne!(new_generation, generation);
+        assert_eq!(
+            view.stylesheets()
+                .iter()
+                .map(|sheet| sheet.id.to_string())
+                .collect::<Vec<_>>(),
+            ["A", "B"],
+            "author sheets survive an HTML-only bundle publication, in order"
+        );
+        assert_eq!(
+            text_of(&mut view, vp, "label"),
+            ["Count: 100"],
+            "the HTML edit published"
+        );
+        // The fresh handles are generation-scoped: resolve #t anew.
+        let new_handle = handle_of(&view, "t");
+        let color_after = view
+            .inspector_snapshot(vp, Some(new_handle))
+            .selected
+            .as_ref()
+            .unwrap()
+            .color;
+        assert_eq!(
+            color_after,
+            Color::from_hex("#0000ff").unwrap(),
+            "the sheets' computed effect is visible in the replacement"
+        );
+
+        // A combined edit that rejects publishes NEITHER change: an
+        // empty stylesheet in the bundle refuses the whole transaction,
+        // so the HTML edit (also in it) must not be live either.
+        let rejected_html = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ count: 200 }\">\
+             <p id=t data-vv-test=label vx-text=\"'Count: ' + count\">placeholder</p>\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_bundle(
+                DocumentSource::new("document", rejected_html),
+                vec![StylesheetSource::new("A", " ")],
+                vp,
+            )
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::Source);
+        assert_eq!(
+            text_of(&mut view, vp, "label"),
+            ["Count: 100"],
+            "neither the HTML nor the CSS change became live"
+        );
+        assert_eq!(
+            view.stylesheets()
+                .iter()
+                .map(|sheet| sheet.id.to_string())
+                .collect::<Vec<_>>(),
+            ["A", "B"],
+            "the sheet set is untouched by the rejection"
+        );
+
+        // The documented convenience semantics, pinned: reload_document
+        // resets the sheet set (hosts preserving sheets use the bundle
+        // form, as above).
+        let reset_html = "<!doctype html><html><body style=\"margin: 0\">\
+             <p id=t>plain</p>\
+             </body></html>";
+        view.reload_document(DocumentSource::new("document", reset_html), vp)
+            .unwrap();
+        assert!(
+            view.stylesheets().is_empty(),
+            "reload_document resets the author sheet set (documented)"
+        );
     }
 
     /// Full reload publishes only a fully prepared candidate: the

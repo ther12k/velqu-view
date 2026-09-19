@@ -442,6 +442,37 @@ fn rescan_rereads_the_tracked_set() {
     assert_eq!(coordinator.status().rescans, 1);
 }
 
+/// Startup reconciliation (the registration gap): the application read
+/// source A; the file became B before watch registration completed —
+/// the watcher baselines B and never emits an event. The watcher
+/// thread's forced post-registration rescan must display B with no
+/// further save, and nothing more happens afterwards.
+#[test]
+fn startup_reconciliation_closes_the_registration_gap() {
+    let (mut view, mut coordinator, vp) = harness();
+    let mut fs = seeded_fs();
+    // The edit happens with NO notification at all (pre-registration);
+    // b.css so the change is visible (B wins the equal-specificity tie).
+    fs.set(Path::new("/app/b.css"), "#t { color: #00ff00 }");
+    // The watcher thread sends one Rescan right after registering.
+    coordinator.notify(SourceNotification::Rescan, 50);
+    let result = settled(&mut coordinator, &mut view, vp, &fs, 200);
+    assert!(matches!(result.outcome, ReconcileOutcome::Published { .. }));
+    view.render(vp).unwrap();
+    let (t_x, t_y) = point_over(&view, vp, "t");
+    let handle = view.hit_test(vp, t_x, t_y).unwrap().handle;
+    let color = view
+        .inspector_snapshot(vp, Some(handle))
+        .selected
+        .unwrap()
+        .color;
+    assert_eq!(color, velqu_view::Color::from_hex("#00ff00").unwrap());
+    // No further filesystem changes: no further reconciliation runs.
+    assert!(!coordinator.due(10_000), "quiet after the startup pass");
+    let result = settled(&mut coordinator, &mut view, vp, &fs, 20_000);
+    assert_eq!(result.outcome, ReconcileOutcome::NothingDirty);
+}
+
 /// Notifications arriving during a reconciliation populate the next
 /// dirty set — never a shared-clear-after-reload.
 #[test]

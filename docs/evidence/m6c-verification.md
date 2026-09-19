@@ -62,12 +62,50 @@ directories, bounded 8s waits; `watch/tests.rs`):
 
 ## Engine notes
 
-* The PollWatcher baseline race: a write landing before the poller's
-  first snapshot is invisible to it — the native tests let the
-  backend establish its baseline before writing (real editors save
-  seconds after launch). Native watcher evidence is Linux evidence.
+* **Polling startup vs timestamp-only detection — the precise causes
+  (M6c.1 review follow-up, verified against the notify 8.2.0
+  source).** Two distinct mechanisms, two distinct fixes:
+  1. **Startup ordering**: registering a path builds the initial
+     `WatchData` snapshot synchronously — a source edited between the
+     host's initial read and registration produces no event ever (the
+     registration *is* the baseline). Fix: the watcher thread sends
+     one forced `Rescan` immediately after registering its directories
+     (ADR 0022's startup reconciliation), so the coordinator compares
+     disk against what the application actually published,
+     independently of any event. Pinned by
+     `startup_reconciliation_closes_the_registration_gap`
+     (coordinator) and
+     `native_startup_registration_gap_closes_without_a_save` (the real
+     sequence under the native backend).
+  2. **Timestamp-only change detection**: notify truncates mtimes to
+     whole seconds and compares "newer mtime or different content
+     hash"; content comparison is off by default. An in-place edit
+     inside the same recorded second is invisible to timestamp-only
+     polling. Fix: the poll backend enables
+     `Config::with_compare_contents(true)` (cost bounded by the
+     watched app directories). Pinned by
+     `polling_detects_same_second_edits_via_content_comparison`,
+     which writes the baseline and the edit inside one wall second and
+     asserts the whole-second mtimes match (so only content comparison
+     can converge).
+* `PollWatcher::poll()` sends a request to its worker; its return is
+  not a completion barrier — the tests wait for the observable
+  outcome (a publication), never treating it as synchronization.
+* Native watcher evidence is Linux evidence.
 * notify 8.2.0 resolved from crates.io; MSRV 1.87 verified against
   the actual feature set (lockfile evidence in CI's msrv job).
+
+## The focused reload_bundle regression (M6c.1)
+
+`m6c_reload_bundle_preserves_author_sheets_or_publishes_nothing`
+(velqu-view): an HTML-only edit published through the full-bundle
+route with the intended sheet set keeps A and B present, in order,
+with their computed-style effect visible in the replacement; a
+combined edit that rejects (empty sheet in the bundle) publishes
+**neither** the HTML nor the CSS change; and the convenience APIs'
+replacement semantics are documented and pinned
+(`reload_document` resets the sheet set; `reload_stylesheets`
+upserts in place; `reload_bundle` replaces with the given set).
 
 ## Gates
 

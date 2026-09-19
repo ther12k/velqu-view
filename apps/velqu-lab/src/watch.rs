@@ -98,11 +98,19 @@ pub fn spawn_with_wake(
             Box::new(watcher)
         }
         WatchBackend::Poll => {
+            // Content comparison on: notify truncates mtimes to whole
+            // seconds and compares "newer or content-hash-different",
+            // so timestamp-only polling can miss an in-place edit
+            // inside the same recorded second (verified against the
+            // notify 8.2.0 source). The cost is bounded by the watched
+            // app directories.
             let watcher = notify::PollWatcher::new(
                 move |event| {
                     let _ = events_tx.send(event);
                 },
-                notify::Config::default().with_poll_interval(Duration::from_millis(250)),
+                notify::Config::default()
+                    .with_poll_interval(Duration::from_millis(250))
+                    .with_compare_contents(true),
             )
             .map_err(|error| format!("poll watcher: {error}"))?;
             Box::new(watcher)
@@ -117,6 +125,17 @@ pub fn spawn_with_wake(
             // nested app folders.
             for dir in dirs {
                 let _ = notify_watcher.watch(&dir, notify::RecursiveMode::Recursive);
+            }
+            // Startup reconciliation (ADR 0022): a source edited after
+            // the host's initial read but before these registrations
+            // produced no event and never will — registration snapshots
+            // the current contents as the baseline. One forced rescan
+            // right after registration closes the gap for both
+            // backends: the coordinator compares disk against what the
+            // application actually published.
+            if !thread_stopped.load(Ordering::SeqCst) {
+                let _ = wakeups.send(SourceNotification::Rescan);
+                wake();
             }
             while !thread_stopped.load(Ordering::SeqCst) {
                 match events_rx.recv_timeout(Duration::from_millis(100)) {

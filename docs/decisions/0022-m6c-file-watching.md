@@ -90,6 +90,23 @@ is out of profile and stated as a limitation.
 registered set, never event reconstruction. Raw events coalesce into
 one notification per wakeup and live only in bounded diagnostics.
 
+**Startup reconciliation**: watch registration snapshots the current
+contents as its baseline, so a source edited between the host's
+initial read and registration produces no event ever. The watcher
+thread therefore sends one forced `Rescan` immediately after
+registering its directories — the coordinator compares disk against
+what the application actually published, independently of events.
+(The M6c.1 review follow-up; verified against notify 8.2.0's
+`watch_inner`, which builds the initial `WatchData` synchronously.)
+
+**Polling detects content**: notify truncates mtimes to whole seconds
+and compares "newer mtime or different content hash" with content
+comparison off by default — an in-place edit inside the same recorded
+second is invisible to timestamp-only polling. The poll backend
+enables `with_compare_contents(true)`; and `PollWatcher::poll()` is a
+request, not a completion barrier, so everything waits for observable
+outcomes.
+
 Native watching is an optimization, not a guarantee (network
 filesystems, containers): `--watch=poll` selects `PollWatcher`, and
 both backends feed the **same** reconciliation logic — polling has no
