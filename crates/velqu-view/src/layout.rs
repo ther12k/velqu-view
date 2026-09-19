@@ -1202,6 +1202,90 @@ mod tests {
     }
 
     #[test]
+    fn flex_zero_basis_distributes_free_space_not_content() {
+        // `flex: 1 1 0%` (Tailwind `flex-1`): the zero basis means the
+        // item grows from zero into the *free space*, not from its
+        // content size — the item takes exactly the remainder after the
+        // fixed sibling, even when its content is wider (its content
+        // min-width only claims space past the free space when overflow
+        // is visible; the scroll-container case is pinned separately).
+        let facts = facts_for(
+            "<body><div data-vv-test=row class=row>\
+             <div data-vv-test=fixed class=fixed></div>\
+             <div data-vv-test=grow class=grow><div class=wide></div></div>\
+             </div></body>",
+            "body { margin: 0 } .row { display: flex; width: 400px } \
+             .fixed { width: 256px } .grow { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; overflow: hidden } \
+             .wide { width: 600px; height: 10px }",
+            400,
+            300,
+        );
+        let fixed = fact(&facts, "fixed");
+        let grow = fact(&facts, "grow");
+        assert_eq!(fixed.width, 256.0, "fixed sibling keeps its width");
+        assert_eq!(grow.width, 144.0, "grow item gets exactly the rest");
+        assert_eq!(fixed.x + fixed.width, grow.x);
+    }
+
+    #[test]
+    fn scroll_container_flex_item_drops_content_minimum() {
+        // Flexbox §4.5: a scroll container's automatic minimum size is
+        // zero, so `flex-1 overflow-y-auto` shares a row with a fixed
+        // panel even when its content's min-content width is larger
+        // than the space left (the reference-dashboard failure shape).
+        let facts = facts_for(
+            "<body><div data-vv-test=row class=row>\
+             <div data-vv-test=fixed class=fixed></div>\
+             <div data-vv-test=list class=list><div class=wide></div></div>\
+             </div></body>",
+            "body { margin: 0 } .row { display: flex; width: 400px } \
+             .fixed { width: 256px } \
+             .list { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; overflow-y: auto } \
+             .wide { width: 600px; height: 10px }",
+            400,
+            300,
+        );
+        let list = fact(&facts, "list");
+        assert_eq!(list.width, 144.0, "scroll container yields its minimum");
+        assert_eq!(list.scroll_width, Some(600.0), "content still scrolls");
+    }
+
+    #[test]
+    fn percent_height_needs_a_definite_parent() {
+        // CSS2 §10.5: `height: 100%` resolves against a definite parent
+        // height; against an auto-height flex row the used value is
+        // `auto`, so align-stretch sizes the rail instead.
+        let facts = facts_for(
+            "<body><div data-vv-test=row class=row>\
+             <div data-vv-test=rail class=rail>x</div>\
+             <div data-vv-test=main class=main><p>one</p><p>two</p></div>\
+             </div></body>",
+            "body { margin: 0 } .row { display: flex; width: 400px; height: 120px } \
+             .rail { width: 100px; height: 100% } .main { flex-grow: 1 }",
+            400,
+            300,
+        );
+        let rail = fact(&facts, "rail");
+        assert_eq!(rail.height, 120.0, "100% resolves against the row");
+
+        let auto = facts_for(
+            "<body><div data-vv-test=row class=row>\
+             <div data-vv-test=rail class=rail>x</div>\
+             <div data-vv-test=main class=main><p>one</p><p>two</p></div>\
+             </div></body>",
+            "body { margin: 0 } .row { display: flex; width: 400px } \
+             .rail { width: 100px; height: 100% } .main { flex-grow: 1 }",
+            400,
+            300,
+        );
+        let row = fact(&auto, "row");
+        let rail = fact(&auto, "rail");
+        let main = fact(&auto, "main");
+        assert_eq!(rail.height, row.height, "auto parent: stretch applies");
+        assert_eq!(main.height, row.height);
+    }
+
+    #[test]
     fn flex_row_nests_block_and_column() {
         // block → flex → (text | block | flex column) — the mixed-nesting
         // shape that a flex-island architecture cannot handle.

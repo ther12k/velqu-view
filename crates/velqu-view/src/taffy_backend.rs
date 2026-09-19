@@ -63,7 +63,7 @@ pub(crate) fn layout_box_tree(
     // Projection: box tree → Taffy tree. Leaf measurement maps to the box's
     // inline words via a side table (id → words source).
     let mut leaf_sources: HashMap<TaffyId, &BoxNode> = HashMap::new();
-    let mirror = project(root, &mut taffy, &mut leaf_sources, scale);
+    let mirror = project(root, &mut taffy, &mut leaf_sources, scale, true);
 
     // A viewport root wraps the page so the page root's own margins behave
     // like M2a's (root nodes in Taffy ignore their margins; a wrapper makes
@@ -182,13 +182,30 @@ fn project<'a>(
     taffy: &mut TaffyTree,
     leaf_sources: &mut HashMap<TaffyId, &'a BoxNode>,
     scale: f32,
+    parent_height_definite: bool,
 ) -> MirrorNode {
-    let style = map_style(
+    let mut style = map_style(
         &node.style,
         scale,
         PAGE_ROOT_TAGS.contains(&node.tag.as_str()),
         node.replaced.is_some() || node.control.is_some() || node.tag == "img",
     );
+
+    // CSS sizing (CSS2 §10.5): a percentage height resolves against the
+    // parent's height only when that height is definite (an absolute
+    // length, or a percentage chain rooted in one). Against an
+    // auto/content-sized parent the used value is `auto` — which also
+    // re-enables flex `align-stretch` for `h-full` rails inside
+    // auto-height flex rows, matching browsers. The projection maps the
+    // percentage to `auto`; the computed style itself is unchanged.
+    let height_definite = match node.style.height {
+        None => false,
+        Some(Length::Percent(_)) => parent_height_definite,
+        Some(_) => true,
+    };
+    if !height_definite && matches!(node.style.height, Some(Length::Percent(_))) {
+        style.size.height = TaffyDimension::auto();
+    }
 
     // A grid container with only inline content still needs its tracks:
     // the inline content becomes an anonymous grid item (M2c). Flex
@@ -229,7 +246,7 @@ fn project<'a>(
         taffy_children.push(id);
     }
     for child in &node.children {
-        let mirror = project(child, taffy, leaf_sources, scale);
+        let mirror = project(child, taffy, leaf_sources, scale, height_definite);
         taffy_children.push(mirror.taffy_id);
         children.push(mirror);
     }
@@ -346,9 +363,20 @@ fn map_style(
         },
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
+        // A 0% basis (`flex-1`) projects as an absolute zero: Taffy only
+        // resolves percentage bases against a definite main size, and under
+        // intrinsic sizing (a parent's min-content pass) it falls back to
+        // the content size — which would smuggle the item's min-content
+        // width into the container's intrinsic contribution and starve
+        // fixed siblings. Browsers clamp the item's hypothetical size at
+        // the zero basis (Flexbox §9.9), so a real zero matches them in
+        // both definite and intrinsic sizing.
         flex_basis: style
             .flex_basis
-            .map(|len| dim(Some(len), scale))
+            .map(|len| match len {
+                Length::Percent(0.0) => TaffyDimension::length(0.0),
+                other => dim(Some(other), scale),
+            })
             .unwrap_or(TaffyDimension::auto()),
         justify_content: match style.justify_content {
             JustifyContent::FlexStart => Some(taffy::style::JustifyContent::FLEX_START),

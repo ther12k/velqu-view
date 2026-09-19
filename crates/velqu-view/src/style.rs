@@ -574,6 +574,33 @@ impl<'a> Cascade<'a> {
                 &mut self.diagnostics,
             );
         }
+
+        // 5. Computed-value normalization (CSS Overflow §3): `visible` on
+        //    one axis cannot combine with a clipping value on the other;
+        //    the visible axis computes to `auto` — the same rule browsers
+        //    apply. For Velqu this also matters to layout: an `auto` axis
+        //    disables the content-based automatic minimum size for flex
+        //    items (CSS Flexbox §4.5), so a `flex-1` scroll list can share
+        //    a row with a fixed panel at narrow viewports instead of
+        //    forcing its min-content width into the line. `clip` pairing
+        //    with `visible` is not part of the v0 profile and stays
+        //    uncoerced.
+        if matches!(style.overflow_x, Overflow::Visible)
+            && matches!(
+                style.overflow_y,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            )
+        {
+            style.overflow_x = Overflow::Auto;
+        }
+        if matches!(style.overflow_y, Overflow::Visible)
+            && matches!(
+                style.overflow_x,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            )
+        {
+            style.overflow_y = Overflow::Auto;
+        }
         style
     }
 }
@@ -2047,5 +2074,28 @@ mod tests {
         );
         let (style, _) = fx.compute_for("hidden");
         assert_eq!(style.display, Display::None);
+    }
+
+    /// CSS Overflow §3: `visible` on one axis combined with a clipping
+    /// value on the other computes the visible axis to `auto`. This is
+    /// what lets an `overflow-y-auto` flex item drop its content-based
+    /// automatic minimum (Flexbox §4.5) in Taffy's projection.
+    #[test]
+    fn overflow_visible_coerces_to_auto_on_the_other_axis() {
+        let mut fx = build(
+            "<div data-vv-test=y style=\"overflow-y: auto\">x</div>\
+             <div data-vv-test=x style=\"overflow-x: hidden\">x</div>\
+             <div data-vv-test=plain style=\"overflow-y: visible\">x</div>",
+            &[],
+        );
+        let (style, _) = fx.compute_for("y");
+        assert_eq!(style.overflow_x, Overflow::Auto, "x axis coerces");
+        assert_eq!(style.overflow_y, Overflow::Auto);
+        let (style, _) = fx.compute_for("x");
+        assert_eq!(style.overflow_x, Overflow::Hidden);
+        assert_eq!(style.overflow_y, Overflow::Auto, "y axis coerces");
+        let (style, _) = fx.compute_for("plain");
+        assert_eq!(style.overflow_x, Overflow::Visible);
+        assert_eq!(style.overflow_y, Overflow::Visible);
     }
 }
