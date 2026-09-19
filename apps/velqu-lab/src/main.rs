@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+mod reload_coordinator;
+mod watch;
+
 use velqu_view::{VelquView, Viewport};
 
 struct Args {
@@ -30,6 +33,8 @@ struct Args {
     tailwind: bool,
     reactive: bool,
     inspect: bool,
+    /// Hot reload: `Some(backend)` when `--watch`/`--watch=poll`.
+    watch: Option<watch::WatchBackend>,
 }
 
 const USAGE: &str = "\
@@ -46,6 +51,10 @@ OPTIONS:
     --tailwind         Compile Tailwind utility classes into CSS (ADR 0009)
     --reactive         Enable Velqu Reactive: compile vx-* markup into the
                        bounded execution plan and drive reactive turns (ADR 0016/0017)
+    --watch            Hot reload (window mode): watch the app's sources and
+                       reconcile through the transactional reload APIs (ADR 0021/0022)
+    --watch=poll       Hot reload with the polling backend (native events are
+                       an optimization, not a guarantee)
     --inspect          Enable the inspector trace (ADR 0020) and print the
                        snapshot + retained trace after the headless run
     --size WxH         Logical viewport size (default 1024x640)
@@ -68,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
         tailwind: false,
         reactive: false,
         inspect: false,
+        watch: None,
     };
     let mut positional: Vec<String> = Vec::new();
     let mut argv = std::env::args().skip(1);
@@ -82,6 +92,8 @@ fn parse_args() -> Result<Args, String> {
             "--tailwind" => args.tailwind = true,
             "--reactive" => args.reactive = true,
             "--inspect" => args.inspect = true,
+            "--watch" => args.watch = Some(watch::WatchBackend::Native),
+            "--watch=poll" => args.watch = Some(watch::WatchBackend::Poll),
             "--size" => {
                 let value = argv.next().ok_or("--size requires WxH")?;
                 args.size = parse_size(&value)?;
@@ -479,6 +491,148 @@ fn run_window(args: &Args, view: &mut VelquView) -> Result<(), String> {
     Ok(())
 }
 
+/// Builds the hot-reload registry for an app directory: the document
+/// plus every `*.css` in established (sorted) cascade order, with the
+/// published bundle seeded from the bytes the app was loaded from.
+fn watch_setup(
+    app_dir: &Path,
+    view: &VelquView,
+) -> Result<
+    (
+        reload_coordinator::SourceRegistry,
+        reload_coordinator::BundleSnapshot,
+    ),
+    String,
+> {
+    let index = app_dir.join("index.html");
+    let html =
+        std::fs::read(&index).map_err(|e| format!("cannot read {}: {e}", index.display()))?;
+    let mut sheets: Vec<PathBuf> = match std::fs::read_dir(app_dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "css"))
+            .collect(),
+        Err(e) => return Err(format!("cannot read {}: {e}", app_dir.display())),
+    };
+    sheets.sort();
+    // The live view's sheet ids are the established order (load_app
+    // loaded them sorted by name, same rule).
+    let stylesheets = sheets
+        .into_iter()
+        .map(|path| reload_coordinator::RegisteredSource {
+            id: velqu_view::SourceId::new(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
+            path,
+        })
+        .collect();
+    let registry = reload_coordinator::SourceRegistry {
+        document: reload_coordinator::RegisteredSource {
+            path: index,
+            id: velqu_view::SourceId::new("index.html"),
+        },
+        stylesheets,
+    };
+    let published = reload_coordinator::BundleSnapshot {
+        html,
+        sheets: view
+            .stylesheets()
+            .iter()
+            .map(|sheet| sheet.css.as_bytes().to_vec())
+            .collect(),
+    };
+    Ok((registry, published))
+}
+
+/// Window mode with hot reload (M6c, ADR 0022): the watcher runs on
+/// its own thread and wakes the loop through the event-loop proxy;
+/// reconciliation happens in the idle hook on the main thread. Only a
+/// published reload redraws.
+fn run_window_watch(args: &Args, view: &mut VelquView) -> Result<(), String> {
+    let backend = args.watch.expect("caller checked");
+    let (registry, published) = watch_setup(&args.app_dir, view)?;
+    let physical = |logical: u32| (logical as f32 * args.scale).round() as u32;
+    let viewport = Viewport::try_new(physical(args.size.0), physical(args.size.1), args.scale)
+        .map_err(|e| e.to_string())?;
+    let mut coordinator = reload_coordinator::Coordinator::new(registry, published, 120);
+    let (sender, wakeups) = watch::Wakeups::channel();
+
+    let title = format!("VelquView Lab — {} (watching)", args.app_dir.display());
+    let mut config = velqu_shell::ShellConfig::new(title)
+        .with_logical_size(args.size.0 as f32, args.size.1 as f32);
+    if let Some(exit_after) = args.exit_after {
+        config = config.with_exit_after(exit_after);
+    }
+
+    let paths = coordinator.registry().paths();
+    let spawn_watcher = move |proxy: winit_stub::EventLoopProxy| {
+        let _watcher = watch::spawn_with_wake(backend, &paths, sender, {
+            let proxy = proxy.clone();
+            std::sync::Arc::new(move || {
+                let _ = proxy.send_event(velqu_shell::ShellUserEvent::Watch);
+            })
+        });
+        // The watcher handle lives for the loop's lifetime; dropping it
+        // here would stop watching immediately, so leak it into a
+        // detached guard that the process teardown reclaims.
+        std::mem::forget(_watcher);
+    };
+    let hook: velqu_shell::WatchHook = Box::new(move |view: &mut VelquView| {
+        let now_ms = std::time::Instant::now().duration_since(*START).as_millis() as u64;
+        wakeups.drain_into(&mut coordinator, now_ms);
+        if !coordinator.due(now_ms) {
+            return false;
+        }
+        let result = coordinator.reconcile(now_ms, read_source, view, viewport);
+        match result.outcome {
+            reload_coordinator::ReconcileOutcome::Published { .. } => {
+                println!("watch: reconciled — {:?}", coordinator.status());
+                true
+            }
+            reload_coordinator::ReconcileOutcome::Rejected(rejection) => {
+                eprintln!("watch: {rejection} — {:?}", coordinator.status());
+                false
+            }
+            _ => false,
+        }
+    });
+    let stats = velqu_shell::run_with_watch(config, view, spawn_watcher, hook)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "window closed: {} frame(s) presented in {:.1?} (watch backend: {})",
+        stats.frames,
+        stats.uptime,
+        match backend {
+            watch::WatchBackend::Native => "native",
+            watch::WatchBackend::Poll => "poll",
+        }
+    );
+    Ok(())
+}
+
+/// The process start marker for the watch hook's millisecond clock.
+static START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// Reads one registered source (missing ≠ empty: a failed read defers).
+fn read_source(path: &Path) -> reload_coordinator::ReadOutcome {
+    match std::fs::read(path) {
+        Ok(bytes) => reload_coordinator::ReadOutcome::Bytes(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            reload_coordinator::ReadOutcome::Missing
+        }
+        Err(_) => reload_coordinator::ReadOutcome::Error("read failed".to_owned()),
+    }
+}
+
+/// Type alias shim so `run_window_watch` can name the proxy without a
+/// direct winit dependency in the lab.
+mod winit_stub {
+    pub type EventLoopProxy = velqu_shell::ShellProxy;
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -505,6 +659,8 @@ fn main() -> ExitCode {
 
     let result = if args.headless {
         run_headless(&args, &mut view)
+    } else if args.watch.is_some() {
+        run_window_watch(&args, &mut view)
     } else {
         run_window(&args, &mut view)
     };

@@ -128,6 +128,25 @@ trace — they ran on the candidate, not the view (CSS staging records
 are checkpoint-rolled-back). Both outcomes append one `Reload` trace
 record.
 
+### 7. Maintenance contract for the stylesheet transaction (M6b freeze note)
+
+Staging on the live instance with snapshot-and-restore is a
+synchronous implementation choice, not a shape requirement. Its rules:
+
+* **One restoration path.** Every handled failure exits through the
+  single restore block; speculative work cannot publish
+  application-visible effects before success.
+* **The rollback inventory is centralized** in the one snapshot/restore
+  pair at the transaction's edge. As new renderer state appears, the
+  danger is a field render mutates but the snapshot forgets — any new
+  renderer-visible state must join both sides.
+* **Renderer rollback ≠ external effects.** Preparation may call an
+  asset provider that performs reads or updates its own caches;
+  restoring Velqu's state cannot undo provider-side actions. Native
+  cursor/IME changes, application observer callbacks, and window
+  presentation remain **after successful publication**, never inside
+  speculative preparation.
+
 ## Consequences
 
 * The reviewer's counter probe is pinned end-to-end: run to 7 with

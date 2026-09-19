@@ -14,7 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 velqu-view = { workspace = true }
+velqu-reactive = { workspace = true }
 velqu-shell = { workspace = true }
+notify = "8.2.0"
 
 [lints]
 workspace = true

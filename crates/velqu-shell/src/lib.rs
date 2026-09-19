@@ -46,7 +46,7 @@ use velqu_view::{
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -159,13 +159,67 @@ pub struct ShellStats {
     pub uptime: Duration,
 }
 
+/// A shell-side wakeup sent into the event loop by host threads (the
+/// M6c watcher). The loop wakes from `Wait` and runs the host's idle
+/// hook on the main thread — the view never crosses threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellUserEvent {
+    /// Tracked sources may be stale: run the watch hook.
+    Watch,
+}
+
+/// The host-side handle for waking the loop (re-exported so hosts
+/// need no direct winit dependency).
+pub type ShellProxy = winit::event_loop::EventLoopProxy<ShellUserEvent>;
+
+/// The host hook invoked on the main thread after a
+/// [`ShellUserEvent::Watch`]. Returns whether the document should
+/// redraw (a watcher wakeup alone never forces rendering).
+pub type WatchHook<'a> = Box<dyn FnMut(&mut VelquView) -> bool + 'a>;
+
 /// Opens a native window and runs the event loop until the window closes.
 ///
 /// The window shows live [`VelquView`] frames, re-rendering whenever the
 /// window is resized or its DPI scale changes. Blocking; returns when the
 /// user closes the window, `exit_after` elapses, or an error occurs.
 pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, ShellError> {
-    let event_loop = EventLoop::new()?;
+    run_inner(config, view, None)
+}
+
+/// [`run`] plus a host watch integration (M6c, ADR 0022):
+/// `spawn_watcher` receives the loop proxy before the loop starts
+/// (forward watcher wakeups with `send_event(ShellUserEvent::Watch)`),
+/// and `hook` runs on the main thread per wake — drain notifications,
+/// reconcile due reloads, and return whether to redraw.
+pub fn run_with_watch(
+    config: ShellConfig,
+    view: &mut VelquView,
+    spawn_watcher: impl FnOnce(winit::event_loop::EventLoopProxy<ShellUserEvent>) + 'static,
+    hook: WatchHook<'_>,
+) -> Result<ShellStats, ShellError> {
+    run_inner(
+        config,
+        view,
+        Some(WatchSetup {
+            spawn: Box::new(spawn_watcher),
+            hook,
+        }),
+    )
+}
+
+/// The watch integration handed to [`run_inner`]: the pre-loop
+/// spawner (receives the proxy) and the idle hook.
+struct WatchSetup<'a> {
+    spawn: Box<dyn FnOnce(winit::event_loop::EventLoopProxy<ShellUserEvent>)>,
+    hook: WatchHook<'a>,
+}
+
+fn run_inner(
+    config: ShellConfig,
+    view: &mut VelquView,
+    watch: Option<WatchSetup<'_>>,
+) -> Result<ShellStats, ShellError> {
+    let event_loop = winit::event_loop::EventLoop::<ShellUserEvent>::with_user_event().build()?;
     let context = softbuffer::Context::new(event_loop.owned_display_handle())?;
     // OS clipboard (M4c2, ADR 0013): the shell is the host that owns
     // platform integration. When the session has no clipboard service
@@ -183,11 +237,18 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
 
     // `Wait` sleeps until input; a deadline (smoke tests) needs `WaitUntil`
     // so the loop wakes up to honor `exit_after` with no other events.
+    // The watch proxy wakes the loop the same way.
     event_loop.set_control_flow(match config.exit_after {
         Some(exit_after) => winit::event_loop::ControlFlow::WaitUntil(Instant::now() + exit_after),
         None => winit::event_loop::ControlFlow::Wait,
     });
 
+    // Split the watch setup: the hook moves into the app, the spawner
+    // runs once with the loop proxy before the loop starts.
+    let (spawn_watcher, watch_hook) = match watch {
+        Some(WatchSetup { spawn, hook }) => (Some(spawn), Some(hook)),
+        None => (None, None),
+    };
     let mut app = ShellApp {
         config,
         view,
@@ -205,7 +266,12 @@ pub fn run(config: ShellConfig, view: &mut VelquView) -> Result<ShellStats, Shel
         ime_allowed: false,
         ime_rect: None,
         error: None,
+        watch_wake: false,
+        watch_hook,
     };
+    if let Some(spawn_watcher) = spawn_watcher {
+        spawn_watcher(event_loop.create_proxy());
+    }
     let loop_result = event_loop.run_app(&mut app);
     let stats = app.take_result();
     // Explicit clipboard teardown (arboard lifecycle): arboard warns that
@@ -244,6 +310,10 @@ struct ShellApp<'a> {
     /// `set_ime_cursor_area` calls (M4c3).
     ime_rect: Option<velqu_view::ControlRect>,
     error: Option<ShellError>,
+    /// Whether a watch wakeup is pending (M6c).
+    watch_wake: bool,
+    /// The host's watch hook, run on the main thread per wake.
+    watch_hook: Option<WatchHook<'a>>,
 }
 
 impl ShellApp<'_> {
@@ -479,7 +549,7 @@ impl ShellApp<'_> {
     }
 }
 
-impl ApplicationHandler for ShellApp<'_> {
+impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Err(error) = self.setup(event_loop) {
             self.fail(event_loop, error);
@@ -583,8 +653,26 @@ impl ApplicationHandler for ShellApp<'_> {
                 event_loop.exit();
             }
         }
+        // A watch wakeup (M6c): the host's hook runs here, on the main
+        // thread, with the view — watcher threads never touch it.
+        // Only a published reload repaints the document.
+        if self.watch_wake {
+            self.watch_wake = false;
+            if let Some(hook) = self.watch_hook.as_mut() {
+                let repaint = (hook)(self.view);
+                if repaint {
+                    self.dirty = true;
+                }
+            }
+        }
         if self.dirty {
             self.request_redraw();
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ShellUserEvent) {
+        match event {
+            ShellUserEvent::Watch => self.watch_wake = true,
         }
     }
 }

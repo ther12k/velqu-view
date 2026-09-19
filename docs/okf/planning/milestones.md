@@ -100,7 +100,18 @@ reconciliation on success; reload acceptance is a policy table
 (Source / ReactiveInitialization / InitialMutations / FirstFrame),
 distinct from parser recovery and from "any diagnostic"; the attempt
 ledger and `Reload` trace records separate failed candidates from the
-active application; **M6c file watching** — candidate
+active application; **M6c file watching** (ADR 0022, done) — host-side
+reconciliation over the M6b APIs: a source registry with stable
+identity per logical path and established cascade order,
+parent-directory watching (notify 8.2; `PollWatcher` fallback, both
+feeding one semantics), a bounded dirty set + quiet interval against
+an injectable clock, and the observed/attempted/published snapshot
+triple (byte-exact; missing ≠ empty; unchanged bytes never reload;
+repeat-invalid snapshots skipped without blocking recovery); routing
+is explicit (sheets-only → `reload_stylesheets`, any document change →
+one `reload_bundle`); the shell wakes through
+`EventLoopProxy<ShellUserEvent>` and the host hook runs on the main
+thread, redrawing only on publication; `velqu-lab --watch[=poll]`. — candidate
 builds fully (parse/compile/runtime/initial validation) before an
 atomic generation swap; failures keep the old document running with
 diagnostics; CSS-only reload upserts the sheet and preserves reactive
@@ -123,7 +134,10 @@ probe: counter at 7 → CSS color edit → still 7, new color, zero
 generation resets; then HTML edit → new generation, state resets per
 source, old handles rejected.
 
-Exit: layout/state failures can be diagnosed without browser tooling.
+Exit: layout/state failures can be diagnosed without browser tooling —
+**met**: the inspector (ADR 0020) explains what Velqu did; the reload
+ledger and traces (ADR 0021/0022) explain what the dev loop did;
+`velqu-lab --tailwind --reactive --inspect` and `--watch` deliver both.
 
 ## M7 - Real Dashboard
 

@@ -2724,12 +2724,40 @@ impl VelquView {
         source: DocumentSource,
         viewport: Viewport,
     ) -> Result<u64, ReloadRejection> {
+        self.reload_bundle(source, Vec::new(), viewport)
+    }
+
+    /// The bundle form of a full reload (M6c, ADR 0022): the document
+    /// **and** its author stylesheets publish as **one** transaction —
+    /// a batch that changed both is never published as a CSS-only
+    /// intermediate followed by a document attempt. The sheets keep
+    /// the given order (their cascade position in the candidate);
+    /// publication moves the candidate's sheet state with everything
+    /// else. Acceptance policy is `reload_document`'s.
+    pub fn reload_bundle(
+        &mut self,
+        source: DocumentSource,
+        stylesheets: Vec<StylesheetSource>,
+        viewport: Viewport,
+    ) -> Result<u64, ReloadRejection> {
         if source.html.trim().is_empty() {
             return Err(self.reject_reload(
                 ReloadKind::FullDocument,
                 ReloadStage::Source,
                 "the document source is empty".to_owned(),
             ));
+        }
+        for sheet in &stylesheets {
+            if sheet.css.trim().is_empty() {
+                return Err(self.reject_reload(
+                    ReloadKind::FullDocument,
+                    ReloadStage::Source,
+                    format!(
+                        "stylesheet {:?} in the bundle is empty: the existing stylesheet primitive defines empty sources as errors",
+                        sheet.id
+                    ),
+                ));
+            }
         }
         // Reserve the candidate generation (the lifetime authority).
         // A failed attempt consumes the id (a visible gap) but never
@@ -2757,6 +2785,15 @@ impl VelquView {
                 ReloadStage::Source,
                 format!("the document source was rejected: {error}"),
             ));
+        }
+        for sheet in stylesheets {
+            if let Err(error) = candidate.load_stylesheet(sheet) {
+                return Err(self.reject_reload(
+                    ReloadKind::FullDocument,
+                    ReloadStage::Source,
+                    format!("a bundle stylesheet was rejected: {error}"),
+                ));
+            }
         }
 
         // Turn zero: the initial binding outputs must apply cleanly.
@@ -2820,6 +2857,8 @@ impl VelquView {
         let VelquView {
             dom,
             document,
+            stylesheets,
+            parsed_css,
             images,
             controls,
             control_diagnostics_list,
@@ -2858,6 +2897,8 @@ impl VelquView {
         } = candidate;
         self.dom = dom;
         self.document = document;
+        self.stylesheets = stylesheets;
+        self.parsed_css = parsed_css;
         self.document_generation = generation;
         self.images = images;
         self.controls = controls;

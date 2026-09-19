@@ -25,6 +25,7 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0019](0019-m6a-event-ownership.md) | M6a: event ownership — the pump takes a caller-owned batch, never the queue; replay is explicit; turn-generated events wait for the next drain | accepted |
 | [0020](0020-m6a-inspector.md) | M6a: the inspector — recorded outcomes only (event/turn/invalidation/render records, bounded retention, metadata-default capture), observational snapshots | accepted |
 | [0021](0021-m6b-transactional-reload.md) | M6b: transactional reload — candidates prepare through the first frame; CSS-only reload stages the committed document; acceptance is a policy, not "any diagnostic" | accepted |
+| [0022](0022-m6c-file-watching.md) | M6c: file watching as host-side reconciliation — notifications say "may be stale", contents decide; observed/attempted/published snapshots; both backends, one semantics | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how
