@@ -47,6 +47,13 @@ native lightweight application UI
 
 Full roadmap: [`docs/okf/planning/milestones.md`](docs/okf/planning/milestones.md).
 
+**Phase 1 closed** — implementation and reference-application
+conformance complete; release qualification explicitly scoped (IME
+live-platform validation, windowed wake counts, long-run reload
+memory): see the closure record,
+[`docs/evidence/phase1-closure.md`](docs/evidence/phase1-closure.md).
+The M8+ rows above are roadmap placeholders, not opened work.
+
 ## Layout
 
 ```

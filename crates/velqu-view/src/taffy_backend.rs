@@ -193,11 +193,18 @@ fn project<'a>(
 
     // CSS sizing (CSS2 §10.5): a percentage height resolves against the
     // parent's height only when that height is definite (an absolute
-    // length, or a percentage chain rooted in one). Against an
-    // auto/content-sized parent the used value is `auto` — which also
-    // re-enables flex `align-stretch` for `h-full` rails inside
-    // auto-height flex rows, matching browsers. The projection maps the
-    // percentage to `auto`; the computed style itself is unchanged.
+    // length, or a percentage chain rooted in one). Against a
+    // content-sized parent the percentage *behaves as* `auto` at this
+    // layout step — a used-value behavior, not a cascade rewrite: the
+    // computed style keeps the declared percentage, and the projection
+    // alone maps it to `auto`. Mapping also re-enables flex
+    // `align-stretch` for `h-full` rails inside auto-height flex rows,
+    // matching browsers. Boundary: definiteness here tracks declared
+    // lengths/percentage chains only — a height a box *acquires* through
+    // flexing or cross-axis stretch is definite per Flexbox §3 but is
+    // not tracked by this walk; descendants' percentages against such a
+    // height behave as `auto` (a documented profile limitation, not a
+    // claimed equivalence).
     let height_definite = match node.style.height {
         None => false,
         Some(Length::Percent(_)) => parent_height_definite,
@@ -363,18 +370,24 @@ fn map_style(
         },
         flex_grow: style.flex_grow,
         flex_shrink: style.flex_shrink,
-        // A 0% basis (`flex-1`) projects as an absolute zero: Taffy only
-        // resolves percentage bases against a definite main size, and under
-        // intrinsic sizing (a parent's min-content pass) it falls back to
-        // the content size — which would smuggle the item's min-content
-        // width into the container's intrinsic contribution and starve
-        // fixed siblings. Browsers clamp the item's hypothetical size at
-        // the zero basis (Flexbox §9.9), so a real zero matches them in
-        // both definite and intrinsic sizing.
+        // Zero-basis scoping (constrained workaround, not a rewrite): an
+        // explicit `0%` basis (Tailwind's `flex-1`) stays a percentage in
+        // general — under an indefinite main size a percentage basis is
+        // content-based, the `0%` ≠ `0px` distinction browsers pin for
+        // auto-sized columns (WPT flex-one-sets-flex-basis-to-zero-px).
+        // The exception is scroll-container flex items (computed overflow
+        // neither `visible` nor `clip` on an axis — Taffy's automatic-
+        // minimum trigger): their intrinsic contribution is zero in
+        // browsers (scrollable content never widens an ancestor's
+        // intrinsic size), while Taffy's intrinsic measurement is
+        // content-based. Projecting `0%` as an absolute zero for exactly
+        // those items reproduces browser intrinsic sizing — the
+        // reference-dashboard failure shape — without touching anyone
+        // else's declared semantics.
         flex_basis: style
             .flex_basis
             .map(|len| match len {
-                Length::Percent(0.0) => TaffyDimension::length(0.0),
+                Length::Percent(0.0) if scrolls_intrinsically(style) => TaffyDimension::length(0.0),
                 other => dim(Some(other), scale),
             })
             .unwrap_or(TaffyDimension::auto()),
@@ -519,6 +532,20 @@ fn map_grid_line(line: GridLine) -> TaffyPlacement {
         GridLine::Index(i) => TaffyPlacement::Line(i.into()),
         GridLine::Span(n) => TaffyPlacement::Span(n),
     }
+}
+
+/// Whether the computed overflow makes this box a scroll container on at
+/// least one axis (mirrors Taffy's `maybe_into_automatic_min_size`
+/// trigger: neither `visible` nor `clip`). Used only to scope the
+/// zero-percent flex-basis projection above.
+fn scrolls_intrinsically(style: &ComputedStyle) -> bool {
+    matches!(
+        style.overflow_x,
+        Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+    ) || matches!(
+        style.overflow_y,
+        Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+    )
 }
 
 fn map_overflow(overflow: Overflow) -> taffy::style::Overflow {

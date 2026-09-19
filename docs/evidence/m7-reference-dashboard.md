@@ -67,31 +67,67 @@ the detail panel stays inside the viewport.
 The dashboard exposed three layout-conformance gaps; each is pinned by
 a named regression:
 
-1. **Overflow computed-value normalization** (CSS Overflow §3) —
-   `visible` on one axis with a clipping value on the other computes to
-   `auto`, letting an `overflow-y-auto` flex item drop its
-   content-based automatic minimum (Flexbox §4.5).
-   `style::tests::overflow_visible_coerces_to_auto_on_the_other_axis`.
-2. **Zero flex-basis projection** (Flexbox §9.9) — `flex-1`'s `0%`
-   basis projects as an absolute zero; Taffy otherwise resolved it
-   against content under intrinsic sizing, starving fixed siblings.
+1. **Overflow computed-value normalization** (CSS Overflow §3) — when
+   one axis is neither `visible` nor `clip`, a `visible` value on the
+   other axis computes to `auto` (and a `clip` value computes to
+   `hidden`; `visible`/`clip` paired together stays as specified). The
+   visible→auto half is what lets an `overflow-y-auto` flex item drop
+   its content-based *automatic* minimum (Flexbox §4.5 — an explicit
+   min-width/min-height is a separate author constraint and always
+   applies; nothing here says visible-overflow items "can never
+   shrink"). Profile note: the `scroll` keyword folds into `auto` at
+   parse time (paint-side scrolling).
+   `style::tests::overflow_visible_coerces_to_auto_on_the_other_axis`
+   (covers all pairing rows, including visible/clip uncoerced).
+2. **Zero flex-basis projection — scoped to scroll-container items**
+   (a constrained workaround, not a general rewrite). An explicit
+   `flex-basis: 0%` (Tailwind's `flex-1`) is **not** equivalent to
+   `0px`: a percentage basis resolves against the flex container's
+   main size, and when that size is indefinite the used basis is
+   content-based — the `0%` ≠ `0px` distinction browsers pin for
+   auto-sized columns (WPT
+   `flex-one-sets-flex-basis-to-zero-px.html`). Velqu therefore keeps
+   the declared percentage for items in general
+   (`layout::tests::explicit_zero_percent_basis_stays_content_based`:
+   an auto-height column sizes the `0%` item from content while the
+   `0px` item starts at zero, with `min-height: 0` keeping the
+   automatic minimum out of the way; against a definite height both
+   resolve to zero and the distinction disappears). The exception is
+   scroll-container flex items (computed overflow neither `visible`
+   nor `clip` on an axis): their intrinsic contribution is zero in
+   browsers — scrollable content never widens an ancestor's intrinsic
+   size — while Taffy's intrinsic measurement is content-based;
+   projecting `0%` as an absolute zero for exactly those items
+   reproduces browser intrinsic sizing without touching anyone else's
+   declared semantics.
    `layout::tests::flex_zero_basis_distributes_free_space_not_content`,
    `layout::tests::scroll_container_flex_item_drops_content_minimum`
    (the dashboard's failure shape; `scroll_width` still reports the
-   full extent). Honest boundary: with *visible* overflow the content
-   minimum legitimately claims space — only scroll containers drop it.
+   full extent).
 3. **Percentage height needs a definite parent** (CSS2 §10.5) —
-   `height: 100%` resolves against a definite parent, computes to
-   `auto` otherwise, re-enabling flex align-stretch for `h-full` rails
-   in auto-height rows. `layout::tests::percent_height_needs_a_definite_parent`.
+   `height: 100%` resolves against a parent height that is definite;
+   against a content-sized parent the percentage *behaves as* `auto`
+   at the layout step (a used-value behavior — the computed style
+   keeps the declared percentage; only the projection maps it), which
+   re-enables flex align-stretch for `h-full` rails in auto-height
+   rows. `layout::tests::percent_height_needs_a_definite_parent`.
+   Boundary: definiteness here tracks declared lengths and percentage
+   chains only; a height a box acquires through flexing or stretch is
+   definite per Flexbox §3 but is not tracked by the projection walk —
+   descendants' percentages against such a height behave as `auto`. A
+   documented profile limitation, not a claimed equivalence.
 
 Fix 3 changes the M5 dashboard's frozen raster (its `flex h-full` shell):
-the rail now stretches full-height, browser-correct. Supersession:
+the rail now stretches full-height, matching browser stretch behavior
+for that declared-height chain. Supersession:
 `770b933b40dd…` → `dd94673102b2…` (1024×640 @1×; display items 37 → 48,
 the larger rail background). The new raster was rendered and reviewed
 before acceptance. Historical evidence docs stating "digest unchanged
 (`770b933b…`)" were true at their milestone time and are superseded as
-of 2026-09-19, per the documented-migration convention (M2a).
+of 2026-09-19, per the documented-migration convention (M2a). This
+legacy-fixture migration is deliberately recorded separately from the
+M7 application baselines above — the two digest sets describe different
+fixtures at different viewports and must not be cross-read.
 
 ## Editor semantics exercised by the suite
 
@@ -111,10 +147,12 @@ reactive + inspector on. Toolchain: containerized `velqu-bench:multihost`
 2026-09-19. Timing numbers are the lab's own indicative wall times,
 not latency targets.
 
-Startup to first frame (release lab, `--frames 2`, 3 runs):
-first frame 9.81 / 10.47 / 15.31 ms (first run cold); avg 9.30–12.28 ms;
-digest and inspector identical across runs (120 display items, 1 layout
-pass, 0 turns).
+First frame (release lab, `--frames 2`, 3 runs): the lab's measured
+first-frame **render wall time** — parse/cascade/layout/raster of frame
+1 inside an already-started process — not cold process launch to first
+screen presentation: 9.81 / 10.47 / 15.31 ms (first run cold); avg
+9.30–12.28 ms; digest and inspector identical across runs (120 display
+items, 1 layout pass, 0 turns).
 
 Scripted journey (filter → select → edit → save → clear), cumulative
 counters from `m7_resource_journey --ignored --nocapture`:
@@ -128,15 +166,24 @@ counters from `m7_resource_journey --ignored --nocapture`:
 | save | 15 | 6 | 11 | 93 |
 | clear filter (8 backspaces) | 22 | 8 | 16 | 121 |
 
-Reading: per-character typing is presentation-only (12 reactive turns,
-11 repaints, a single layout in the burst — M5d batching + M4b
+Reading: the counters are an exact baseline for **this scripted
+sequence**. Within it, per-character typing on the tested edit path
+(value edits that change no `vx-show` predicate and no
+layout-affecting derived text) is presentation-only — 12 reactive
+turns, 11 repaints, a single layout in the burst (M5d batching + M4b
 interaction-paint); structural filters/selects cost one layout each;
-the journey's whole cost is 22 turns / 8 layouts / 16 repaints.
+the journey's whole cost is 22 turns / 8 layouts / 16 repaints. Typing
+that changes filtered rows or layout-relevant derived text may
+legitimately request layout and is not covered by this claim.
 
-RSS (VmRSS, same run): flat at ~50.8 MB through the entire journey;
-across five bounded full reloads ~89.2 MB after the first-generation
-replacement (new document + QuickJS generation), then +8 kB, +4 kB,
-+0, +0 — plateaued, consistent with the bounded per-generation model.
+RSS (VmRSS — current resident memory, not the VmHWM high-water mark —
+same run): flat at ~50.8 MB through the entire journey; across five
+bounded full reloads ~89.2 MB after the first-generation replacement
+(new document + QuickJS generation), then +8 kB, +4 kB, +0, +0. This
+is observed behavior over five reloads on this host — consistent with
+the bounded per-generation model, and explicitly **not** a long-run
+leak-free guarantee; a longer bounded run with retired-runtime counts
+would be the informative follow-up, not RSS inference.
 
 Idle wakeups (watcher disabled / native / polling) are **not measured
 here**: they require a windowed host run, which this headless lane

@@ -575,16 +575,17 @@ impl<'a> Cascade<'a> {
             );
         }
 
-        // 5. Computed-value normalization (CSS Overflow §3): `visible` on
-        //    one axis cannot combine with a clipping value on the other;
-        //    the visible axis computes to `auto` — the same rule browsers
-        //    apply. For Velqu this also matters to layout: an `auto` axis
-        //    disables the content-based automatic minimum size for flex
-        //    items (CSS Flexbox §4.5), so a `flex-1` scroll list can share
-        //    a row with a fixed panel at narrow viewports instead of
-        //    forcing its min-content width into the line. `clip` pairing
-        //    with `visible` is not part of the v0 profile and stays
-        //    uncoerced.
+        // 5. Computed-value normalization (CSS Overflow §3): when one axis
+        //    is neither `visible` nor `clip`, a `visible` value on the
+        //    other axis computes to `auto`, and a `clip` value computes to
+        //    `hidden` — the rule browsers apply. (`visible`/`clip` as a
+        //    pair is legal and stays as specified.) For Velqu the
+        //    visible→auto half also matters to layout: an `auto` axis
+        //    drops the content-based automatic minimum size for flex
+        //    items (CSS Flexbox §4.5 — an *automatic* minimum; an
+        //    explicit min-width/min-height is a separate author
+        //    constraint and still applies), so a `flex-1` scroll list
+        //    can share a row with a fixed panel at narrow viewports.
         if matches!(style.overflow_x, Overflow::Visible)
             && matches!(
                 style.overflow_y,
@@ -600,6 +601,22 @@ impl<'a> Cascade<'a> {
             )
         {
             style.overflow_y = Overflow::Auto;
+        }
+        if matches!(style.overflow_x, Overflow::Clip)
+            && matches!(
+                style.overflow_y,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            )
+        {
+            style.overflow_x = Overflow::Hidden;
+        }
+        if matches!(style.overflow_y, Overflow::Clip)
+            && matches!(
+                style.overflow_x,
+                Overflow::Hidden | Overflow::Scroll | Overflow::Auto
+            )
+        {
+            style.overflow_y = Overflow::Hidden;
         }
         style
     }
@@ -2076,16 +2093,22 @@ mod tests {
         assert_eq!(style.display, Display::None);
     }
 
-    /// CSS Overflow §3: `visible` on one axis combined with a clipping
-    /// value on the other computes the visible axis to `auto`. This is
-    /// what lets an `overflow-y-auto` flex item drop its content-based
-    /// automatic minimum (Flexbox §4.5) in Taffy's projection.
+    /// CSS Overflow §3: when one axis is neither `visible` nor `clip`, a
+    /// `visible` value on the other axis computes to `auto` and a `clip`
+    /// value computes to `hidden`. `visible`/`clip` as a pair stays as
+    /// specified. The visible→auto half is what lets an `overflow-y-auto`
+    /// flex item drop its content-based automatic minimum (Flexbox §4.5)
+    /// in Taffy's projection.
     #[test]
     fn overflow_visible_coerces_to_auto_on_the_other_axis() {
         let mut fx = build(
             "<div data-vv-test=y style=\"overflow-y: auto\">x</div>\
              <div data-vv-test=x style=\"overflow-x: hidden\">x</div>\
-             <div data-vv-test=plain style=\"overflow-y: visible\">x</div>",
+             <div data-vv-test=plain style=\"overflow-y: visible\">x</div>\
+             <div data-vv-test=visclip style=\"overflow-x: visible; overflow-y: clip\">x</div>\
+             <div data-vv-test=clipvis style=\"overflow-x: clip; overflow-y: visible\">x</div>\
+             <div data-vv-test=clipauto style=\"overflow-x: clip; overflow-y: auto\">x</div>\
+             <div data-vv-test=clipscroll style=\"overflow-y: clip; overflow-x: scroll\">x</div>",
             &[],
         );
         let (style, _) = fx.compute_for("y");
@@ -2097,5 +2120,22 @@ mod tests {
         let (style, _) = fx.compute_for("plain");
         assert_eq!(style.overflow_x, Overflow::Visible);
         assert_eq!(style.overflow_y, Overflow::Visible);
+        // visible/clip pairs with each other: legal, uncoerced.
+        let (style, _) = fx.compute_for("visclip");
+        assert_eq!(style.overflow_x, Overflow::Visible);
+        assert_eq!(style.overflow_y, Overflow::Clip);
+        let (style, _) = fx.compute_for("clipvis");
+        assert_eq!(style.overflow_x, Overflow::Clip);
+        assert_eq!(style.overflow_y, Overflow::Visible);
+        // clip paired with a scrolling value computes to hidden. (The
+        // v0 profile folds the `scroll` keyword into `auto` at parse
+        // time — scrolling is paint-side — so `overflow-x: scroll`
+        // computes to `auto`, not `scroll`.)
+        let (style, _) = fx.compute_for("clipauto");
+        assert_eq!(style.overflow_x, Overflow::Hidden, "clip→hidden");
+        assert_eq!(style.overflow_y, Overflow::Auto);
+        let (style, _) = fx.compute_for("clipscroll");
+        assert_eq!(style.overflow_y, Overflow::Hidden, "clip→hidden");
+        assert_eq!(style.overflow_x, Overflow::Auto, "scroll folds to auto");
     }
 }

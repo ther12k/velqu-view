@@ -1203,12 +1203,13 @@ mod tests {
 
     #[test]
     fn flex_zero_basis_distributes_free_space_not_content() {
-        // `flex: 1 1 0%` (Tailwind `flex-1`): the zero basis means the
-        // item grows from zero into the *free space*, not from its
+        // `flex: 1 1 0%` (Tailwind `flex-1`) on a scroll-container item:
+        // the zero basis (projected absolute for scroll containers) means
+        // the item grows from zero into the *free space*, not from its
         // content size — the item takes exactly the remainder after the
-        // fixed sibling, even when its content is wider (its content
-        // min-width only claims space past the free space when overflow
-        // is visible; the scroll-container case is pinned separately).
+        // fixed sibling, even when its content is wider. Non-scroll
+        // items keep the percentage basis; their distinction is pinned
+        // by explicit_zero_percent_basis_stays_content_based.
         let facts = facts_for(
             "<body><div data-vv-test=row class=row>\
              <div data-vv-test=fixed class=fixed></div>\
@@ -1248,6 +1249,60 @@ mod tests {
         let list = fact(&facts, "list");
         assert_eq!(list.width, 144.0, "scroll container yields its minimum");
         assert_eq!(list.scroll_width, Some(600.0), "content still scrolls");
+    }
+
+    #[test]
+    fn explicit_zero_percent_basis_stays_content_based() {
+        // An auto-height column is an indefinite main size: an explicit
+        // `0%` basis is content-based there (the 0% ≠ 0px distinction
+        // browsers pin — WPT flex-one-sets-flex-basis-to-zero-px), while
+        // `0px` contributes its zero basis. `min-height: 0` keeps the
+        // automatic minimum from obscuring the difference. Velqu keeps
+        // the declared percentage for non-scroll items; only
+        // scroll-container items project the absolute zero.
+        let auto = facts_for(
+            "<body><div data-vv-test=col class=col>\
+             <div data-vv-test=px class=px>PX</div>\
+             <div data-vv-test=pc class=pc>PC</div>\
+             </div></body>",
+            "body { margin: 0 } .col { display: flex; flex-direction: column; width: 200px } \
+             .px { flex-grow: 1; flex-shrink: 1; flex-basis: 0px; min-height: 0 } \
+             .pc { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; min-height: 0 }",
+            300,
+            400,
+        );
+        let px = fact(&auto, "px");
+        let pc = fact(&auto, "pc");
+        // Observed: the container sizes to its content sum and the free
+        // space splits evenly, so px ends up grown-only while pc starts
+        // from its content base (here 12 vs 36). The pinned contract is
+        // the distinction — the 0% item out-sizes the 0px item because
+        // its base is content-based — not Taffy's container-content
+        // approximation of the exact numbers.
+        assert!(
+            pc.height > px.height,
+            "0% base is content-based, 0px base is zero: pc={} px={}",
+            pc.height,
+            px.height
+        );
+
+        // Against a definite container height both bases resolve to zero
+        // and grow splits the space evenly: no distinction survives.
+        let definite = facts_for(
+            "<body><div data-vv-test=col class=col>\
+             <div data-vv-test=px class=px>PX</div>\
+             <div data-vv-test=pc class=pc>PC</div>\
+             </div></body>",
+            "body { margin: 0 } .col { display: flex; flex-direction: column; width: 200px; height: 100px } \
+             .px { flex-grow: 1; flex-shrink: 1; flex-basis: 0px; min-height: 0 } \
+             .pc { flex-grow: 1; flex-shrink: 1; flex-basis: 0%; min-height: 0 }",
+            300,
+            400,
+        );
+        let px = fact(&definite, "px");
+        let pc = fact(&definite, "pc");
+        assert_eq!(px.height, 50.0, "0px grows from zero: {}", px.height);
+        assert_eq!(pc.height, 50.0, "0% resolves to zero: {}", pc.height);
     }
 
     #[test]
