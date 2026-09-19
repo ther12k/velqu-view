@@ -77,3 +77,7 @@ directories, bounded 8s waits; `watch/tests.rs`):
   `cargo +1.87.0 check --workspace --all-targets --locked`; headless
   dashboard smoke digest unchanged (`770b933b…`); M5 conformance and
   the M6b battery unchanged.
+
+Landing: `d8d49f1` pushed to `main`; GitHub CI green — run
+[35431174182](https://github.com/ther12k/velqu-view/actions/runs/35431174182)
+(fmt/clippy/test/build + MSRV 1.87 with notify 8.2.0, both jobs).
