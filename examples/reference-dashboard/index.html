@@ -90,11 +90,12 @@
         </div>
       </div>
 
-      <!-- h-80 bounds the pair of columns; the records card scrolls
-           (overflow-y-auto + paint-side wheel scrolling, ADR 0008) -->
-      <div class="flex mt-6 h-80">
+      <!-- The pair auto-heights to the detail card; only the records
+           list scrolls (overflow-y-auto + paint-side wheel scrolling,
+           ADR 0008) -->
+      <div class="flex mt-6 items-start">
         <!-- Records list (authored rows; vx-show filtering) -->
-        <div class="flex-1 overflow-y-auto bg-white rounded-lg border mr-6 p-3">
+        <div class="flex-1 h-80 overflow-y-auto bg-white rounded-lg border mr-6 p-3">
           <div
             id="row-8841"
             data-vv-test="row-8841"

@@ -123,6 +123,37 @@ Fixed, deterministic, local: the six-shipment dataset lives in the
 `vx-state` initializer in `index.html`. No server, network, auth, or
 persistence; no images or other binary assets.
 
+## Visual baselines
+
+Five application states are frozen as reviewed raster digests and
+pinned in `crates/velqu-view/tests/reference_dashboard.rs`
+(`M7_*_DIGEST`). Each digest was regenerated, its PNG inspected, and
+only then accepted:
+
+| State | What it shows |
+|---|---|
+| `INITIAL` 1280×800 @1× | default selection TRK-8841, 6/0/2 summary cards, Save disabled |
+| `EDITED` | TRK-2210 selected, name edited (focused field), Save enabled, unsaved = 1 |
+| `EMPTY` | search `zzz`: 0 records, no-results block, detail state intact |
+| `SCROLLED` | records card wheel-scrolled (paint-side), selection still highlighted |
+| `SMALL` 800×600 @1× | rail + summary + detail intact; the records list narrows |
+
+The `SMALL` boundary, stated plainly: at 800×600 the fixed-width detail
+panel and rail leave the records list a narrow column whose text wraps.
+This viewport is a stable layout baseline, not a responsive claim —
+Tailwind variants (`md:`) are deferred in the v0 profile, so the
+fixture does not restyle itself per viewport.
+
+Digests are regenerated with an intentional-change procedure, never
+silently:
+
+```sh
+cargo test -p velqu-view --test reference_dashboard m7_regenerate \
+  -- --ignored --nocapture   # prints digests, writes /tmp/ref-states/*.png
+```
+
+Review the PNGs, then pin the printed digests as the new constants.
+
 ## Acceptance
 
 The M7 acceptance matrix — initial dashboard, filter and clear search,
