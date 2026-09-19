@@ -86,3 +86,7 @@ necessary post-style reconciliation.
   (304 tests); `cargo +1.87.0 check --workspace --all-targets
   --locked`; headless dashboard smoke digest unchanged
   (`770b933b…`); counter/forms/tabs conformance unchanged.
+
+Landing: `a36832a` pushed to `main`; GitHub CI green — run
+[35428449895](https://github.com/ther12k/velqu-view/actions/runs/35428449895)
+(fmt/clippy/test/build + MSRV 1.87, both jobs).
