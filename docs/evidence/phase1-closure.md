@@ -16,7 +16,7 @@ documented public surface.
 |---|---|
 | M7 evidence anchor (original acceptance) | `199ccb0335f8121802582b483e2a0de25a3814f2` |
 | Phase-1 closure point | `624bd1e` (closure record + 0%-basis scoping; CI run `35451329843` green) |
-| Deviation-record amendment | the commit carrying the reclassified scroll-basis wording (follows the closure point; same gates) |
+| Deviation-record amendment | `7002a07397b64f7f4b31bbdd6cecbd68f0873885` (reclassified scroll-basis wording + deviation pin; CI run `35457142384` green) |
 | CI on M7 anchor | run `35447937753` — fmt/clippy(-D warnings)/test/release-build and MSRV 1.87 lanes, both green (2m16s) |
 | Gate at closure | `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets --locked` zero warnings; `cargo test --workspace --locked` 338 passed / 0 failed (339 after the deviation pin); `cargo +1.87.0 check --workspace --all-targets --locked` clean |
 | Reference application | `examples/reference-dashboard` (ADR 0023; profile: [`docs/reference-dashboard.md`](../reference-dashboard.md); evidence: [`m7-reference-dashboard.md`](m7-reference-dashboard.md)) |
