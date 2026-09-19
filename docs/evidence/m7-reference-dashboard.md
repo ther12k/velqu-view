@@ -49,6 +49,60 @@ SMALL-viewport boundary statement and the regeneration procedure.
 The lab's own render of the fixture reproduces the frozen `INITIAL`
 digest byte-for-byte (`a89813c5…` from `velqu-lab --headless … --inspect`).
 
+Review took two iterations, both producing real changes: the first
+flagged the detail panel's Save/caption clipped at the viewport bottom
+(fixture pair column too tall → bounded list); the second flagged the
+nav rail ending above the content bottom, which the engine
+investigation below proved to be correct rendering of a
+browser-differing pattern — after the layout fixes the fixture pair
+auto-heights and the final PNGs were re-reviewed (rail full-height and
+flush with the content at both viewports; badge/ID spacing clean; the
+800×600 state browser-equivalent, the cramped list clipping inside its
+own card). Conformance facts are asserted next to the frozen SMALL
+digest: `w-64` rail keeps 256px, stretches to main-content height, and
+the detail panel stays inside the viewport.
+
+## Engine fixes landed with M7 (focused regressions)
+
+The dashboard exposed three layout-conformance gaps; each is pinned by
+a named regression:
+
+1. **Overflow computed-value normalization** (CSS Overflow §3) —
+   `visible` on one axis with a clipping value on the other computes to
+   `auto`, letting an `overflow-y-auto` flex item drop its
+   content-based automatic minimum (Flexbox §4.5).
+   `style::tests::overflow_visible_coerces_to_auto_on_the_other_axis`.
+2. **Zero flex-basis projection** (Flexbox §9.9) — `flex-1`'s `0%`
+   basis projects as an absolute zero; Taffy otherwise resolved it
+   against content under intrinsic sizing, starving fixed siblings.
+   `layout::tests::flex_zero_basis_distributes_free_space_not_content`,
+   `layout::tests::scroll_container_flex_item_drops_content_minimum`
+   (the dashboard's failure shape; `scroll_width` still reports the
+   full extent). Honest boundary: with *visible* overflow the content
+   minimum legitimately claims space — only scroll containers drop it.
+3. **Percentage height needs a definite parent** (CSS2 §10.5) —
+   `height: 100%` resolves against a definite parent, computes to
+   `auto` otherwise, re-enabling flex align-stretch for `h-full` rails
+   in auto-height rows. `layout::tests::percent_height_needs_a_definite_parent`.
+
+Fix 3 changes the M5 dashboard's frozen raster (its `flex h-full` shell):
+the rail now stretches full-height, browser-correct. Supersession:
+`770b933b40dd…` → `dd94673102b2…` (1024×640 @1×; display items 37 → 48,
+the larger rail background). The new raster was rendered and reviewed
+before acceptance. Historical evidence docs stating "digest unchanged
+(`770b933b…`)" were true at their milestone time and are superseded as
+of 2026-09-19, per the documented-migration convention (M2a).
+
+## Editor semantics exercised by the suite
+
+The suite drives text through the public keyboard path and pins these
+M4c editor semantics as the contract: programmatic `set_focus` parks
+the caret at the value's **start** (pointer press places it at the
+click point); `Backspace` deletes one grapheme and ignores the active
+selection (SelectAll + text replaces); `insert_text("")` is a no-op, so
+clearing is backspace-until-empty, with the suite asserting forward
+progress. No IME claim is made (standing item, §below).
+
 ## Resource baseline (descriptive, single host — not a benchmark)
 
 Scene: `examples/reference-dashboard`, 1280×800 @1×, Tailwind +
@@ -58,9 +112,9 @@ reactive + inspector on. Toolchain: containerized `velqu-bench:multihost`
 not latency targets.
 
 Startup to first frame (release lab, `--frames 2`, 3 runs):
-first frame 13.91 / 14.18 / 14.77 ms; avg 13.27–13.74 ms; digest and
-inspector identical across runs (120 display items, 1 layout pass,
-0 turns).
+first frame 9.81 / 10.47 / 15.31 ms (first run cold); avg 9.30–12.28 ms;
+digest and inspector identical across runs (120 display items, 1 layout
+pass, 0 turns).
 
 Scripted journey (filter → select → edit → save → clear), cumulative
 counters from `m7_resource_journey --ignored --nocapture`:
@@ -79,9 +133,9 @@ Reading: per-character typing is presentation-only (12 reactive turns,
 interaction-paint); structural filters/selects cost one layout each;
 the journey's whole cost is 22 turns / 8 layouts / 16 repaints.
 
-RSS (VmRSS, same run): flat at ~55.2 MB through the entire journey;
-across five bounded full reloads ~93.6 MB after the first-generation
-replacement (new document + QuickJS generation), then +36 kB, +8 kB,
+RSS (VmRSS, same run): flat at ~50.8 MB through the entire journey;
+across five bounded full reloads ~89.2 MB after the first-generation
+replacement (new document + QuickJS generation), then +8 kB, +4 kB,
 +0, +0 — plateaued, consistent with the bounded per-generation model.
 
 Idle wakeups (watcher disabled / native / polling) are **not measured

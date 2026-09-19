@@ -67,7 +67,7 @@ silently. Families used (representative tokens, not exhaustive):
 - Flex/grid layout: `flex`, `flex-1`, `grid`, `grid-cols-3`, `gap-4`,
   `items-center`, `justify-between`, `block`
 - Spacing/size scale: `p-2…p-8`, `px-2/3`, `py-2/6`, `mt-1…mt-8`,
-  `mr-6`, `w-16/24/64/72/96`, `w-full`, `h-3/20/96`, `h-full`
+  `mr-6`, `w-16/24/64/72/96`, `w-full`, `h-3/20/80`, `h-full`
 - Color + background: `bg-white`, `bg-slate-100/200/900`,
   `bg-indigo-50/600`, `bg-emerald-600`, `bg-red-500`; `text-white`,
   `text-slate-400…900`, `text-indigo`-family accents, status colors
