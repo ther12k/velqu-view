@@ -621,6 +621,106 @@ fn quiet_interval_gates_reconciliation() {
     assert!(coordinator.due(190));
 }
 
+/// The post-closure repair's core policy pin: an irrelevant wake
+/// (unregistered paths) never moves the debounce deadline. On the
+/// defective scheduling every wake restarted the clock, so under a
+/// waiting event loop the quiet interval could never elapse.
+#[test]
+fn irrelevant_wakes_never_postpone_reconciliation() {
+    let (_view, mut coordinator, _vp) = harness();
+    let reg = registry();
+    coordinator.notify(
+        SourceNotification::Changed(vec![reg.stylesheets[0].path.clone()]),
+        100,
+    );
+    assert_eq!(coordinator.next_deadline_ms(), Some(100 + QUIET));
+    // Unregistered-path noise (another file in the watched directory).
+    for at in [120, 130, 140] {
+        coordinator.notify(
+            SourceNotification::Changed(vec![PathBuf::from("/app/notes.txt")]),
+            at,
+        );
+    }
+    assert_eq!(
+        coordinator.next_deadline_ms(),
+        Some(100 + QUIET),
+        "irrelevant wakes must not move the deadline"
+    );
+    assert!(coordinator.due(150), "the settled edit still reconciles");
+}
+
+/// Burst edits to the same (already dirty) path extend the deadline;
+/// the reviewer's timing example — edit at t=0 (deadline 50), re-edit
+/// at t=40 (deadline 90) — must land on 90, and the interval between
+/// 50 and 90 must neither fire early nor reset to a later time.
+#[test]
+fn burst_edits_extend_the_deadline_to_the_latest_edit() {
+    let (_view, mut coordinator, _vp) = harness();
+    let reg = registry();
+    coordinator.notify(
+        SourceNotification::Changed(vec![reg.stylesheets[0].path.clone()]),
+        0,
+    );
+    assert_eq!(coordinator.next_deadline_ms(), Some(QUIET));
+    // A re-edit of the already-dirty path inside the window.
+    coordinator.notify(
+        SourceNotification::Changed(vec![reg.stylesheets[0].path.clone()]),
+        40,
+    );
+    assert_eq!(
+        coordinator.next_deadline_ms(),
+        Some(40 + QUIET),
+        "a relevant re-edit extends the deadline"
+    );
+    assert!(!coordinator.due(40 + QUIET - 1), "nothing runs early");
+    assert!(coordinator.due(40 + QUIET));
+}
+
+/// A deferral schedules exactly one bounded retry: the deadline moves
+/// one quiet interval past the deferral, so the retry has an actual
+/// future wake (no hot loop, no lost retry) while the loop sleeps.
+#[test]
+fn deferral_schedules_one_bounded_retry() {
+    let (mut view, mut coordinator, vp) = harness();
+    let mut fs = seeded_fs();
+    fs.remove(Path::new("/app/a.css"));
+    coordinator.notify(
+        SourceNotification::Changed(vec![PathBuf::from("/app/a.css")]),
+        100,
+    );
+    let result = settled(&mut coordinator, &mut view, vp, &fs, 200);
+    assert_eq!(result.outcome, ReconcileOutcome::Deferred);
+    assert_eq!(
+        coordinator.next_deadline_ms(),
+        Some(200 + QUIET),
+        "the retry is scheduled one quiet interval out"
+    );
+    assert!(!coordinator.due(200 + QUIET - 1));
+    assert!(coordinator.due(200 + QUIET));
+}
+
+/// Quiescence has no deadline: nothing is armed when there is no
+/// pending work, so the scheduler worker sleeps.
+#[test]
+fn quiescence_has_no_deadline() {
+    let (mut view, mut coordinator, vp) = harness();
+    assert_eq!(coordinator.next_deadline_ms(), None);
+    let mut fs = seeded_fs();
+    fs.set(Path::new("/app/b.css"), "#t { color: #010101 }");
+    coordinator.notify(
+        SourceNotification::Changed(vec![PathBuf::from("/app/b.css")]),
+        100,
+    );
+    assert_eq!(coordinator.next_deadline_ms(), Some(100 + QUIET));
+    let result = settled(&mut coordinator, &mut view, vp, &fs, 200);
+    assert!(matches!(result.outcome, ReconcileOutcome::Published { .. }));
+    assert_eq!(
+        coordinator.next_deadline_ms(),
+        None,
+        "a published reconciliation leaves nothing armed"
+    );
+}
+
 fn point_over(view: &VelquView, vp: Viewport, id: &str) -> (f32, f32) {
     for y in (0..vp.height()).step_by(4) {
         for x in (0..vp.width()).step_by(8) {

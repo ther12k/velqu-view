@@ -244,5 +244,103 @@ impl Wakeups {
     }
 }
 
+/// The debounce-deadline scheduler (post-closure repair): under
+/// `ControlFlow::Wait` the event loop sleeps until an event arrives,
+/// so "the quiet interval elapsed" needs an actual wake. One worker
+/// per watched session waits on the current deadline and invokes the
+/// host wake callback (the loop proxy) when it passes; the host hook
+/// re-arms it from the coordinator's truth. Idle — no thread wakes,
+/// no callbacks fire — whenever no deadline is set.
+///
+/// Design notes: deadlines are [`std::time::Instant`] (monotonic); the
+/// worker rechecks its predicate after every wakeup because condition
+/// variables permit spurious wakeups and interrupted timeout waits;
+/// replacing a deadline (a burst edit extends it) notifies the worker
+/// so it recomputes; `schedule` never sends the wake callback itself,
+/// so the loop cannot recurse (scheduler → wake → hook → schedule →
+/// …); shutdown is explicit and idempotent, and a late wake after
+/// loop teardown is a harmless proxy send error.
+pub(crate) struct DeadlineScheduler {
+    shared: std::sync::Arc<DeadlineShared>,
+}
+
+struct DeadlineShared {
+    /// `None` = idle. Only the host hook (main thread) writes.
+    deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    signal: std::sync::Condvar,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+impl DeadlineScheduler {
+    /// Starts the worker. `wake` is invoked (from the worker thread)
+    /// each time the current deadline passes; the host forwards it to
+    /// its event loop proxy.
+    pub(crate) fn start(wake: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        let shared = std::sync::Arc::new(DeadlineShared {
+            deadline: std::sync::Mutex::new(None),
+            signal: std::sync::Condvar::new(),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        });
+        let worker = std::sync::Arc::clone(&shared);
+        // Detached like the watcher itself: the loop's lifetime owns
+        // the session; dropping the scheduler stops the worker.
+        let _ = std::thread::Builder::new()
+            .name("watch-deadline".to_owned())
+            .spawn(move || {
+                loop {
+                    let fire = {
+                        let mut deadline = worker.deadline.lock().unwrap();
+                        loop {
+                            if worker.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                                return;
+                            }
+                            match *deadline {
+                                None => {
+                                    deadline = worker.signal.wait(deadline).unwrap();
+                                }
+                                Some(at) => {
+                                    let now = std::time::Instant::now();
+                                    if at <= now {
+                                        *deadline = None;
+                                        break true;
+                                    }
+                                    let (guard, _) =
+                                        worker.signal.wait_timeout(deadline, at - now).unwrap();
+                                    deadline = guard;
+                                }
+                            }
+                        }
+                    };
+                    if fire {
+                        wake();
+                    }
+                }
+            });
+        Self { shared }
+    }
+
+    /// Sets (or replaces — a later edit extends) the deadline. Safe at
+    /// any time; wakes the worker so it recomputes its wait.
+    pub(crate) fn schedule(&self, deadline: std::time::Instant) {
+        *self.shared.deadline.lock().unwrap() = Some(deadline);
+        self.shared.signal.notify_all();
+    }
+
+    /// Stops the worker; late wake callbacks may still fire once and
+    /// are harmless (the loop is gone; the proxy send errors out).
+    pub(crate) fn shutdown(&self) {
+        self.shared
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shared.signal.notify_all();
+    }
+}
+
+impl Drop for DeadlineScheduler {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests;

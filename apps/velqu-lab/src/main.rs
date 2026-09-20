@@ -549,7 +549,11 @@ fn watch_setup(
 /// Window mode with hot reload (M6c, ADR 0022): the watcher runs on
 /// its own thread and wakes the loop through the event-loop proxy;
 /// reconciliation happens in the idle hook on the main thread. Only a
-/// published reload redraws.
+/// published reload redraws. The debounce deadline carries its own
+/// wake (post-closure repair): a `DeadlineScheduler` worker fires the
+/// proxy at the coordinator's next deadline, because a waiting loop
+/// does not measure elapsed time by itself — filesystem wakes mark
+/// work, deadline wakes settle it.
 fn run_window_watch(args: &Args, view: &mut VelquView) -> Result<(), String> {
     let backend = args.watch.expect("caller checked");
     let (registry, published) = watch_setup(&args.app_dir, view)?;
@@ -567,36 +571,62 @@ fn run_window_watch(args: &Args, view: &mut VelquView) -> Result<(), String> {
     }
 
     let paths = coordinator.registry().paths();
+    // The debounce deadline needs its own wake: under ControlFlow::Wait
+    // the loop sleeps until an event, so the scheduler worker fires the
+    // proxy at the coordinator's deadline. The slot outlives both
+    // closures (spawn is 'static, the hook borrows for the loop) and
+    // drops — stopping the worker — when the loop ends.
+    let scheduler_slot: std::rc::Rc<std::cell::RefCell<Option<watch::DeadlineScheduler>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot_for_spawn = std::rc::Rc::clone(&scheduler_slot);
     let spawn_watcher = move |proxy: winit_stub::EventLoopProxy| {
-        let _watcher = watch::spawn_with_wake(backend, &paths, sender, {
+        let send_watch: std::sync::Arc<dyn Fn() + Send + Sync> = {
             let proxy = proxy.clone();
             std::sync::Arc::new(move || {
                 let _ = proxy.send_event(velqu_shell::ShellUserEvent::Watch);
             })
-        });
+        };
+        *slot_for_spawn.borrow_mut() = Some(watch::DeadlineScheduler::start(
+            std::sync::Arc::clone(&send_watch),
+        ));
+        let _watcher = watch::spawn_with_wake(backend, &paths, sender, send_watch);
         // The watcher handle lives for the loop's lifetime; dropping it
         // here would stop watching immediately, so leak it into a
         // detached guard that the process teardown reclaims.
         std::mem::forget(_watcher);
     };
+    let slot_for_hook = std::rc::Rc::clone(&scheduler_slot);
     let hook: velqu_shell::WatchHook = Box::new(move |view: &mut VelquView| {
         let now_ms = std::time::Instant::now().duration_since(*START).as_millis() as u64;
         wakeups.drain_into(&mut coordinator, now_ms);
-        if !coordinator.due(now_ms) {
-            return false;
-        }
-        let result = coordinator.reconcile(now_ms, read_source, view, viewport);
-        match result.outcome {
-            reload_coordinator::ReconcileOutcome::Published { .. } => {
-                println!("watch: reconciled — {:?}", coordinator.status());
-                true
+        let mut repaint = false;
+        if coordinator.due(now_ms) {
+            let result = coordinator.reconcile(now_ms, read_source, view, viewport);
+            match result.outcome {
+                reload_coordinator::ReconcileOutcome::Published { kind, generation } => {
+                    println!(
+                        "watch: reconciled kind={kind:?} generation={generation:?} — {:?}",
+                        coordinator.status()
+                    );
+                    repaint = result.repaint;
+                }
+                reload_coordinator::ReconcileOutcome::Rejected(rejection) => {
+                    eprintln!("watch: {rejection} — {:?}", coordinator.status());
+                }
+                _ => {}
             }
-            reload_coordinator::ReconcileOutcome::Rejected(rejection) => {
-                eprintln!("watch: {rejection} — {:?}", coordinator.status());
-                false
-            }
-            _ => false,
         }
+        // Re-arm the scheduler from coordinator truth: a pending
+        // debounce or a bounded deferral retry both need a future wake
+        // while the loop sleeps; quiescence arms nothing and the
+        // worker goes idle.
+        if let Some(deadline_ms) = coordinator.next_deadline_ms() {
+            let deadline = *START + std::time::Duration::from_millis(deadline_ms);
+            if let Some(scheduler) = slot_for_hook.borrow().as_ref() {
+                scheduler.schedule(deadline);
+            }
+        }
+        repaint
     });
     let stats = velqu_shell::run_with_watch(config, view, spawn_watcher, hook)
         .map_err(|e| e.to_string())?;

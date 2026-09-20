@@ -227,34 +227,39 @@ impl Coordinator {
         status
     }
 
-    /// Records a wakeup: marks registered paths dirty and restarts the
-    /// quiet interval. Never reloads. Unknown paths are ignored
-    /// (bounded by the registered source set).
+    /// Records a wakeup. A **relevant** notification — a changed path
+    /// that is registered (including a re-edit of an already-dirty
+    /// source) or a rescan — marks sources dirty and moves the debounce
+    /// deadline to `now_ms + quiet`. An irrelevant wake (unregistered
+    /// paths) never touches the deadline: under `ControlFlow::Wait` a
+    /// waiting loop only runs the host hook at wake instants, so a
+    /// clock restarted by every wake could never let the quiet
+    /// interval elapse. Never reloads.
     pub fn notify(&mut self, notification: SourceNotification, now_ms: u64) {
         if !self.enabled {
             return;
         }
-        match notification {
+        let relevant = match notification {
             SourceNotification::Changed(paths) => {
+                let registered = self.registry.paths();
+                let mut matched = false;
                 for path in paths {
-                    if self
-                        .registry
-                        .paths()
-                        .iter()
-                        .any(|registered| registered == &path)
-                    {
+                    if registered.iter().any(|candidate| candidate == &path) {
                         self.dirty.insert(path);
+                        matched = true;
                     }
                 }
+                matched
             }
             SourceNotification::Rescan => {
                 self.rescan_pending = true;
                 for path in self.registry.paths() {
                     self.dirty.insert(path);
                 }
+                true
             }
-        }
-        if !self.dirty.is_empty() {
+        };
+        if relevant {
             self.last_change_ms = Some(now_ms);
         }
     }
@@ -292,13 +297,28 @@ impl Coordinator {
         }
     }
 
+    /// The absolute `now_ms` at which the next reconciliation becomes
+    /// due, or `None` when nothing is pending (quiescent). This is the
+    /// deadline the host must schedule a wake for: a waiting event
+    /// loop does not measure elapsed time on its own.
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        if !self.enabled || self.dirty.is_empty() {
+            return None;
+        }
+        Some(
+            self.last_change_ms
+                .unwrap_or(0)
+                .saturating_add(self.quiet_ms),
+        )
+    }
+
     /// Runs one reconciliation against an injected reader. The dirty
     /// set is **taken** (a snapshot): notifications arriving during the
     /// reconciliation populate the next set — the M6a.1 lesson, never a
     /// shared-clear-after-reload.
     pub fn reconcile<R>(
         &mut self,
-        _now_ms: u64,
+        now_ms: u64,
         mut read: R,
         view: &mut VelquView,
         viewport: Viewport,
@@ -340,7 +360,7 @@ impl Coordinator {
             match read_one(&self.registry.document.path.clone(), &mut deferred_paths) {
                 Some(bytes) => observed.html = bytes,
                 None => {
-                    self.defer(deferred_paths);
+                    self.defer(deferred_paths, now_ms);
                     return Reconciliation {
                         outcome: ReconcileOutcome::Deferred,
                         repaint: false,
@@ -361,7 +381,7 @@ impl Coordinator {
                         observed.sheets[index] = bytes;
                     }
                     None => {
-                        self.defer(deferred_paths);
+                        self.defer(deferred_paths, now_ms);
                         return Reconciliation {
                             outcome: ReconcileOutcome::Deferred,
                             repaint: false,
@@ -459,13 +479,18 @@ impl Coordinator {
     }
 
     /// A deferred reconciliation keeps its unreadable paths eligible
-    /// for the next wakeup (bounded by the registered set; deferral is
-    /// a cheap reread, never an error storm).
-    fn defer(&mut self, paths: Vec<PathBuf>) {
+    /// for a later wakeup (bounded by the registered set; deferral is
+    /// a cheap reread, never an error storm). The retry is scheduled:
+    /// the debounce deadline moves to `now_ms + quiet` so the host has
+    /// an actual future wake to arm — without this, a deferral would
+    /// either retry in a hot loop or never (a waiting loop does not
+    /// advance time on its own).
+    fn defer(&mut self, paths: Vec<PathBuf>, now_ms: u64) {
         self.status.deferrals += 1;
         for path in paths {
             self.dirty.insert(path);
         }
+        self.last_change_ms = Some(now_ms);
     }
 }
 

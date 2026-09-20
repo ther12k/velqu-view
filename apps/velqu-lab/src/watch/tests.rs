@@ -447,3 +447,88 @@ fn point_over(view: &VelquView, vp: Viewport, id: &str) -> (f32, f32) {
     }
     panic!("no hit target for {id}");
 }
+
+// --- DeadlineScheduler (post-closure repair) --------------------------
+//
+// Real threads with real (short) waits; margins are generous because
+// these run on loaded CI runners. Timing bounds assert the ORDER of
+// events (not fired early / fired by), never exact instants.
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+
+use super::DeadlineScheduler;
+
+fn counter_wake() -> (Arc<AtomicUsize>, Arc<dyn Fn() + Send + Sync>) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let wake: Arc<dyn Fn() + Send + Sync> = {
+        let count = Arc::clone(&count);
+        Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    (count, wake)
+}
+
+fn fired(count: &Arc<AtomicUsize>) -> usize {
+    count.load(Ordering::SeqCst)
+}
+
+/// The deadline fires once, the worker goes idle (no further fires
+/// without a new schedule), and re-arming after a fire works.
+#[test]
+fn deadline_scheduler_fires_once_then_rearms() {
+    let (count, wake) = counter_wake();
+    let scheduler = DeadlineScheduler::start(wake);
+    scheduler.schedule(Instant::now() + Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(fired(&count), 1, "fires exactly once");
+    // Idle: nothing further without a new schedule.
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(fired(&count), 1, "idle after firing");
+    // Re-arm after a fire.
+    scheduler.schedule(Instant::now() + Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(fired(&count), 2, "re-arms after firing");
+}
+
+/// A later schedule replaces (extends) a pending earlier deadline: the
+/// burst-edit case — the worker must recompute and NOT fire at the
+/// superseded time.
+#[test]
+fn deadline_scheduler_extends_a_pending_deadline() {
+    let (count, wake) = counter_wake();
+    let scheduler = DeadlineScheduler::start(wake);
+    scheduler.schedule(Instant::now() + Duration::from_millis(300));
+    // The re-edit lands inside the window: the deadline extends.
+    scheduler.schedule(Instant::now() + Duration::from_millis(700));
+    std::thread::sleep(Duration::from_millis(450));
+    assert_eq!(fired(&count), 0, "must not fire at the superseded deadline");
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(fired(&count), 1, "fires at the extended deadline");
+}
+
+/// An earlier schedule replaces a pending later one (the idle-to-work
+/// transition).
+#[test]
+fn deadline_scheduler_pulls_a_pending_deadline_earlier() {
+    let (count, wake) = counter_wake();
+    let scheduler = DeadlineScheduler::start(wake);
+    scheduler.schedule(Instant::now() + Duration::from_millis(900));
+    scheduler.schedule(Instant::now() + Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(fired(&count), 1, "fires at the earlier deadline");
+}
+
+/// Shutdown stops the worker: a scheduled deadline after shutdown
+/// never fires, and dropping the scheduler is sufficient.
+#[test]
+fn deadline_scheduler_shutdown_stops_firing() {
+    let (count, wake) = counter_wake();
+    let scheduler = DeadlineScheduler::start(wake);
+    scheduler.shutdown();
+    scheduler.schedule(Instant::now() + Duration::from_millis(40));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(fired(&count), 0, "no fire after shutdown");
+    drop(scheduler);
+}

@@ -166,6 +166,11 @@ gate):
    `insert_text` and makes no IME claim.
 2. **Live-window idle-wakeup counts** under `--watch` / `--watch=poll`
    — requires a windowed host run; not measured by the headless lane.
+   *(Corrected 2026-09-20: this item hid a functional defect, not just
+   a missing measurement — live-window reconciliation was broken. See
+   [post-closure correction 0001](post-closure-watch-scheduling.md),
+   which repairs it; the wakeup-count measurement itself remains
+   open.)*
 3. **Long-run reload memory qualification** — a longer bounded run
    with retired-runtime/resource counts; the five-reload RSS plateau
    is indicative only.
@@ -181,3 +186,18 @@ parse-time `scroll`→`auto` fold, and the flex-acquired-height
 percentage limitation. No M8 is opened by this record; retiring a
 deviation, a renderer rewrite, a new reactive subsystem, or a profile
 expansion is a separately named future proposal.
+
+## Post-closure corrections
+
+The anchors above are historical records and are not rewritten.
+Corrections land as separate linked entries:
+
+- **[Post-closure correction 0001 — live-window watch
+  scheduling](post-closure-watch-scheduling.md)** (2026-09-20):
+  `velqu-lab --watch` never reconciled a live window at `1d0a562`;
+  the coordinator and transaction tests here did not establish
+  end-to-end windowed delivery. Found by the external-consumer
+  starter, repaired in `apps/velqu-lab` only, gated by a live
+  single-save/no-input regression that fails on `1d0a562` and passes
+  on the repair. Until that repair, the dev loop described in the M6c
+  evidence carried this hidden qualification.
