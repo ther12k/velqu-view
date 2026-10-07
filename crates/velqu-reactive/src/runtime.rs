@@ -379,11 +379,12 @@ impl ReactiveRuntime {
                 // in the JS prelude so no `Value<'js>` crosses a closure.
                 let emit = {
                     let diagnostics = Rc::clone(&self.diagnostics);
-                    move |line: String| {
-                        let mut line = line;
+                    move |mut line: String| {
                         if line.len() > output_cap {
-                            line.truncate(output_cap);
-                            line.push('…');
+                            // Char-boundary-safe: the byte cap can land
+                            // inside a multi-byte character, where plain
+                            // truncation would panic.
+                            line = cap_string(&line, output_cap);
                         }
                         let mut sink = diagnostics.borrow_mut();
                         if sink.len() < MAX_DIAGNOSTIC_LINES {
@@ -445,7 +446,11 @@ impl ReactiveRuntime {
                 // The Date shim: wall-clock reads become logical-clock reads;
                 // constructing with explicit components stays pure computation.
                 // The native tick function is captured and removed, like the
-                // diagnostic sink, so only the shim holds it.
+                // diagnostic sink, so only the shim holds it — and the native
+                // Date constructor itself is severed from every script-
+                // reachable chain (post-closure correction 0002): without
+                // that, `Object.getPrototypeOf(Date).now()` read the host
+                // wall clock through the subclass's [[Prototype]].
                 ctx.eval::<(), _>(
                     // NB: the subclass must not be named `Date` — a lexical
                 // `class Date` binding would shadow the global during its
@@ -462,6 +467,16 @@ impl ReactiveRuntime {
                         }
                         static now() { return epoch + tick(); }
                     }
+                    // The pure statics (spec computation, no clock reads)
+                    // survive severing only when copied explicitly.
+                    LogicalDate.parse = OriginDate.parse;
+                    LogicalDate.UTC = OriginDate.UTC;
+                    // Sever both reachable handles to the native
+                    // constructor: the subclass's [[Prototype]] (its
+                    // `.now`/`new` were native) and the inherited
+                    // `Date.prototype.constructor`.
+                    Object.setPrototypeOf(LogicalDate, Function.prototype);
+                    OriginDate.prototype.constructor = LogicalDate;
                     globalThis.Date = LogicalDate;
                 })();"#,
                 )
@@ -473,9 +488,12 @@ impl ReactiveRuntime {
                 // made to throw instead.
                 //   - `eval` / `Function` globals: deleted (direct and
                 //     indirect eval become ReferenceErrors).
-                //   - `Function.prototype.constructor`: replaced with a
-                //     throwing stub, so `(function(){}).constructor(...)`
-                //     and class-constructor chains cannot rebuild Function.
+                //   - `constructor` on every function-family prototype —
+                //     `Function.prototype` and the async, generator, and
+                //     async-generator prototypes (each carries its own
+                //     live compiler) — replaced with a throwing stub
+                //     (post-closure correction 0002 closed the three
+                //     non-plain families).
                 //   - dynamic `import(...)`: no module loader exists
                 //     (loader feature off); the engine rejects it.
                 ctx.eval::<(), _>(
@@ -483,10 +501,17 @@ impl ReactiveRuntime {
                         const refused = () => { throw new TypeError("dynamic code generation is not supported"); };
                         // Capture before deleting: the identifiers resolve
                         // through the globals being removed.
-                        const functionPrototype = Function.prototype;
-                        Object.defineProperty(functionPrototype, "constructor", {
-                            value: refused, writable: true, configurable: true,
-                        });
+                        const families = [
+                            Function.prototype,
+                            Object.getPrototypeOf(async function () {}),
+                            Object.getPrototypeOf(function* () {}),
+                            Object.getPrototypeOf(async function* () {}),
+                        ];
+                        for (const family of families) {
+                            Object.defineProperty(family, "constructor", {
+                                value: refused, writable: true, configurable: true,
+                            });
+                        }
                         delete globalThis.eval;
                         delete globalThis.Function;
                     })();"#,

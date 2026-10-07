@@ -162,6 +162,11 @@ pub struct ReactiveMachine {
     poisoned_handlers: std::collections::HashMap<usize, String>,
     /// Initializers that failed during construction (M6b observability).
     initializer_failures: u32,
+    /// Turn zero's rollback reason, when the initial binding evaluation
+    /// failed (post-closure correction 0002): the machine still works,
+    /// but the reload acceptance policy reads this to refuse publishing
+    /// a candidate whose first evaluation never committed.
+    initial_failure: Option<String>,
     /// Bounded turn diagnostics, newest last.
     diagnostics: Vec<String>,
 }
@@ -193,20 +198,27 @@ impl ReactiveMachine {
             poisoned_bindings: std::collections::HashMap::new(),
             poisoned_handlers: std::collections::HashMap::new(),
             initializer_failures: 0,
+            initial_failure: None,
             diagnostics: Vec::new(),
         };
         machine.compile_units(plan);
         machine.run_initializers(plan);
         // Turn zero: evaluate the bindings once against the initial
         // state, commit it, and hand the host the initial mutations so
-        // the first render shows initial values.
+        // the first render shows initial values. A rollback is NOT an
+        // "empty mutations" success — the reason is retained for the
+        // reload acceptance policy (post-closure correction 0002).
         let initial = match machine.prepare_inner(None, &[], None, true) {
             TurnOutcome::Prepared(pending) => {
                 let mutations = pending.mutations.clone();
                 machine.commit(pending);
                 mutations
             }
-            _ => Vec::new(),
+            TurnOutcome::RolledBack(reason) => {
+                machine.initial_failure = Some(reason);
+                Vec::new()
+            }
+            TurnOutcome::NoChange => Vec::new(),
         };
         Ok((machine, initial))
     }
@@ -233,6 +245,15 @@ impl ReactiveMachine {
     /// candidate as unpublishable.
     pub fn initializer_failures(&self) -> u32 {
         self.initializer_failures
+    }
+
+    /// Why turn zero — the initial binding evaluation at construction —
+    /// rolled back, if it did. The machine remains usable (later turns
+    /// may commit), but M6b reload acceptance reads this to refuse
+    /// publishing a candidate whose first evaluation never committed
+    /// (post-closure correction 0002).
+    pub fn initial_turn_failure(&self) -> Option<&str> {
+        self.initial_failure.as_deref()
     }
 
     /// How many executable units (bindings/handlers) failed to compile

@@ -163,3 +163,17 @@ synchronous implementation choice, not a shape requirement. Its rules:
   continuity.
 * Filesystem notification, debounce, coalescing, and rename detection
   are M6c; M6b's API is the primitive they will drive.
+
+## Amendment (post-closure correction 0002, 2026-10-07)
+
+The acceptance table (§5) gains one row: **turn zero — the initial
+binding evaluation — rolls back → Reject**, at the existing
+reactive-initialization stage. A rolled-back initial evaluation is not
+a valid "no mutations" publication: until this amendment it published
+candidates whose bindings never committed (a binding referencing an
+undefined identifier, or one whose output exceeded the byte budget),
+silently replacing a working application. First loads are unchanged —
+they render with diagnostics as before; only reload acceptance
+tightens. Pinned by `m6b_initial_binding_failure_blocks_reload`
+(`crates/velqu-view/src/lib.rs`); evidence:
+[`../evidence/post-closure-reactive-hardening.md`](../evidence/post-closure-reactive-hardening.md).

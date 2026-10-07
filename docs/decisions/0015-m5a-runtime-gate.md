@@ -148,3 +148,28 @@ asserted via capture, not a job exception. The source-size budget
 consequently governs the only code that can ever run: sources the
 host submits directly.
 
+## Amendment (post-closure correction 0002, 2026-10-07)
+
+Three boundary gaps found by whole-system review, all closed with
+pinned regressions (evidence:
+[`../evidence/post-closure-reactive-hardening.md`](../evidence/post-closure-reactive-hardening.md)):
+
+* **The constructor refusal covers all four function families.**
+  Async, generator, and async-generator instances carry their *own*
+  prototype objects (`AsyncFunction.prototype` et al.), each with a
+  live `constructor`; patching `Function.prototype` alone left three
+  compilers reachable (`(async function(){}).constructor('…')`
+  compiled). The prelude now patches every family prototype, and the
+  battery pins all three paths.
+* **The native `Date` constructor is severed, not just shadowed.**
+  Subclassing left it reachable through `LogicalDate`'s [[Prototype]]
+  — `Object.getPrototypeOf(Date).now()` read the host wall clock. The
+  shim now re-parents the subclass onto the function prototype,
+  re-points the inherited `Date.prototype.constructor` at the shim,
+  and copies the pure statics (`parse`, `UTC`) across the sever; the
+  battery walks every remaining handle.
+* **The diagnostic sink's byte cap is char-boundary safe.** The old
+  `String::truncate` panicked when the cap landed inside a multi-byte
+  code point — a host crash from ordinary non-ASCII logging, violating
+  §6's "never fatal to the host".
+

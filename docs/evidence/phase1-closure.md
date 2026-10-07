@@ -201,3 +201,11 @@ Corrections land as separate linked entries:
   single-save/no-input regression that fails on `1d0a562` and passes
   on the repair. Until that repair, the dev loop described in the M6c
   evidence carried this hidden qualification.
+- **[Post-closure correction 0002 — reactive profile hardening and
+  initial-turn reload acceptance](post-closure-reactive-hardening.md)**
+  (2026-10-07): a host-panicking multi-byte log cap, a reload
+  acceptance gap that published turn-zero rollbacks, and two ADR 0015
+  profile-boundary gaps (async/generator constructor families; the
+  native `Date` constructor reachable through the shim's prototype
+  chain) — found by whole-system review against locked dependencies,
+  repaired with focused regressions; no frozen digest moved.

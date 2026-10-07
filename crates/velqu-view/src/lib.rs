@@ -2828,6 +2828,16 @@ impl VelquView {
                         format!("{poisoned} executable unit(s) failed to compile"),
                     ));
                 }
+                // Turn zero must actually commit: a rolled-back initial
+                // evaluation is not a valid "no mutations" publication
+                // (post-closure correction 0002).
+                if let Some(reason) = machine.initial_turn_failure() {
+                    return Err(self.reject_reload(
+                        ReloadKind::FullDocument,
+                        ReloadStage::ReactiveInitialization,
+                        format!("the initial binding evaluation failed: {reason}"),
+                    ));
+                }
             } else if let Some(setup) = &candidate.reactive_setup_diagnostic {
                 return Err(self.reject_reload(
                     ReloadKind::FullDocument,
@@ -7970,6 +7980,51 @@ mod tests {
             .unwrap_err();
         assert_eq!(rejection.stage, ReloadStage::Source);
         // The old document still works after all three rejections.
+        click_inc(&mut view, vp);
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("count")),
+            Some(velqu_reactive::ReactiveValue::Number(1.0))
+        );
+    }
+
+    /// Post-closure correction 0002: turn zero must actually commit for
+    /// a candidate to publish. A binding that throws at the initial
+    /// evaluation, or one whose output exceeds the budget, is not a
+    /// valid "no mutations" publication — the candidate is rejected at
+    /// the reactive stage and the active document keeps working.
+    #[test]
+    fn m6b_initial_binding_failure_blocks_reload() {
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let mut view = inspected_counter_view();
+        view.render(vp).unwrap();
+        pump_drained(&mut view);
+        view.render(vp).unwrap();
+        let generation = view.inspector_snapshot(vp, None).generation;
+
+        // Compiles clean, but the binding throws at turn zero.
+        let throwing = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ n: 0 }\">\
+             <p vx-text=\"missingIdentifier\">x</p>\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_document(DocumentSource::new("document", throwing), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::ReactiveInitialization);
+
+        // Compiles clean; turn zero trips the output budget.
+        let oversized = "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ n: 0 }\">\
+             <p :class=\"'x'.repeat(70000)\">x</p>\
+             </div>\
+             </body></html>";
+        let rejection = view
+            .reload_document(DocumentSource::new("document", oversized), vp)
+            .unwrap_err();
+        assert_eq!(rejection.stage, ReloadStage::ReactiveInitialization);
+
+        // The active document is unchanged and still interactive.
+        assert_eq!(view.inspector_snapshot(vp, None).generation, generation);
         click_inc(&mut view, vp);
         assert_eq!(
             view.reactive_state().map(|s| s.get_path("count")),

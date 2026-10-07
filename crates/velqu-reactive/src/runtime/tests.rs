@@ -240,6 +240,68 @@ fn output_lines_are_length_capped() {
 }
 
 #[test]
+fn unicode_logging_is_capped_on_char_boundaries() {
+    // Post-closure correction 0002: the byte cap can land inside a
+    // multi-byte character, where plain `String::truncate` panics. The
+    // sink must walk back to a boundary instead.
+    let rt = runtime();
+    // 8192 % 3 == 2: the cap lands mid-'€' (3 bytes/code point).
+    rt.evaluate("console.log('€'.repeat(4096))")
+        .expect("3-byte boundary is safe");
+    assert!(rt.diagnostics()[0].len() <= test_limits().max_output_string_bytes + 3);
+    // An odd cap lands mid-'😀' (4 bytes/code point).
+    let mut limits = test_limits();
+    limits.max_output_string_bytes = 8191;
+    let rt = ReactiveRuntime::new(1, limits).unwrap();
+    rt.evaluate("console.log('😀'.repeat(4096))")
+        .expect("4-byte boundary is safe");
+    assert!(rt.diagnostics()[0].len() <= 8191 + 3);
+}
+
+#[test]
+fn the_native_clock_is_unreachable_from_the_profile() {
+    // Post-closure correction 0002: the Date shim used to leak the
+    // native constructor through the subclass's [[Prototype]]
+    // (`Object.getPrototypeOf(Date).now()` read the wall clock) and
+    // through the inherited `Date.prototype.constructor`.
+    let rt = runtime();
+    rt.evaluate(
+        r#"
+        const logical = Date.now();
+        // The subclass's [[Prototype]] is severed onto the (deleted)
+        // Function prototype: a plain non-constructable function object
+        // whose `.constructor` is the codegen-refusing stub — no `now`,
+        // no native Date.
+        const proto = Object.getPrototypeOf(Date);
+        if (typeof proto !== "function") {
+            throw new Error("subclass prototype not severed: " + proto);
+        }
+        if (proto.now !== undefined) { throw new Error("native static now is reachable"); }
+        let leaked = false;
+        try { leaked = new proto().getTime() > 0; }
+        catch (error) { /* not constructable once severed */ }
+        if (leaked) { throw new Error("native constructor is reachable"); }
+        let refused = false;
+        try { proto.constructor("return 42"); }
+        catch (error) { refused = true; }
+        if (!refused) { throw new Error("the severed proto still reaches a compiler"); }
+        // Every remaining constructor handle resolves to the shim.
+        for (const ctor of [
+            Date.prototype.constructor,
+            Object.getPrototypeOf(Date.prototype).constructor,
+        ]) {
+            if (ctor !== Date) { throw new Error("handle escaped the shim: " + ctor); }
+        }
+        if (Date.now() !== logical) { throw new Error("logical clock moved without a tick"); }
+        // The pure statics survive severing.
+        if (Date.UTC(2000, 0, 1) !== 946684800000) { throw new Error("UTC lost"); }
+        "#,
+    )
+    .expect("the native wall clock stays unreachable");
+    assert!(rt.diagnostics().is_empty());
+}
+
+#[test]
 fn dynamic_code_generation_is_refused_at_every_handle() {
     // The Eval intrinsic must stay (the host's own evaluation rides the
     // same engine hook), so every script-reachable compiler handle is
@@ -251,9 +313,15 @@ fn dynamic_code_generation_is_refused_at_every_handle() {
         "const q = 5; eval('q')",
         // The Function global is deleted...
         "new Function('return 1')",
-        // ...and every f.constructor path hits the refusing stub.
+        // ...and every f.constructor path hits the refusing stub —
+        // including the async/generator families, which carry their
+        // own prototype objects and constructors (correction 0002).
         "(function () {}).constructor('return 1')",
         "class C {} C.constructor('return 1')",
+        "(async function () {}).constructor('return 42')",
+        "(async () => {}).constructor('return 42')",
+        "(function* () {}).constructor('yield 42')",
+        "(async function* () {}).constructor('yield 42')",
     ] {
         let failure = rt.evaluate(source).expect_err("dynamic codegen refused");
         assert!(
