@@ -17,7 +17,7 @@ this file maps it onto what exists in the repository today.
     │            │                │
  document/    interaction     reactive layer
  styling      (Rust hot path)  (M5: isolated UI QuickJS,
- (M2)                          expressions + state only)
+ (M2–M3)                      expressions + state only)
     │            │                │
     └────────────┼────────────────┘
                  ▼
@@ -33,21 +33,27 @@ this file maps it onto what exists in the repository today.
 
 | Crate | Owns | Does not own |
 |---|---|---|
-| `velqu-view` | public renderer API, scene model, M1 CPU painter, bundled fonts, `Frame`/capture, source identity, viewport validation, asset-resolution seam | windows, events, HTML semantics (M2), any I/O |
-| `velqu-shell` | native window, event loop, DPI/resize, frame presentation | rendering decisions, document state |
-| `velqu-reactive` | frozen vx-* syntax surface, static validation | any runtime (M5) |
-| `velqu-tailwind` | CSS Profile v0 manifest, concept-level classification (declaration/at-rule, three tiers) | CSS parsing/engine work (M3) |
-| `velqu-lab` (app) | loading local app dirs (with source identity + directory asset resolver), window preview, headless fixture capture | — |
+| `velqu-view` | public renderer API, scene model, CPU painter, bundled fonts, `Frame`/capture, source identity, viewport validation, asset-resolution seam, input/interaction state, editable controls, transactional reload, inspector trace | windows, events, any I/O |
+| `velqu-shell` | native window, event loop, DPI/resize, frame presentation, IME/clipboard wiring | rendering decisions, document state |
+| `velqu-reactive` | vx-* syntax surface, plan compiler, isolated QuickJS runtime + reactive turn machine (budgeted, deterministic, plain-data state) | renderer mechanics, DOM access, script-side I/O |
+| `velqu-tailwind` | Tailwind utility compilation to the Velqu CSS Profile (v0), classification, palette, profile checker | CSS parsing/engine work |
+| `velqu-lab` (app) | loading local app dirs (with source identity + directory asset resolver), window preview, headless fixture capture, inspector print, `--watch` hot reload (coordinator + watcher + deadline scheduler) | — |
 
 Dependency direction: `velqu-lab → velqu-shell → velqu-view`.
 `velqu-reactive` and `velqu-tailwind` are leaves; nothing depends on
-windowing or GPU crates except `velqu-shell`.
+windowing or GPU crates except `velqu-shell`. Phase 1 (M1–M7) is
+closed; see [`docs/evidence/phase1-closure.md`](evidence/phase1-closure.md)
+and its linked post-closure corrections.
 
-## Render pipeline (M2a)
+## Render pipeline
 
 ```
 DocumentSource / StylesheetSource          sources carry identity (SourceId);
                                            stylesheets upsert by id (ADR 0004)
+        ↓
+velqu-tailwind (opt-in)                    Tailwind utilities compile to CSS
+                                           under the v0 profile; diagnostics,
+                                           never silent drops (ADR 0009)
         ↓
 html5ever → dom::Dom                       spec-correct tokenization/tree building
                                            lowered into the small Velqu tree;
@@ -60,9 +66,11 @@ cssparser → css::Stylesheet                rules, selectors + specificity,
 style::Cascade                             UA defaults → author sheets → inline;
                                            inheritance; per-property diagnostics
         ↓
-layout.rs                                  box tree → block flow → wrapped lines;
-                                           LayoutFacts v1 (data-vv-test keyed) and
-                                           a DisplayList (fills + text runs)
+layout.rs / taffy_backend.rs               box tree → Taffy whole-tree layout
+                                           (block/flex/grid profiles, ADR 0007/
+                                           0008) → display-list clipping and
+                                           overflow; LayoutFacts (data-vv-test
+                                           keyed)
         ↓
 painter.rs                                 rasterizes the display list — no layout
                                            decisions; fallible, pixel-bounded alloc
@@ -86,21 +94,35 @@ display server (`docs/decisions/0002-offscreen-determinism.md`).
 
 ## Renderer strategy
 
-Phase A (done): proved the pipeline with minimal, replaceable pieces —
-winit + softbuffer + fontdue — behind the Velqu-owned API
+Phase A (done, M1): proved the pipeline with minimal, replaceable
+pieces — winit + softbuffer + fontdue — behind the Velqu-owned API
 (`docs/decisions/0001-m1-paint-backend.md`).
 
-Phase B (M2a done, M2b/M2c next): HTML parsing (html5ever), CSS syntax
-(cssparser), cascade, and **block layout** now run behind the same API
-(ADR 0005/0006). Flex and grid are the next layout milestones; **Taffy is
-the adopted candidate** (its 0.14 line implements block/flex/grid and its
-MSRV fits the 1.87 floor — verified). Text shaping (Parley candidate) is
-deferred; the current deterministic Latin subset is documented in
-ADR 0006. None of the engine types may appear in the public API
-(`docs/decisions/0003-api-boundary.md`).
+Phase B (done, M2–M7 / Phase 1 closed): HTML parsing (html5ever), CSS
+syntax (cssparser), cascade, **Taffy whole-tree layout** (block, flex,
+and grid profiles behind a private backend — ADR 0007/0008), the
+Tailwind utility pipeline (ADR 0009), the input/interaction stack
+(ADR 0010–0014), Velqu Reactive (ADR 0015–0018), and the Lab dev loop
+(inspector, transactional reload, file watching — ADR 0019–0022). Text
+shaping remains the deterministic Latin subset documented in ADR 0006;
+none of the engine types appear in the public API
+(`docs/decisions/0003-api-boundary.md`). Deferred boundaries (variants,
+dynamic lists, IME live-platform validation, and the recorded layout
+deviations) are scoped in the Phase-1 closure record, not reopened
+here.
 
-Phase C (M9/M10): comparative benchmark against matched Electron and
-Tauri/system-webview apps; GO/NO-GO on Velqu Desktop.
+Phase C (M9/M10, not started): comparative benchmark against matched
+Electron and Tauri/system-webview apps; GO/NO-GO on Velqu Desktop.
+
+## Development loop (M6)
+
+`velqu-lab` adds the developer surfaces on top of the same public API:
+an inspector that records outcomes (events, reactive turns,
+invalidation causes, render passes — never rerunning work, ADR 0020),
+transactional reload for both full documents and stylesheets (ADR 0021),
+and host-side file watching (`--watch`, native or polling) reconciled
+through the reload APIs (ADR 0022). A reload either publishes a fully
+prepared replacement or leaves the running application untouched.
 
 ## Runtime boundaries
 
