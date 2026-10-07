@@ -115,8 +115,14 @@ impl EditorState {
 
     /// Replaces the whole value (a reactive `SetControlValue`
     /// mutation, M5c): silent — no events, selection clamped into the
-    /// new value.
+    /// new value. An equal value is a complete no-op (post-closure
+    /// correction 0003): re-normalizing the selection of a value that
+    /// did not change can only disturb a live editor whose caret was
+    /// ahead of a stale snapshot.
     pub(crate) fn set_value(&mut self, value: &str) {
+        if self.value == value {
+            return;
+        }
         self.value = value.to_owned();
         self.anchor = self.anchor.min(self.value.len());
         self.focus = self.focus.min(self.value.len());

@@ -2558,14 +2558,50 @@ impl VelquView {
                 TurnFlow::Prepared(pending) => {
                     let started = std::time::Instant::now();
                     let revision_before = self.state_revision;
-                    let attempted = pending.mutations.len();
-                    let kinds: Vec<&'static str> = pending
+                    // Echo screening (post-closure correction 0003): a
+                    // `ValueChanged` turn's own value may come straight back
+                    // as a `SetControlValue` on the same control when the
+                    // model round-trips the event's snapshot. Re-applying it
+                    // can only rewind a live editor — with several edits
+                    // drained into one batch, each earlier snapshot clamped
+                    // the caret down and the control ended with the caret
+                    // left of the value, corrupting subsequent typing.
+                    // The editor's live value is the newest truth for user
+                    // input; the model still converges through the ordered
+                    // model writes. A binding output that DIFFERS from the
+                    // event's value (a handler changed the model) is a real
+                    // programmatic update and still applies.
+                    let echo_origin = match event {
+                        Event::ValueChanged { target, value } => self
+                            .resolve_handle(target.handle)
+                            .map(|node| (node, value.clone())),
+                        _ => None,
+                    };
+                    let mutations: Vec<velqu_reactive::Mutation> = pending
                         .mutations
+                        .iter()
+                        .filter(|mutation| {
+                            let Some((origin, event_value)) = &echo_origin else {
+                                return true;
+                            };
+                            let Some(binding) = plan.bindings.get(mutation.binding) else {
+                                return true;
+                            };
+                            !(binding.node == *origin
+                                && matches!(
+                                    &mutation.kind,
+                                    MutationKind::SetControlValue(value) if value == event_value
+                                ))
+                        })
+                        .cloned()
+                        .collect();
+                    let attempted = mutations.len();
+                    let kinds: Vec<&'static str> = mutations
                         .iter()
                         .map(|mutation| mutation_kind_label(&mutation.kind))
                         .collect();
                     if let Some(machine) = machine_slot.as_mut() {
-                        if !self.mutations_valid(plan, &pending.mutations) {
+                        if !self.mutations_valid(plan, &mutations) {
                             machine.record_host_diagnostic(
                                 "mutation batch rejected: a target failed validation",
                             );
@@ -2581,7 +2617,6 @@ impl VelquView {
                             );
                             continue;
                         }
-                        let mutations = pending.mutations.clone();
                         machine.commit(pending);
                         self.apply_mutations(plan, &mutations);
                         self.state_revision += 1;
@@ -6427,6 +6462,135 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::ValueChanged { .. })),
             "no feedback loop: {events:?}"
+        );
+    }
+
+    /// Post-closure correction 0003: several `ValueChanged` edits drained
+    /// into one pump batch used to corrupt the control — each turn's echo
+    /// `SetControlValue` re-applied the event's own snapshot, and
+    /// `set_value`'s downward caret clamp left the caret left of the
+    /// value, so later characters inserted one position early
+    /// ("Correction Candidate" became "Crrection Candidateo"). Echo
+    /// write-backs are now skipped; the editor's live value leads and the
+    /// model still converges through the ordered model writes.
+    #[test]
+    fn m5c_batched_value_changed_turns_keep_value_and_caret_exact() {
+        let text = "Correction Candidate";
+        for group in [2usize, 4, 8, 64] {
+            let mut view = VelquView::new();
+            view.enable_reactive();
+            view.load_html(
+                "<!doctype html><html><body style=\"margin: 0\">\
+                 <div vx-state=\"{ name: '' }\">\
+                 <input id=box vx-model=\"name\" value=\"\">\
+                 </div>\
+                 </body></html>",
+            )
+            .unwrap();
+            let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+            view.render(vp).unwrap();
+            view.pump_reactive(&[]);
+            view.set_focus(Some("box"));
+            let _ = view.take_events();
+            let mut pending = Vec::new();
+            for ch in text.chars() {
+                assert!(view.insert_text(ch.to_string().as_str()));
+                pending.extend(view.take_events());
+                if pending.len() >= group {
+                    view.pump_reactive(&pending);
+                    pending.clear();
+                }
+            }
+            view.pump_reactive(&pending);
+            let handle = view.node_target(view.element_node("box").unwrap()).handle;
+            assert_eq!(view.control_value(handle), Some(text), "group {group}");
+            assert_eq!(
+                view.reactive_state().map(|s| s.get_path("name")),
+                Some(velqu_reactive::ReactiveValue::String(text.into())),
+                "group {group}: the model converged"
+            );
+            let facts = view.control_facts(vp).unwrap();
+            let fact = facts
+                .controls
+                .iter()
+                .find(|fact| fact.target.id.as_deref() == Some("box"))
+                .unwrap();
+            assert_eq!(
+                fact.selection_focus,
+                text.len(),
+                "group {group}: the caret stayed at the end"
+            );
+        }
+    }
+
+    /// The stale-batch half of correction 0003: pumping an echo batch must
+    /// never rewind a control the user has typed past, while a binding
+    /// output that differs from the event's value (a handler changed the
+    /// model) is a real programmatic update and still applies.
+    #[test]
+    fn m5c_model_echo_write_backs_never_rewind_a_live_editor() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: '' }\">\
+             <input id=box vx-model=\"name\" value=\"\">\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+
+        for ch in "abcd".chars() {
+            assert!(view.insert_text(ch.to_string().as_str()));
+        }
+        let stale = view.take_events();
+        for ch in "efg".chars() {
+            assert!(view.insert_text(ch.to_string().as_str()));
+        }
+        let fresh = view.take_events();
+        view.pump_reactive(&stale);
+        let handle = view.node_target(view.element_node("box").unwrap()).handle;
+        assert_eq!(
+            view.control_value(handle),
+            Some("abcdefg"),
+            "a stale echo batch must not disturb the live editor"
+        );
+        view.pump_reactive(&fresh);
+        assert_eq!(view.control_value(handle), Some("abcdefg"));
+        assert_eq!(
+            view.reactive_state().map(|s| s.get_path("name")),
+            Some(velqu_reactive::ReactiveValue::String("abcdefg".into()))
+        );
+
+        // A handler that changes the model produces a non-echo output;
+        // that write-back still reaches the control.
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div vx-state=\"{ name: '' }\">\
+             <input id=box vx-model=\"name\" @input=\"name = 'fixed'\" value=\"\">\
+             </div>\
+             </body></html>",
+        )
+        .unwrap();
+        view.render(vp).unwrap();
+        view.pump_reactive(&[]);
+        view.set_focus(Some("box"));
+        let _ = view.take_events();
+        assert!(view.insert_text("a"));
+        let events = view.take_events();
+        view.pump_reactive(&events);
+        let handle = view.node_target(view.element_node("box").unwrap()).handle;
+        assert_eq!(
+            view.control_value(handle),
+            Some("fixed"),
+            "a handler-driven model change still writes the control"
         );
     }
 

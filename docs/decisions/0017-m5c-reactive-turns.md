@@ -124,3 +124,21 @@ byte-identically with or without reactive enabled.
 * One scope namespace in v0 means two sibling scopes writing the same
   key merge last-writer-wins; the deferred lexical-showering semantics
   have their plan-side foundation (scope parentage) already in place.
+
+## Amendment (post-closure correction 0003, 2026-10-07)
+
+**A `ValueChanged` turn must not write its own value back to the
+control it came from.** The model round-trip can return the event's
+snapshot as a `SetControlValue` on the origin control — an *echo*.
+Applying echoes was harmless one-event-per-batch, but with several
+edits drained into one pumped batch each echo clamped the editor's
+caret down to a stale snapshot's length and the control corrupted
+deterministically ("Correction Candidate" → "Crrection Candidatee";
+found via the pilot's simulated acceptance, isolated headlessly
+through the public API). The pump now screens echoes (drop
+`SetControlValue` on the origin control when the value equals the
+event's value); a differing output — a handler-changed model — still
+applies, and `Editor::set_value` is an equal-value no-op. The
+editor's live value is the newest truth for user input; the model
+converges through the ordered model writes. Evidence:
+[`../evidence/post-closure-batched-model-echo.md`](../evidence/post-closure-batched-model-echo.md).

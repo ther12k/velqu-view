@@ -209,3 +209,11 @@ Corrections land as separate linked entries:
   native `Date` constructor reachable through the shim's prototype
   chain) — found by whole-system review against locked dependencies,
   repaired with focused regressions; no frozen digest moved.
+- **[Post-closure correction 0003 — batched model echo
+  write-backs](post-closure-batched-model-echo.md)** (2026-10-07):
+  two or more `ValueChanged` edits in one pumped batch corrupted the
+  control (echo `SetControlValue` snapshots clamped the caret left of
+  the live value); found via the pilot's simulated acceptance and
+  isolated headlessly through the public API, repaired by echo
+  screening + an equal-value `set_value` no-op; ADR 0017 amended; no
+  frozen digest moved.
