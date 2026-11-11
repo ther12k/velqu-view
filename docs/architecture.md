@@ -34,10 +34,10 @@ this file maps it onto what exists in the repository today.
 | Crate | Owns | Does not own |
 |---|---|---|
 | `velqu-view` | public renderer API, scene model, CPU painter, bundled fonts, `Frame`/capture, source identity, viewport validation, asset-resolution seam, input/interaction state, editable controls, transactional reload, inspector trace | windows, events, any I/O |
-| `velqu-shell` | native window, event loop, DPI/resize, frame presentation, IME/clipboard wiring | rendering decisions, document state |
-| `velqu-reactive` | vx-* syntax surface, plan compiler, isolated QuickJS runtime + reactive turn machine (budgeted, deterministic, plain-data state) | renderer mechanics, DOM access, script-side I/O |
+| `velqu-shell` | native window, event loop, DPI/resize, frame presentation, IME/clipboard wiring, the animation frame pump (ADR 0024) | rendering decisions, document state |
+| `velqu-reactive` | vx-* syntax surface (incl. `vx-transition` phases, ADR 0024), plan compiler, isolated QuickJS runtime + reactive turn machine (budgeted, deterministic, plain-data state) | renderer mechanics, DOM access, script-side I/O |
 | `velqu-tailwind` | Tailwind utility compilation to the Velqu CSS Profile (v0), classification, palette, profile checker | CSS parsing/engine work |
-| `velqu-lab` (app) | loading local app dirs (with source identity + directory asset resolver), window preview, headless fixture capture, inspector print, `--watch` hot reload (coordinator + watcher + deadline scheduler) | — |
+| `velqu-lab` (app) | loading local app dirs (with source identity + directory asset resolver), window preview, headless fixture capture, stepped animation capture (`--step-ms`, ADR 0024), inspector print, `--watch` hot reload (coordinator + watcher + deadline scheduler) | — |
 
 Dependency direction: `velqu-lab → velqu-shell → velqu-view`.
 `velqu-reactive` and `velqu-tailwind` are leaves; nothing depends on
@@ -66,6 +66,10 @@ cssparser → css::Stylesheet                rules, selectors + specificity,
 style::Cascade                             UA defaults → author sheets → inline;
                                            inheritance; per-property diagnostics
         ↓
+anim.rs (transition engine, ADR 0024)      in-flight animation overrides applied
+                                           over the cascade output; virtual clock
+                                           (hosts tick it, never wall time)
+        ↓
 layout.rs / taffy_backend.rs               box tree → Taffy whole-tree layout
                                            (block/flex/grid profiles, ADR 0007/
                                            0008) → display-list clipping and
@@ -73,11 +77,14 @@ layout.rs / taffy_backend.rs               box tree → Taffy whole-tree layout
                                            keyed)
         ↓
 painter.rs                                 rasterizes the display list — no layout
-                                           decisions; fallible, pixel-bounded alloc
+                                           decisions; fallible, pixel-bounded alloc;
+                                           opacity scopes + 2D affines (ADR 0024)
         ↓
 Frame                                       pixels + sha256 + PNG encode
         ↓
-velqu-shell                                 winit window; softbuffer blit
+velqu-shell                                 winit window; softbuffer blit; the
+                                           animation frame pump (~60 FPS
+                                           WaitUntil while animating, Wait idle)
 ```
 
 Identity is separated per stage (ADR 0005): DOM `NodeId`s never reach
@@ -106,7 +113,15 @@ Tailwind utility pipeline (ADR 0009), the input/interaction stack
 (inspector, transactional reload, file watching — ADR 0019–0022). Text
 shaping remains the deterministic Latin subset documented in ADR 0006;
 none of the engine types appear in the public API
-(`docs/decisions/0003-api-boundary.md`). Deferred boundaries (variants,
+(`docs/decisions/0003-api-boundary.md`).
+
+Phase C (M8, ADR 0024): the transition engine — Tailwind
+`transition-*`/`duration-*`/`ease-*`/`delay-*` plus `opacity-*`/
+`scale-*`/`translate-*` utilities, paint-time opacity and 2D transforms
+in the painter, cascade overrides driven by a virtual clock (bit-
+identical stepped frames in CI via `--step-ms`), dual-tier invalidation
+(paint properties: zero Taffy passes; width/height: one per frame), and
+Alpine-style `vx-transition` enter/leave phases over `vx-show`. Deferred boundaries (variants,
 dynamic lists, IME live-platform validation, and the recorded layout
 deviations) are scoped in the Phase-1 closure record, not reopened
 here.

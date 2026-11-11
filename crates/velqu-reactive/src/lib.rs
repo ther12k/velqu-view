@@ -52,7 +52,7 @@ pub use machine::{
 };
 pub use plan::{
     Binding, BindingKind, EventBinding, ReactiveDiagnostic, ReactiveDocument, ReactiveDom,
-    ScopePlan, SourceSpan, compile,
+    ScopePlan, SourceSpan, TransitionPlan, compile,
 };
 pub use runtime::{InvalidJsLimits, JsFailure, JsLimits, LOGICAL_EPOCH_MS, ReactiveRuntime};
 pub use state::{MAX_STATE_DEPTH, ReactiveValue, StateError};
@@ -67,6 +67,7 @@ pub const DIRECTIVES: &[&str] = &[
     "vx-for",
     "vx-key",
     "vx-model",
+    "vx-transition",
 ];
 
 /// v0 event names usable in `@<name>` handlers.
@@ -97,6 +98,10 @@ pub enum Directive {
     Key,
     /// `vx-model` — two-way form control binding.
     Model,
+    /// `vx-transition` — Alpine-style enter/leave phases for `vx-show`
+    /// (ADR 0024). The phase attributes (`vx-transition:enter`, …) carry
+    /// static utility-class strings; the bare form uses engine defaults.
+    Transition,
 }
 
 impl Directive {
@@ -111,6 +116,7 @@ impl Directive {
             Directive::For => "vx-for",
             Directive::Key => "vx-key",
             Directive::Model => "vx-model",
+            Directive::Transition => "vx-transition",
         }
     }
 }
@@ -185,11 +191,46 @@ pub fn parse_directive(attribute: &str) -> Result<Directive, ReactiveSyntaxError
         "vx-for" => Directive::For,
         "vx-key" => Directive::Key,
         "vx-model" => Directive::Model,
+        "vx-transition" => Directive::Transition,
         other => {
             return Err(ReactiveSyntaxError::UnknownDirective(other.to_owned()));
         }
     };
     Ok(directive)
+}
+
+/// The valid `vx-transition:<phase>` suffixes (ADR 0024; Alpine's names).
+pub const TRANSITION_PHASES: &[&str] = &[
+    "enter",
+    "enter-start",
+    "enter-end",
+    "leave",
+    "leave-start",
+    "leave-end",
+];
+
+/// Parses the phase suffix of a `vx-transition…` attribute name. `None`
+/// (bare `vx-transition`) is valid and selects the engine defaults.
+///
+/// ```
+/// use velqu_reactive::parse_transition_phase;
+/// assert_eq!(parse_transition_phase("vx-transition"), Ok(None));
+/// assert_eq!(parse_transition_phase("vx-transition:enter-start"), Ok(Some("enter-start")));
+/// assert!(parse_transition_phase("vx-transition:wiggle").is_err());
+/// ```
+pub fn parse_transition_phase(
+    attribute: &str,
+) -> Result<Option<&'static str>, ReactiveSyntaxError> {
+    let Some(phase) = attribute
+        .strip_prefix("vx-transition")
+        .and_then(|rest| rest.strip_prefix(':'))
+    else {
+        return Ok(None);
+    };
+    match TRANSITION_PHASES.iter().find(|known| **known == phase) {
+        Some(known) => Ok(Some(known)),
+        None => Err(ReactiveSyntaxError::UnknownDirective(attribute.to_owned())),
+    }
 }
 
 /// Parses the name part of an event handler attribute (what follows `@`).
@@ -242,6 +283,7 @@ mod tests {
     #[test]
     fn name_sets_are_frozen() {
         // Exact-match assertions keep the v0 surface from drifting silently.
+        // `vx-transition` joined the frozen set with ADR 0024.
         assert_eq!(
             DIRECTIVES,
             &[
@@ -252,7 +294,8 @@ mod tests {
                 "vx-if",
                 "vx-for",
                 "vx-key",
-                "vx-model"
+                "vx-model",
+                "vx-transition"
             ]
         );
         assert_eq!(

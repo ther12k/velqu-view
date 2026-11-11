@@ -292,3 +292,85 @@ fn compilation_is_deterministic() {
     assert_eq!(a.events.len(), 2); // click.prevent, input
     assert!(a.diagnostics.is_empty(), "{:#?}", a.diagnostics);
 }
+
+#[test]
+fn transition_phases_compile_into_one_entry_per_node() {
+    let mut dom = TestDom::new("div");
+    let scope = dom.add(0, "div");
+    dom.attr(scope, "vx-state", "{ open: false }");
+    let panel = dom.add(scope, "div");
+    dom.attr(panel, "vx-show", "open");
+    dom.attr(
+        panel,
+        "vx-transition:enter",
+        "transition duration-300 ease-out",
+    );
+    dom.attr(panel, "vx-transition:enter-start", "opacity-0 scale-95");
+    dom.attr(panel, "vx-transition:enter-end", "opacity-100 scale-100");
+    dom.attr(
+        panel,
+        "vx-transition:leave",
+        "transition duration-200 ease-in",
+    );
+    dom.attr(panel, "vx-transition:leave-end", "opacity-0 scale-95");
+    let plan = compile(&dom);
+    assert!(plan.diagnostics.is_empty(), "{:#?}", plan.diagnostics);
+    assert_eq!(plan.transitions.len(), 1);
+    let entry = &plan.transitions[0];
+    assert_eq!(entry.node, panel);
+    assert_eq!(entry.bare, None);
+    assert_eq!(
+        entry.enter.as_deref(),
+        Some("transition duration-300 ease-out")
+    );
+    assert_eq!(entry.enter_start.as_deref(), Some("opacity-0 scale-95"));
+    assert_eq!(entry.enter_end.as_deref(), Some("opacity-100 scale-100"));
+    assert_eq!(
+        entry.leave.as_deref(),
+        Some("transition duration-200 ease-in")
+    );
+    assert_eq!(entry.leave_start, None);
+    assert_eq!(entry.leave_end.as_deref(), Some("opacity-0 scale-95"));
+}
+
+#[test]
+fn bare_transition_and_unknown_phases() {
+    let mut dom = TestDom::new("div");
+    let scope = dom.add(0, "div");
+    dom.attr(scope, "vx-state", "{ open: true }");
+    let panel = dom.add(scope, "div");
+    dom.attr(panel, "vx-show", "open");
+    dom.attr(panel, "vx-transition", "transition-opacity duration-150");
+    dom.attr(panel, "vx-transition:wiggle", "transition");
+    let plan = compile(&dom);
+    assert_eq!(plan.transitions.len(), 1);
+    assert_eq!(
+        plan.transitions[0].bare.as_deref(),
+        Some("transition-opacity duration-150")
+    );
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|d| d.message.contains("unknown vx-transition phase")),
+        "{:#?}",
+        plan.diagnostics
+    );
+}
+
+#[test]
+fn transition_without_show_binding_diagnoses() {
+    let mut dom = TestDom::new("div");
+    let scope = dom.add(0, "div");
+    dom.attr(scope, "vx-state", "{ open: true }");
+    let panel = dom.add(scope, "div");
+    dom.attr(panel, "vx-text", "'hi'");
+    dom.attr(panel, "vx-transition:enter", "transition");
+    let plan = compile(&dom);
+    assert!(
+        plan.diagnostics
+            .iter()
+            .any(|d| d.message.contains("no vx-show binding")),
+        "{:#?}",
+        plan.diagnostics
+    );
+}

@@ -3,13 +3,14 @@
 //! (utilities → CSS → profile check → renderer), with no node toolchain and
 //! no network.
 //!
-//! v0 scope is exactly the renderer's M2c profile expressed as utilities:
+//! v0 scope is exactly the renderer's profile expressed as utilities:
 //! display/flex/grid layout, spacing, sizing, the v3 color palette,
-//! typography, borders/radius, and overflow. Everything else — variants
-//! (`hover:`), arbitrary values (`w-[91px]`), fractional classes
-//! (`w-1/2`), and utilities outside the renderer profile (`shadow`,
-//! `opacity-50`, positioning) — produces a deterministic diagnostic,
-//! never a silent drop.
+//! typography, borders/radius, overflow, opacity/scale/translate, and the
+//! transition families (`transition-*`, `duration-*`, `ease-*`, `delay-*`,
+//! ADR 0024). Everything else — variants (`hover:`), arbitrary values
+//! (`w-[91px]`), fractional classes (`w-1/2`), and utilities outside the
+//! renderer profile (`shadow`, positioning) — produces a deterministic
+//! diagnostic, never a silent drop.
 //!
 //! The output is plain CSS: one rule per class, in first-use order, so the
 //! renderer's normal cascade applies (class specificity beats element
@@ -132,6 +133,18 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
     if class.contains('!') {
         return Err("the !important modifier is not part of profile v0".into());
     }
+    // Negative utilities (ADR 0024): a leading dash is a sign, not part of
+    // the identifier. Only `translate-*` and `rotate-*` accept one in profile v0.
+    let (negative, class) = match class.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, class),
+    };
+    if negative && !class.starts_with("translate-") && !class.starts_with("rotate-") {
+        return Err(
+            "negative utilities are only supported for translate-* and rotate-* in profile v0"
+                .into(),
+        );
+    }
     if !is_plain_class(class) {
         return Err(format!(
             "class {class:?} needs CSS escaping (fractions, decimals, or \
@@ -164,6 +177,12 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
     }
     if let Some(rest) = class.strip_prefix("overflow-y-") {
         return overflow_axis("overflow-y", rest);
+    }
+    if let Some(rest) = class.strip_prefix("translate-x-") {
+        return translate_axis('x', rest, negative);
+    }
+    if let Some(rest) = class.strip_prefix("translate-y-") {
+        return translate_axis('y', rest, negative);
     }
 
     let (base, arg) = match class.split_once('-') {
@@ -371,6 +390,81 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             )),
         },
 
+        // -- opacity / transforms (ADR 0024) ----------------------------------
+        ("opacity", Some(step)) => match opacity_step(step) {
+            Some(value) => Ok(vec![("opacity", value)]),
+            None => Err(format!(
+                "unknown opacity step {step:?} (0/5/10/20/25/…/95/100 scale)"
+            )),
+        },
+        ("scale", Some(step)) => match scale_step(step) {
+            Some(value) => Ok(vec![("transform", format!("scale({value})"))]),
+            None => Err(format!(
+                "unknown scale step {step:?} (0/50/75/90/95/100/105/110/125/150)"
+            )),
+        },
+
+        // -- transitions (ADR 0024) --------------------------------------------
+        ("transition", None) => Ok(transition_declarations(
+            "color, background-color, border-color, opacity, transform",
+        )),
+        ("transition", Some("all")) => Ok(transition_declarations("all")),
+        ("transition", Some("colors")) => Ok(transition_declarations(
+            "color, background-color, border-color",
+        )),
+        ("transition", Some("opacity")) => Ok(transition_declarations("opacity")),
+        ("transition", Some("transform")) => Ok(transition_declarations("transform")),
+        ("transition", Some("none")) => Ok(vec![
+            ("transition-property", "none".into()),
+            ("transition-duration", "0s".into()),
+        ]),
+        ("transition", Some(other)) => Err(format!(
+            "unknown transition utility target {other:?} \
+             (all/colors/opacity/transform/none)"
+        )),
+        ("duration", Some(step)) => match time_step(step) {
+            Some(ms) => Ok(vec![("transition-duration", format!("{ms}ms"))]),
+            None => Err(format!(
+                "unknown duration {step:?} (75/100/150/200/300/500/700/1000 scale)"
+            )),
+        },
+        ("delay", Some(step)) => match time_step(step) {
+            Some(ms) => Ok(vec![("transition-delay", format!("{ms}ms"))]),
+            None => Err(format!(
+                "unknown delay {step:?} (75/100/150/200/300/500/700/1000 scale)"
+            )),
+        },
+        ("ease", Some(kind)) => match easing_value(kind) {
+            Some(value) => Ok(vec![("transition-timing-function", value.to_owned())]),
+            None => Err(format!(
+                "unknown easing {kind:?} (linear/in/out/in-out, Tailwind names)"
+            )),
+        },
+
+        // -- rotation & origin & animation (ADR 0024) --------------------------
+        ("rotate", Some(step)) => match rotate_step(step, negative) {
+            Some(value) => Ok(vec![("transform", format!("rotate({value})"))]),
+            None => Err(format!(
+                "unknown rotate step {step:?} (0/1/2/3/6/12/45/90/180 scale)"
+            )),
+        },
+        ("origin", Some(anchor)) => match origin_value(anchor) {
+            Some(value) => Ok(vec![("transform-origin", value.to_owned())]),
+            None => Err(format!("unknown origin utility {class:?}")),
+        },
+        ("animate", Some(name)) => match name {
+            "none" => Ok(vec![("animation", "none".into())]),
+            "spin" => Ok(vec![("animation", "spin 1s linear infinite".into())]),
+            "pulse" => Ok(vec![(
+                "animation",
+                "pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite".into(),
+            )]),
+            "bounce" => Ok(vec![("animation", "bounce 1s infinite".into())]),
+            _ => Err(format!(
+                "unknown animation utility {class:?} (spin/pulse/bounce/none)"
+            )),
+        },
+
         // -- deliberately unsupported but common -----------------------------------
         ("absolute" | "fixed" | "sticky" | "static" | "relative", _)
         | ("inset", _)
@@ -380,19 +474,19 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         | ("left", _) => {
             Err("positioning is outside the renderer profile v0 (layout is flow/flex/grid)".into())
         }
-        ("shadow" | "opacity" | "cursor" | "z" | "transition" | "ring" | "blur", _)
+        ("shadow" | "cursor" | "z" | "ring" | "blur", _)
         | (
             "container" | "truncate" | "underline" | "italic" | "uppercase" | "lowercase"
             | "capitalize" | "sr-only" | "antialiased",
             None,
         ) => Err(format!(
             "utility {class:?} is outside the renderer profile v0 \
-             (shadows/opacity/cursor/z-index/transitions/decorations are deferred)"
+             (shadows/cursor/z-index/decorations are deferred)"
         )),
         (
             "aspect" | "columns" | "list" | "object" | "align" | "select" | "appearance" | "order"
-            | "basis" | "place" | "content" | "outline" | "accent" | "divide" | "space" | "scale"
-            | "rotate" | "translate" | "skew" | "animate" | "fill" | "stroke",
+            | "basis" | "place" | "content" | "outline" | "accent" | "divide" | "space" | "skew"
+            | "fill" | "stroke",
             _,
         ) => Err(format!("utility family {base:?} is outside profile v0")),
 
@@ -566,6 +660,103 @@ fn track_count(token: &str) -> Result<u8, String> {
         return Err(format!("track count {count} outside the v0 range (1..=12)"));
     }
     Ok(count)
+}
+
+/// The `opacity-<step>` scale (Tailwind v3): 0–100 in named steps → CSS
+/// number (0.05, 0.5, 1, …).
+fn opacity_step(token: &str) -> Option<String> {
+    const STEPS: [u16; 15] = [0, 5, 10, 20, 25, 30, 40, 50, 60, 70, 75, 80, 90, 95, 100];
+    let step: u16 = token.parse().ok()?;
+    if !STEPS.contains(&step) {
+        return None;
+    }
+    Some(format!("{}", step as f32 / 100.0))
+}
+
+/// The `scale-<step>` scale (Tailwind v3) → `scale()` factor.
+fn scale_step(token: &str) -> Option<String> {
+    const STEPS: [u16; 10] = [0, 50, 75, 90, 95, 100, 105, 110, 125, 150];
+    let step: u16 = token.parse().ok()?;
+    if !STEPS.contains(&step) {
+        return None;
+    }
+    Some(format!("{}", step as f32 / 100.0))
+}
+
+/// The `duration-<ms>` / `delay-<ms>` named scale (Tailwind v3).
+fn time_step(token: &str) -> Option<u32> {
+    const TIMES: [u32; 8] = [75, 100, 150, 200, 300, 500, 700, 1000];
+    let ms: u32 = token.parse().ok()?;
+    TIMES.contains(&ms).then_some(ms)
+}
+
+/// The `transition` family's shared duration + easing defaults: every
+/// `transition-*` utility carries them so a bare `transition-colors` is
+/// complete on its own (matching Tailwind); `duration-*`/`ease-*` then
+/// override per use.
+fn transition_declarations(properties: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("transition-property", properties.to_owned()),
+        ("transition-duration", "150ms".into()),
+        (
+            "transition-timing-function",
+            "cubic-bezier(0.4, 0, 0.2, 1)".into(),
+        ),
+    ]
+}
+
+/// `ease-*` names → CSS timing functions (Tailwind v3 curves).
+fn easing_value(kind: &str) -> Option<&'static str> {
+    match kind {
+        "linear" => Some("linear"),
+        "in" => Some("cubic-bezier(0.4, 0, 1, 1)"),
+        "out" => Some("cubic-bezier(0, 0, 0.2, 1)"),
+        "in-out" => Some("cubic-bezier(0.4, 0, 0.2, 1)"),
+        _ => None,
+    }
+}
+
+/// `translate-x-*` / `translate-y-*`: the spacing scale on one axis,
+/// negated for a leading `-`. Percentages are deferred (percent-of-own-box
+/// needs layout-time resolution the transform engine does not own).
+fn translate_axis(
+    axis: char,
+    token: &str,
+    negative: bool,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let px = spacing_px(token, "translate")?;
+    let value = if negative { format!("-{px}") } else { px };
+    Ok(vec![(
+        "transform",
+        format!("translate{}({value})", axis.to_ascii_uppercase()),
+    )])
+}
+
+/// The `rotate-<step>` scale (Tailwind v3): named degrees (0, 1, 2, 3, 6, 12, 45, 90, 180).
+fn rotate_step(token: &str, negative: bool) -> Option<String> {
+    const STEPS: [u16; 9] = [0, 1, 2, 3, 6, 12, 45, 90, 180];
+    let step: u16 = token.parse().ok()?;
+    if !STEPS.contains(&step) {
+        return None;
+    }
+    let sign = if negative { "-" } else { "" };
+    Some(format!("{sign}{step}deg"))
+}
+
+/// `origin-<anchor>` names (Tailwind v3) → CSS transform-origin values.
+fn origin_value(anchor: &str) -> Option<&'static str> {
+    match anchor {
+        "center" => Some("center"),
+        "top" => Some("top"),
+        "top-right" => Some("top right"),
+        "right" => Some("right"),
+        "bottom-right" => Some("bottom right"),
+        "bottom" => Some("bottom"),
+        "bottom-left" => Some("bottom left"),
+        "left" => Some("left"),
+        "top-left" => Some("top left"),
+        _ => None,
+    }
 }
 
 /// The `text-<size>` typography scale: (font-size px, line-height px).
@@ -768,5 +959,140 @@ mod tests {
         assert!(build.css.contains("justify-items: center"));
         assert!(build.css.contains("align-self: stretch"));
         assert!(build.css.contains("flex-basis: 0%"));
+    }
+
+    #[test]
+    fn transition_families_compile() {
+        let build = compile_utilities(&[
+            "transition",
+            "transition-colors",
+            "transition-opacity",
+            "transition-transform",
+            "transition-all",
+            "transition-none",
+            "duration-300",
+            "ease-out",
+            "delay-75",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains(".transition {"));
+        assert!(build.css.contains(
+            "transition-property: color, background-color, border-color, opacity, transform;"
+        ));
+        assert!(build.css.contains(".transition-colors {"));
+        assert!(
+            build
+                .css
+                .contains("transition-property: color, background-color, border-color;")
+        );
+        assert!(build.css.contains(".transition-none {"));
+        assert!(build.css.contains("transition-duration: 0s;"));
+        assert!(build.css.contains("transition-duration: 300ms;"));
+        assert!(
+            build
+                .css
+                .contains("transition-timing-function: cubic-bezier(0, 0, 0.2, 1);")
+        );
+        assert!(build.css.contains("transition-delay: 75ms;"));
+    }
+
+    #[test]
+    fn opacity_scale_compiles() {
+        let build = compile_utilities(&["opacity-0", "opacity-5", "opacity-50", "opacity-100"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains("opacity: 0;"));
+        assert!(build.css.contains("opacity: 0.05;"));
+        assert!(build.css.contains("opacity: 0.5;"));
+        assert!(build.css.contains("opacity: 1;"));
+    }
+
+    #[test]
+    fn scale_and_translate_compile() {
+        let build = compile_utilities(&[
+            "scale-95",
+            "scale-100",
+            "scale-125",
+            "translate-x-2",
+            "-translate-x-4",
+            "translate-y-px",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains("transform: scale(0.95);"));
+        assert!(build.css.contains("transform: scale(1);"));
+        assert!(build.css.contains("transform: scale(1.25);"));
+        assert!(build.css.contains("transform: translateX(8px);"));
+        assert!(build.css.contains("transform: translateX(-16px);"));
+        assert!(build.css.contains("transform: translateY(1px);"));
+    }
+
+    #[test]
+    fn out_of_scale_transition_steps_diagnose() {
+        let build = compile_utilities(&[
+            "duration-123",
+            "delay-42",
+            "opacity-33",
+            "scale-97",
+            "ease-bouncy",
+            "transition-wiggle",
+            "-scale-50",
+            "-p-2",
+        ]);
+        assert_eq!(build.rules, 0, "nothing outside the scales compiles");
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("duration-123").contains("75/100/150/200/300/500/700/1000"));
+        assert!(message_for("delay-42").contains("75/100/150/200/300/500/700/1000"));
+        assert!(message_for("opacity-33").contains("opacity step"));
+        assert!(message_for("scale-97").contains("scale step"));
+        assert!(message_for("ease-bouncy").contains("easing"));
+        assert!(message_for("transition-wiggle").contains("transition utility target"));
+        assert!(
+            message_for("-scale-50").contains("negative utilities"),
+            "negative non-translate classes diagnose clearly"
+        );
+        assert!(message_for("-p-2").contains("negative utilities"));
+    }
+
+    #[test]
+    fn rotate_origin_and_animate_compile() {
+        let build = compile_utilities(&[
+            "rotate-0",
+            "rotate-45",
+            "rotate-90",
+            "rotate-180",
+            "-rotate-90",
+            "-rotate-180",
+            "origin-center",
+            "origin-top-left",
+            "origin-bottom",
+            "animate-spin",
+            "animate-pulse",
+            "animate-bounce",
+            "animate-none",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains("transform: rotate(0deg);"));
+        assert!(build.css.contains("transform: rotate(45deg);"));
+        assert!(build.css.contains("transform: rotate(90deg);"));
+        assert!(build.css.contains("transform: rotate(180deg);"));
+        assert!(build.css.contains("transform: rotate(-90deg);"));
+        assert!(build.css.contains("transform: rotate(-180deg);"));
+        assert!(build.css.contains("transform-origin: center;"));
+        assert!(build.css.contains("transform-origin: top left;"));
+        assert!(build.css.contains("transform-origin: bottom;"));
+        assert!(build.css.contains("animation: spin 1s linear infinite;"));
+        assert!(
+            build
+                .css
+                .contains("animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;")
+        );
+        assert!(build.css.contains("animation: bounce 1s infinite;"));
+        assert!(build.css.contains("animation: none;"));
     }
 }

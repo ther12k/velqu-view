@@ -154,6 +154,9 @@ pub struct ReactiveDocument<N> {
     pub bindings: Vec<Binding<N>>,
     /// Event handlers, in document order.
     pub events: Vec<EventBinding<N>>,
+    /// Alpine-style `vx-transition` phase entries (ADR 0024), in
+    /// document order — static class strings, no JS evaluation.
+    pub transitions: Vec<TransitionPlan<N>>,
     /// Diagnostics, in first-seen document order.
     pub diagnostics: Vec<ReactiveDiagnostic>,
 }
@@ -164,6 +167,7 @@ impl<N> Default for ReactiveDocument<N> {
             scopes: Vec::new(),
             bindings: Vec::new(),
             events: Vec::new(),
+            transitions: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -176,8 +180,37 @@ impl<N> ReactiveDocument<N> {
         self.scopes.is_empty()
             && self.bindings.is_empty()
             && self.events.is_empty()
+            && self.transitions.is_empty()
             && self.diagnostics.is_empty()
     }
+}
+
+/// One element's `vx-transition:*` phase classes (ADR 0024): the
+/// enter/leave utilities the renderer's transition state machine injects
+/// as the element appears/disappears through `vx-show`. Every field is a
+/// raw class string authored in the markup; a missing phase falls back to
+/// the engine defaults, and a bare `vx-transition` uses them everywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionPlan<N> {
+    /// The node the attributes were written on.
+    pub node: N,
+    /// The bare `vx-transition="…"` value, when present (overrides the
+    /// default transition classes for both directions).
+    pub bare: Option<String>,
+    /// `vx-transition:enter` — transition utilities for the enter leg.
+    pub enter: Option<String>,
+    /// `vx-transition:enter-start` — the starting state classes.
+    pub enter_start: Option<String>,
+    /// `vx-transition:enter-end` — the settled state classes.
+    pub enter_end: Option<String>,
+    /// `vx-transition:leave` — transition utilities for the leave leg.
+    pub leave: Option<String>,
+    /// `vx-transition:leave-start` — the starting state classes.
+    pub leave_start: Option<String>,
+    /// `vx-transition:leave-end` — the settled state classes.
+    pub leave_end: Option<String>,
+    /// Where the first phase attribute occurred.
+    pub span: SourceSpan,
 }
 
 /// The deferred-but-known directives: valid v0 names whose runtime
@@ -270,6 +303,22 @@ pub fn compile<N: Copy + Eq>(dom: &impl ReactiveDom<Node = N>) -> ReactiveDocume
     let mut scope_stack: Vec<usize> = Vec::new(); // enclosing scope indices
     let mut ordinal = 0usize; // true preorder counter
     walk(dom, dom.root(), &mut scope_stack, &mut ordinal, &mut plan);
+    // Post-walk validation (ADR 0024): transitions only drive `vx-show`
+    // visibility; on anything else they would silently never fire.
+    for entry in &plan.transitions {
+        let has_show = plan
+            .bindings
+            .iter()
+            .any(|binding| binding.node == entry.node && binding.kind == BindingKind::Show);
+        if !has_show {
+            plan.diagnostics.push(ReactiveDiagnostic {
+                span: entry.span.clone(),
+                message: "vx-transition drives vx-show enter/leave; \
+                          no vx-show binding is on this element"
+                    .to_owned(),
+            });
+        }
+    }
     plan
 }
 
@@ -340,6 +389,10 @@ fn walk<N: Copy + Eq>(
 
         // Known names only: unknown vx-*/@*/:* diagnose, never pass as
         // ordinary markup.
+        if name == "vx-transition" || name.starts_with("vx-transition:") {
+            lower_transition(node, name, value, &span, plan);
+            continue;
+        }
         if name.starts_with("vx-") {
             let directive = match parse_directive(name) {
                 Ok(directive) => directive,
@@ -505,6 +558,61 @@ fn walk<N: Copy + Eq>(
     }
 }
 
+/// Lowers one `vx-transition[:phase]` attribute into the node's
+/// [`TransitionPlan`] entry (ADR 0024). Class strings are verbatim — the
+/// renderer's transition state machine owns how and when they apply;
+/// the compiler only validates the phase name and records the value.
+/// Duplicate phases keep the first occurrence, like duplicate directives.
+fn lower_transition<N: Copy + Eq>(
+    node: N,
+    name: &str,
+    value: &str,
+    span: &SourceSpan,
+    plan: &mut ReactiveDocument<N>,
+) {
+    let Ok(phase) = crate::parse_transition_phase(name) else {
+        plan.diagnostics.push(ReactiveDiagnostic {
+            span: span.clone(),
+            message: format!(
+                "unknown vx-transition phase {name:?}: expected bare vx-transition or one of {}",
+                crate::TRANSITION_PHASES.join(", ")
+            ),
+        });
+        return;
+    };
+    let entry = match plan.transitions.iter_mut().find(|entry| entry.node == node) {
+        Some(entry) => entry,
+        None => {
+            plan.transitions.push(TransitionPlan {
+                node,
+                bare: None,
+                enter: None,
+                enter_start: None,
+                enter_end: None,
+                leave: None,
+                leave_start: None,
+                leave_end: None,
+                span: span.clone(),
+            });
+            plan.transitions.last_mut().expect("just pushed")
+        }
+    };
+    let slot = match phase {
+        None => &mut entry.bare,
+        Some("enter") => &mut entry.enter,
+        Some("enter-start") => &mut entry.enter_start,
+        Some("enter-end") => &mut entry.enter_end,
+        Some("leave") => &mut entry.leave,
+        Some("leave-start") => &mut entry.leave_start,
+        Some("leave-end") => &mut entry.leave_end,
+        Some(other) => unreachable!("parse_transition_phase validated {other:?}"),
+    };
+    // First occurrence wins, matching the duplicate-directive rule.
+    if slot.is_none() {
+        *slot = Some(value.to_owned());
+    }
+}
+
 fn lower_directive<N>(
     node: N,
     tag: &str,
@@ -575,6 +683,9 @@ fn lower_directive<N>(
         }
         // Deferred directives were diagnosed before lowering.
         Directive::Computed | Directive::If | Directive::For | Directive::Key => {}
+        // Intercepted before `parse_directive` in the walk; unreachable
+        // through this path.
+        Directive::Transition => {}
     }
 }
 

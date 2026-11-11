@@ -87,42 +87,57 @@ fn contains(rect: &Rect, x: f32, y: f32) -> bool {
 /// `document_scroll` is the clamped document-level scroll offset: the
 /// caller's point is in *viewport* space, so descending into the page
 /// translates by it. Returns the deepest box whose chrome or content is
-/// under the point, honoring paint order, clip scopes, and per-container
-/// scroll offsets.
+/// under the point, honoring paint order, clip scopes, per-container
+/// scroll offsets, and 2D element transforms (inverting affine matrices).
 pub(crate) fn hit_at(
     root: &BoxNode,
     document_scroll: (f32, f32),
+    scale: f32,
     x: f32,
     y: f32,
 ) -> Option<&BoxNode> {
     // Enter the page in content space (undo the document scroll).
-    hit_in(root, x + document_scroll.0, y + document_scroll.1)
+    hit_in(root, scale, x + document_scroll.0, y + document_scroll.1)
 }
 
 /// Maps a viewport point into the target node's own geometry space by
-/// reversing the same document and nested-scroll transforms used by hit test.
+/// reversing the same document, nested-scroll, and element transforms used by hit test.
 /// It intentionally ignores clipping so an active pointer capture can keep
 /// updating selection after the pointer leaves the control.
 pub(crate) fn point_in_node(
     root: &BoxNode,
     document_scroll: (f32, f32),
+    scale: f32,
     target: NodeId,
     x: f32,
     y: f32,
 ) -> Option<(f32, f32)> {
-    fn walk(node: &BoxNode, target: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+    fn walk(node: &BoxNode, scale: f32, target: NodeId, x: f32, y: f32) -> Option<(f32, f32)> {
+        let (x, y) = if !node.style.transform.is_identity() {
+            let matrix = crate::layout::element_transform_matrix(node, scale);
+            let inv = matrix.inverse()?;
+            inv.apply_point(x, y)
+        } else {
+            (x, y)
+        };
         if node.node == target {
             return Some((x, y));
         }
         let (ox, oy) = node.applied_scroll;
         for child in &node.children {
-            if let Some(point) = walk(child, target, x + ox, y + oy) {
+            if let Some(point) = walk(child, scale, target, x + ox, y + oy) {
                 return Some(point);
             }
         }
         None
     }
-    walk(root, target, x + document_scroll.0, y + document_scroll.1)
+    walk(
+        root,
+        scale,
+        target,
+        x + document_scroll.0,
+        y + document_scroll.1,
+    )
 }
 
 /// The translation `point_in_node` would apply for `target`: the document
@@ -152,7 +167,16 @@ pub(crate) fn accumulated_scroll_offset(
 /// space the node's own geometry lives in; scrolling translates the point
 /// only when *descending into children* (their geometry is content-space),
 /// while the clip test and own-chrome test use the incoming point.
-fn hit_in(node: &BoxNode, x: f32, y: f32) -> Option<&BoxNode> {
+/// Transforms are inverted into local space (ADR 0024).
+fn hit_in(node: &BoxNode, scale: f32, x: f32, y: f32) -> Option<&BoxNode> {
+    let (x, y) = if !node.style.transform.is_identity() {
+        let matrix = crate::layout::element_transform_matrix(node, scale);
+        let inv = matrix.inverse()?;
+        inv.apply_point(x, y)
+    } else {
+        (x, y)
+    };
+
     let clips = node.style.overflow_y != crate::style::Overflow::Visible
         || node.style.overflow_x != crate::style::Overflow::Visible;
     let (ox, oy) = node.applied_scroll;
@@ -161,7 +185,7 @@ fn hit_in(node: &BoxNode, x: f32, y: f32) -> Option<&BoxNode> {
     // its content space.
     if !clips || contains(&node.padding_box, x, y) {
         for child in node.children.iter().rev() {
-            if let Some(hit) = hit_in(child, x + ox, y + oy) {
+            if let Some(hit) = hit_in(child, scale, x + ox, y + oy) {
                 return Some(hit);
             }
         }
@@ -251,7 +275,13 @@ pub(crate) fn wheel_target(
     dx: f32,
     dy: f32,
 ) -> Option<WheelResult> {
-    let node = hit_at(ctx.root, ctx.document_offset, x, y)?;
+    let node = hit_at(
+        ctx.root,
+        ctx.document_offset,
+        ctx.viewport.scale_factor(),
+        x,
+        y,
+    )?;
     match nearest_scrollable_ancestor(ctx.root, node) {
         Some(container) => {
             let extent = container.scroll?;

@@ -17,9 +17,11 @@
 #![allow(dead_code)]
 
 use std::fmt;
+use std::time::Duration;
 
 use cssparser::Parser;
 
+use crate::anim::{Easing, PropKind};
 use crate::color::Color;
 use crate::css::{Combinator, Declaration, Rule, Selector, Simple, Specificity, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
@@ -299,6 +301,133 @@ pub enum CursorStyle {
     Text,
 }
 
+/// A 2D transform: independent axis scales, rotation, plus a translation,
+/// all in logical CSS units (ADR 0024). Transforms are paint-time only (CSS
+/// semantics): layout never sees them. Hit testing inverts this matrix to
+/// accurately map pointer coordinates into transformed element space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Transform2D {
+    /// Horizontal scale factor (1 = identity).
+    pub scale_x: f32,
+    /// Vertical scale factor (1 = identity).
+    pub scale_y: f32,
+    /// Clockwise rotation in degrees (0 = identity).
+    pub rotate: f32,
+    /// Horizontal translation in logical px.
+    pub translate_x: f32,
+    /// Vertical translation in logical px.
+    pub translate_y: f32,
+}
+
+impl Default for Transform2D {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl Transform2D {
+    /// The identity transform (no scale, no rotation, no translation).
+    pub(crate) const IDENTITY: Transform2D = Transform2D {
+        scale_x: 1.0,
+        scale_y: 1.0,
+        rotate: 0.0,
+        translate_x: 0.0,
+        translate_y: 0.0,
+    };
+
+    /// True when the transform would leave every point unchanged.
+    pub(crate) fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+}
+
+/// The anchor point for transforms (ADR 0024): fractions of the element's
+/// border box (0.5, 0.5 = center, the CSS default).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TransformOrigin {
+    /// Horizontal anchor fraction (0.0 = left, 0.5 = center, 1.0 = right).
+    pub x: f32,
+    /// Vertical anchor fraction (0.0 = top, 0.5 = center, 1.0 = bottom).
+    pub y: f32,
+}
+
+impl Default for TransformOrigin {
+    fn default() -> Self {
+        Self::CENTER
+    }
+}
+
+impl TransformOrigin {
+    pub(crate) const CENTER: Self = Self { x: 0.5, y: 0.5 };
+    pub(crate) const TOP: Self = Self { x: 0.5, y: 0.0 };
+    pub(crate) const TOP_RIGHT: Self = Self { x: 1.0, y: 0.0 };
+    pub(crate) const RIGHT: Self = Self { x: 1.0, y: 0.5 };
+    pub(crate) const BOTTOM_RIGHT: Self = Self { x: 1.0, y: 1.0 };
+    pub(crate) const BOTTOM: Self = Self { x: 0.5, y: 1.0 };
+    pub(crate) const BOTTOM_LEFT: Self = Self { x: 0.0, y: 1.0 };
+    pub(crate) const LEFT: Self = Self { x: 0.0, y: 0.5 };
+    pub(crate) const TOP_LEFT: Self = Self { x: 0.0, y: 0.0 };
+}
+
+/// Which property groups a transition covers (from
+/// `transition-property`); `all` is Tailwind's `transition-all` and CSS's
+/// default property value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct TransitionProperties {
+    /// `color`, `background-color`, `border-color`.
+    pub colors: bool,
+    /// `opacity`.
+    pub opacity: bool,
+    /// `transform`.
+    pub transform: bool,
+    /// `border-radius`.
+    pub radius: bool,
+    /// `width`/`height` (layout-affecting: each tick is a Taffy pass).
+    pub layout: bool,
+    /// `transition-all` — covers everything animatable.
+    pub all: bool,
+}
+
+impl TransitionProperties {
+    /// Whether an animation of `kind` is allowed by this set.
+    pub(crate) fn covers(&self, kind: PropKind) -> bool {
+        self.all
+            || match kind {
+                PropKind::Width | PropKind::Height => self.layout,
+                PropKind::Opacity => self.opacity,
+                PropKind::Transform => self.transform,
+                PropKind::BorderRadius => self.radius,
+                PropKind::BackgroundColor | PropKind::BorderColor | PropKind::Color => self.colors,
+            }
+    }
+}
+
+/// A fully resolved transition (ADR 0024): what the differ consumes when
+/// a computed style changes. `None`-valued at the style level whenever
+/// the property set is empty or the duration is zero — those changes
+/// land instantly, exactly like CSS.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TransitionSpec {
+    /// The property groups this transition animates.
+    pub properties: TransitionProperties,
+    /// Active-phase length.
+    pub duration: Duration,
+    /// Time to hold the from-value before the active phase.
+    pub delay: Duration,
+    /// The progress curve.
+    pub easing: Easing,
+}
+
+/// Preset looping animations (ADR 0024: Tailwind's `animate-*` utilities).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AnimationKind {
+    #[default]
+    None,
+    Spin,
+    Pulse,
+    Bounce,
+}
+
 /// Fully computed style for one element (M2a profile properties).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ComputedStyle {
@@ -353,6 +482,22 @@ pub(crate) struct ComputedStyle {
     pub box_sizing: BoxSizing,
     /// M4b: pointer cursor over the element (inherited).
     pub cursor: CursorStyle,
+    /// ADR 0024: element opacity (0–1, paint-time only, not inherited).
+    pub opacity: f32,
+    /// ADR 0024: paint-time 2D transform (not inherited).
+    pub transform: Transform2D,
+    /// ADR 0024: paint-time transform anchor (not inherited, default center).
+    pub transform_origin: TransformOrigin,
+    /// ADR 0024: transition-property set (empty = transitions nothing).
+    pub transition_properties: TransitionProperties,
+    /// ADR 0024: transition-duration (zero = instant).
+    pub transition_duration: Duration,
+    /// ADR 0024: transition-delay.
+    pub transition_delay: Duration,
+    /// ADR 0024: transition-timing-function.
+    pub transition_easing: Easing,
+    /// ADR 0024: preset looping animation (not inherited).
+    pub animation: AnimationKind,
 }
 
 impl ComputedStyle {
@@ -400,7 +545,32 @@ impl ComputedStyle {
             justify_self: AlignSelf::Auto,
             box_sizing: BoxSizing::ContentBox,
             cursor: CursorStyle::Auto,
+            opacity: 1.0,
+            transform: Transform2D::IDENTITY,
+            transform_origin: TransformOrigin::CENTER,
+            transition_properties: TransitionProperties::default(),
+            transition_duration: Duration::ZERO,
+            transition_delay: Duration::ZERO,
+            transition_easing: Easing::DEFAULT,
+            animation: AnimationKind::None,
         }
+    }
+
+    /// The active transition for this style, or `None` when nothing
+    /// animates (empty property set or zero duration — the change lands
+    /// instantly, per CSS).
+    pub(crate) fn transition(&self) -> Option<TransitionSpec> {
+        if self.transition_duration.is_zero()
+            || self.transition_properties == TransitionProperties::default()
+        {
+            return None;
+        }
+        Some(TransitionSpec {
+            properties: self.transition_properties,
+            duration: self.transition_duration,
+            delay: self.transition_delay,
+            easing: self.transition_easing,
+        })
     }
 }
 
@@ -1271,6 +1441,62 @@ fn apply_declaration(
             }
             _ => diagnostics.push(unsupported("justify-self value")),
         },
+        "opacity" => match declaration.value.trim().parse::<f32>() {
+            Ok(value) if value.is_finite() => style.opacity = value.clamp(0.0, 1.0),
+            _ => diagnostics.push(unsupported("opacity value")),
+        },
+        "transform" => match parse_transform(&declaration.value) {
+            Ok(transform) => style.transform = transform,
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported transform value {:?}: {}",
+                declaration.value, message
+            ))),
+        },
+        "transform-origin" => match parse_transform_origin(&declaration.value) {
+            Ok(origin) => style.transform_origin = origin,
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported transform-origin value {:?}: {}",
+                declaration.value, message
+            ))),
+        },
+        "transition" => match parse_transition_shorthand(&declaration.value) {
+            Ok((properties, duration, delay, easing)) => {
+                style.transition_properties = properties;
+                style.transition_duration = duration;
+                style.transition_delay = delay;
+                style.transition_easing = easing;
+            }
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported transition value {:?}: {}",
+                declaration.value, message
+            ))),
+        },
+        "transition-property" => match parse_transition_properties(&declaration.value) {
+            Ok(properties) => style.transition_properties = properties,
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported transition-property value {:?}: {}",
+                declaration.value, message
+            ))),
+        },
+        "transition-duration" => match parse_css_time(&declaration.value) {
+            Some(duration) => style.transition_duration = duration,
+            None => diagnostics.push(unsupported("transition-duration value")),
+        },
+        "transition-delay" => match parse_css_time(&declaration.value) {
+            Some(delay) => style.transition_delay = delay,
+            None => diagnostics.push(unsupported("transition-delay value")),
+        },
+        "transition-timing-function" => match parse_easing(&declaration.value) {
+            Some(easing) => style.transition_easing = easing,
+            None => diagnostics.push(unsupported("transition-timing-function value")),
+        },
+        "animation" => match declaration.value.trim() {
+            val if val.starts_with("spin") => style.animation = AnimationKind::Spin,
+            val if val.starts_with("pulse") => style.animation = AnimationKind::Pulse,
+            val if val.starts_with("bounce") => style.animation = AnimationKind::Bounce,
+            "none" => style.animation = AnimationKind::None,
+            _ => diagnostics.push(unsupported("animation value")),
+        },
         "box-sizing" => match declaration.value.as_str() {
             "content-box" => style.box_sizing = BoxSizing::ContentBox,
             "border-box" => style.box_sizing = BoxSizing::BorderBox,
@@ -1497,6 +1723,361 @@ fn parse_grid_line(token: &str) -> Result<GridLine, String> {
             "unsupported grid line {token:?} (named lines are outside the M2c profile)"
         ))
     }
+}
+
+// -- transition / transform parsing (ADR 0024) --------------------------------
+
+/// Parses a CSS time (`150ms`, `0.15s`, `0s`); negative or non-finite
+/// values are rejected (durations and delays are non-negative by spec).
+/// Integer `ms`/`s` strings take exact integer paths — the transition
+/// engine compares and reports durations, and `300ms` must stay exactly
+/// 300ms, not `f32(0.3s)`'s 300.000012ms.
+fn parse_css_time(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Some(ms) = value.strip_suffix("ms") {
+        if let Ok(exact) = ms.trim().parse::<u64>() {
+            return Some(Duration::from_millis(exact));
+        }
+        return fractional_time(ms, 0.001);
+    }
+    if let Some(secs) = value.strip_suffix('s') {
+        if let Ok(exact) = secs.trim().parse::<u64>() {
+            return Some(Duration::from_secs(exact));
+        }
+        return fractional_time(secs, 1.0);
+    }
+    None
+}
+
+/// Fractional CSS times (`0.15s`, `12.5ms`): f32 parse + scale, guarded
+/// against negatives and non-finite input.
+fn fractional_time(number: &str, unit_scale: f32) -> Option<Duration> {
+    let amount: f32 = number.trim().parse().ok()?;
+    if !amount.is_finite() || amount < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f32(amount * unit_scale))
+}
+
+/// Parses a `transition-timing-function` value: named curves (linear,
+/// ease, ease-in, ease-out, ease-in-out) or `cubic-bezier(x1, y1, x2,
+/// y2)` with the x ordinates CSS requires in `[0, 1]`.
+fn parse_easing(value: &str) -> Option<Easing> {
+    let value = value.trim();
+    match value {
+        "linear" => Some(Easing::Linear),
+        "ease" | "ease-in-out" => Some(Easing::EASE_IN_OUT),
+        "ease-in" => Some(Easing::EASE_IN),
+        "ease-out" => Some(Easing::EASE_OUT),
+        bezier if bezier.starts_with("cubic-bezier(") && bezier.ends_with(')') => {
+            let inner = &bezier["cubic-bezier(".len()..bezier.len() - 1];
+            let mut parts = inner.split(',');
+            let coordinates = [(); 4].map(|_| parts.next()?.trim().parse::<f32>().ok());
+            if parts.next().is_some() {
+                return None;
+            }
+            let [x1, y1, x2, y2] = coordinates;
+            let (Some(x1), Some(y1), Some(x2), Some(y2)) = (x1, y1, x2, y2) else {
+                return None;
+            };
+            if (0.0..=1.0).contains(&x1)
+                && (0.0..=1.0).contains(&x2)
+                && [x1, y1, x2, y2].iter().all(|value| value.is_finite())
+            {
+                Some(Easing::CubicBezier { x1, y1, x2, y2 })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Parses a `transition-property` list: comma-separated animatable names,
+/// `all`, or `none`. Unknown names are collected for the diagnostic (no
+/// silent drops); known-but-unanimatable-by-this-engine names (filters,
+/// shadows) map to the empty set with a diagnostic.
+fn parse_transition_properties(value: &str) -> Result<TransitionProperties, String> {
+    let mut properties = TransitionProperties::default();
+    let mut unknown = Vec::new();
+    for name in value.split(',') {
+        match name.trim() {
+            "all" => properties.all = true,
+            "none" => {}
+            "color" | "background-color" | "border-color" => properties.colors = true,
+            "opacity" => properties.opacity = true,
+            "transform" => properties.transform = true,
+            "border-radius" => properties.radius = true,
+            "width" | "height" => properties.layout = true,
+            other => unknown.push(other.to_owned()),
+        }
+    }
+    if unknown.is_empty() {
+        Ok(properties)
+    } else {
+        Err(format!(
+            "unknown transition properties {} (animatable: colors, opacity, transform, \
+             border-radius, width, height, all)",
+            unknown.join(", ")
+        ))
+    }
+}
+
+/// Parses the `transition` shorthand: `none`, or a space-separated mix
+/// where the property list appears at most once, the first time is the
+/// duration, an optional second time is the delay, and an optional curve
+/// keyword is the easing (CSS ordering rules).
+fn parse_transition_shorthand(
+    value: &str,
+) -> Result<(TransitionProperties, Duration, Duration, Easing), String> {
+    let mut properties: Option<TransitionProperties> = None;
+    let mut duration: Option<Duration> = None;
+    let mut delay: Option<Duration> = None;
+    let mut easing: Option<Easing> = None;
+    for token in top_level_tokens(value) {
+        let token = token.trim();
+        if token == "none" {
+            properties = Some(TransitionProperties::default());
+            continue;
+        }
+        if token == "all" {
+            properties = Some(TransitionProperties {
+                all: true,
+                ..TransitionProperties::default()
+            });
+            continue;
+        }
+        if let Some(time) = parse_css_time(token) {
+            if duration.is_none() {
+                duration = Some(time);
+            } else if delay.is_none() {
+                delay = Some(time);
+            } else {
+                return Err("more than two times in the shorthand".into());
+            }
+            continue;
+        }
+        if let Some(curve) = parse_easing(token) {
+            easing = Some(curve);
+            continue;
+        }
+        // Anything else must be a property list.
+        if properties.is_some() {
+            return Err(format!("unexpected token {token:?}"));
+        }
+        properties = Some(parse_transition_properties(token)?);
+    }
+    Ok((
+        properties.unwrap_or_default(),
+        duration.unwrap_or(Duration::ZERO),
+        delay.unwrap_or(Duration::ZERO),
+        easing.unwrap_or(Easing::DEFAULT),
+    ))
+}
+
+/// Parses a `transform` value: `none` or a space-separated sequence of 2D
+/// functions (`translateX`/`translateY`/`translate`, `scale`/`scaleX`/
+/// `scaleY`) composed by accumulating translations and multiplying
+/// scales. Rotation/skew/matrix and 3D forms are outside the profile and
+/// produce a diagnostic, never an approximation.
+fn parse_transform(value: &str) -> Result<Transform2D, String> {
+    let mut transform = Transform2D::IDENTITY;
+    if value.trim() == "none" {
+        return Ok(transform);
+    }
+    for token in top_level_tokens(value) {
+        let token = token.trim();
+        let Some(open) = token.find('(') else {
+            return Err(format!("unsupported transform token {token:?}"));
+        };
+        if !token.ends_with(')') {
+            return Err(format!("unbalanced transform token {token:?}"));
+        }
+        let name = &token[..open];
+        let args = &token[open + 1..token.len() - 1];
+        let numbers: Vec<Option<f32>> = args
+            .split(',')
+            .map(|arg| arg.trim().parse::<f32>().ok())
+            .collect();
+        match name {
+            "translateX" => match parse_length(args.trim()) {
+                Some(Length::Px(px)) => transform.translate_x += px,
+                _ => return Err("translateX takes one px length".into()),
+            },
+            "translateY" => match parse_length(args.trim()) {
+                Some(Length::Px(px)) => transform.translate_y += px,
+                _ => return Err("translateY takes one px length".into()),
+            },
+            "translate" => {
+                let lengths: Vec<Option<f32>> = args
+                    .split(',')
+                    .map(|arg| match parse_length(arg.trim()) {
+                        Some(Length::Px(px)) => Some(px),
+                        _ => None,
+                    })
+                    .collect();
+                let (Some(Some(x)), Some(Some(y)), None) =
+                    (lengths.first(), lengths.get(1), lengths.get(2))
+                else {
+                    return Err("translate takes two px lengths".into());
+                };
+                transform.translate_x += x;
+                transform.translate_y += y;
+            }
+            "scale" => match (numbers.first(), numbers.get(1), numbers.get(2)) {
+                (Some(Some(x)), None, _) | (Some(Some(x)), Some(None), _) => {
+                    transform.scale_x *= x;
+                    transform.scale_y *= x;
+                }
+                (Some(Some(x)), Some(Some(y)), None) => {
+                    transform.scale_x *= x;
+                    transform.scale_y *= y;
+                }
+                _ => return Err("scale takes one or two numbers".into()),
+            },
+            "scaleX" => match numbers.first() {
+                Some(Some(x)) => transform.scale_x *= x,
+                _ => return Err("scaleX takes one number".into()),
+            },
+            "scaleY" => match numbers.first() {
+                Some(Some(y)) => transform.scale_y *= y,
+                _ => return Err("scaleY takes one number".into()),
+            },
+            "rotate" | "rotateZ" => {
+                let deg = parse_angle(args.trim())?;
+                transform.rotate += deg;
+            }
+            "skew" | "skewX" | "skewY" | "matrix" | "matrix3d" | "translate3d" | "scale3d"
+            | "rotate3d" | "rotateX" | "rotateY" | "perspective" => {
+                return Err(format!("{name}() is outside the 2D transform profile"));
+            }
+            other => return Err(format!("unknown transform function {other:?}")),
+        }
+    }
+    Ok(transform)
+}
+
+/// Parses an angle token: `deg`, `rad`, `turn`, `grad`, or unitless `0`.
+fn parse_angle(token: &str) -> Result<f32, String> {
+    let token = token.trim();
+    if token == "0" {
+        return Ok(0.0);
+    }
+    if let Some(deg) = token.strip_suffix("deg") {
+        return deg
+            .trim()
+            .parse::<f32>()
+            .map_err(|_| format!("invalid angle {token:?}"));
+    }
+    if let Some(rad) = token.strip_suffix("rad") {
+        return rad
+            .trim()
+            .parse::<f32>()
+            .map(|r| r.to_degrees())
+            .map_err(|_| format!("invalid angle {token:?}"));
+    }
+    if let Some(turn) = token.strip_suffix("turn") {
+        return turn
+            .trim()
+            .parse::<f32>()
+            .map(|t| t * 360.0)
+            .map_err(|_| format!("invalid angle {token:?}"));
+    }
+    if let Some(grad) = token.strip_suffix("grad") {
+        return grad
+            .trim()
+            .parse::<f32>()
+            .map(|g| g * 0.9)
+            .map_err(|_| format!("invalid angle {token:?}"));
+    }
+    Err(format!(
+        "angle must have unit deg, rad, turn, or grad, got {token:?}"
+    ))
+}
+
+/// Parses a `transform-origin` declaration (ADR 0024): 1 or 2 tokens
+/// (keywords `center`, `top`, `bottom`, `left`, `right`, or percentage `P%`).
+fn parse_transform_origin(value: &str) -> Result<TransformOrigin, String> {
+    let tokens: Vec<&str> = value.split_ascii_whitespace().collect();
+    match tokens.len() {
+        1 => parse_single_origin_token(tokens[0]),
+        2 => parse_origin_pair(tokens[0], tokens[1]),
+        _ => Err("transform-origin takes 1 or 2 values".into()),
+    }
+}
+
+fn parse_single_origin_token(token: &str) -> Result<TransformOrigin, String> {
+    match token {
+        "center" => Ok(TransformOrigin::CENTER),
+        "top" => Ok(TransformOrigin::TOP),
+        "bottom" => Ok(TransformOrigin::BOTTOM),
+        "left" => Ok(TransformOrigin::LEFT),
+        "right" => Ok(TransformOrigin::RIGHT),
+        pct if pct.ends_with('%') => {
+            let num = pct[..pct.len() - 1]
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| format!("invalid percentage {pct:?}"))?;
+            Ok(TransformOrigin {
+                x: num / 100.0,
+                y: 0.5,
+            })
+        }
+        _ => Err(format!("unknown transform-origin token {token:?}")),
+    }
+}
+
+fn parse_origin_pair(first: &str, second: &str) -> Result<TransformOrigin, String> {
+    let parse_coord = |t: &str, is_y_preferred: bool| -> Result<Option<(bool, f32)>, String> {
+        match t {
+            "left" => Ok(Some((false, 0.0))),
+            "right" => Ok(Some((false, 1.0))),
+            "top" => Ok(Some((true, 0.0))),
+            "bottom" => Ok(Some((true, 1.0))),
+            "center" => Ok(None),
+            pct if pct.ends_with('%') => {
+                let num = pct[..pct.len() - 1]
+                    .trim()
+                    .parse::<f32>()
+                    .map_err(|_| format!("invalid percentage {pct:?}"))?;
+                Ok(Some((is_y_preferred, num / 100.0)))
+            }
+            _ => Err(format!("unknown origin token {t:?}")),
+        }
+    };
+
+    let p1 = parse_coord(first, false)?;
+    let p2 = parse_coord(second, true)?;
+
+    let mut origin = TransformOrigin::CENTER;
+    match (p1, p2) {
+        (Some((false, x)), Some((true, y))) | (Some((true, y)), Some((false, x))) => {
+            origin.x = x;
+            origin.y = y;
+        }
+        (Some((false, x)), None) => {
+            origin.x = x;
+            origin.y = 0.5;
+        }
+        (None, Some((true, y))) => {
+            origin.x = 0.5;
+            origin.y = y;
+        }
+        (Some((true, y)), None) => {
+            origin.x = 0.5;
+            origin.y = y;
+        }
+        (None, Some((false, x))) => {
+            origin.x = x;
+            origin.y = 0.5;
+        }
+        (None, None) => {}
+        (Some((false, x)), Some((false, y))) | (Some((true, x)), Some((true, y))) => {
+            origin.x = x;
+            origin.y = y;
+        }
+    }
+    Ok(origin)
 }
 
 fn sides_all(len: Length) -> Sides<Length> {
@@ -2137,5 +2718,118 @@ mod tests {
         let (style, _) = fx.compute_for("clipscroll");
         assert_eq!(style.overflow_y, Overflow::Hidden, "clip→hidden");
         assert_eq!(style.overflow_x, Overflow::Auto, "scroll folds to auto");
+    }
+
+    #[test]
+    fn transition_longhands_and_shorthand_compute() {
+        let mut fx = build(
+            r#"<div>
+                <p data-vv-test="shorthand" style="transition: opacity 300ms ease-out 100ms"></p>
+                <p data-vv-test="longhand" style="transition-property: color, background-color;
+                     transition-duration: 150ms; transition-timing-function: linear"></p>
+                <p data-vv-test="none" style="transition-property: none; transition-duration: 300ms"></p>
+                <p data-vv-test="nolength" style="transition-property: opacity"></p>
+            </div>"#,
+            &[],
+        );
+        let (style, diagnostics) = fx.compute_for("shorthand");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let spec = style.transition().expect("shorthand is a live transition");
+        assert!(spec.properties.opacity && !spec.properties.colors);
+        assert_eq!(spec.duration, Duration::from_millis(300));
+        assert_eq!(spec.delay, Duration::from_millis(100));
+        assert_eq!(spec.easing, Easing::EASE_OUT);
+
+        let (style, diagnostics) = fx.compute_for("longhand");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let spec = style.transition().expect("longhands compose");
+        assert!(spec.properties.colors && !spec.properties.opacity);
+        assert_eq!(spec.duration, Duration::from_millis(150));
+        assert_eq!(spec.delay, Duration::ZERO);
+        assert_eq!(spec.easing, Easing::Linear);
+
+        // `transition-property: none` animates nothing even with a duration.
+        let (style, _) = fx.compute_for("none");
+        assert!(style.transition().is_none());
+
+        // A property set without a duration lands instantly (CSS).
+        let (style, _) = fx.compute_for("nolength");
+        assert!(style.transition().is_none());
+    }
+
+    #[test]
+    fn opacity_and_transform_parse() {
+        let mut fx = build(
+            r#"<div>
+                <p data-vv-test="a" style="opacity: 0.5"></p>
+                <p data-vv-test="b" style="opacity: 3"></p>
+                <p data-vv-test="c" style="transform: scale(0.95)"></p>
+                <p data-vv-test="d" style="transform: translateX(-16px)"></p>
+                <p data-vv-test="e" style="transform: translate(4px, 8px) scaleX(2)"></p>
+                <p data-vv-test="f" style="transform: rotate(15deg)"></p>
+                <p data-vv-test="g" style="transform: none"></p>
+            </div>"#,
+            &[],
+        );
+        let (style, diagnostics) = fx.compute_for("a");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.opacity, 0.5);
+
+        // Opacity clamps into [0, 1] per CSS.
+        let (style, _) = fx.compute_for("b");
+        assert_eq!(style.opacity, 1.0);
+
+        let (style, diagnostics) = fx.compute_for("c");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.transform.scale_x, 0.95);
+        assert_eq!(style.transform.scale_y, 0.95);
+
+        let (style, diagnostics) = fx.compute_for("d");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.transform.translate_x, -16.0);
+
+        let (style, diagnostics) = fx.compute_for("e");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.transform.translate_x, 4.0);
+        assert_eq!(style.transform.translate_y, 8.0);
+        assert_eq!(style.transform.scale_x, 2.0);
+
+        // Rotation is parsed and applied (ADR 0024).
+        let (style, diagnostics) = fx.compute_for("f");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.transform.rotate, 15.0);
+
+        let (style, diagnostics) = fx.compute_for("g");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(style.transform.is_identity());
+    }
+
+    #[test]
+    fn interaction_rules_may_now_change_opacity_and_transform() {
+        // ADR 0024 extends the M4b paint list: stateful rules may drive
+        // opacity/transform (paint-only) alongside colors.
+        let mut fx = build(
+            r#"<div><p data-vv-test="hover" class="card">x</p></div>"#,
+            &[".card:hover { opacity: 0.6; transform: scale(1.05); }"],
+        );
+        let mut target = None;
+        fx.dom.walk(|id, node| {
+            if let NodeData::Element { fixture_id, .. } = &node.data {
+                if fixture_id.as_deref() == Some("hover") {
+                    target = Some(id);
+                }
+            }
+        });
+        let mut interaction = InteractionState::default();
+        interaction.hover_path.push(target.expect("node exists"));
+        let (style, diagnostics) = fx.compute_for_with("hover", Some(&interaction));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| !d.message.contains("interaction")),
+            "no deferral diagnostics: {diagnostics:?}"
+        );
+        assert_eq!(style.opacity, 0.6);
+        assert_eq!(style.transform.scale_x, 1.05);
     }
 }

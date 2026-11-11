@@ -89,6 +89,7 @@
 //! assert_eq!(result.frame.pixels(), again.frame.pixels());
 //! ```
 
+mod anim;
 mod clipboard;
 mod color;
 mod control;
@@ -504,6 +505,21 @@ pub struct VelquView {
     presentation_causes: Vec<String>,
     structural_causes_dropped: usize,
     presentation_causes_dropped: usize,
+    // -- transition engine (ADR 0024) ----------------------------------
+    /// In-flight animations + the virtual clock. Ticked only by the host
+    /// ([`VelquView::step_animations_by`]); renders apply the engine's
+    /// overrides over the cascade (see `layout::apply_animation_overrides`).
+    anim: anim::AnimationEngine,
+    /// Captured from-values for nodes whose styles are about to change
+    /// structurally (reactive `SetClass`/`SetStyle`): the render's
+    /// structure branch diffs them against the fresh cascade and spawns
+    /// animations before layout runs, so the first frame already shows
+    /// the from-state (no jump to the target).
+    pending_style_diffs: std::collections::HashMap<dom::NodeId, StyleDiffSnapshot>,
+    /// The vx-transition enter/leave state machine (ADR 0024; Alpine-style
+    /// `vx-transition:*` phases over `vx-show`). Empty when no transitions
+    /// are mid-flight.
+    transition_phases: Vec<TransitionPhase>,
 }
 
 impl Default for VelquView {
@@ -523,6 +539,87 @@ impl fmt::Debug for VelquView {
             .field("custom_clipboard_provider", &self.custom_clipboard)
             .finish()
     }
+}
+
+/// Captured animatable "from" values for one node (ADR 0024): taken from
+/// the cached box tree immediately before a structural style change
+/// applies, so the diff that spawns animations reads the true on-screen
+/// state.
+struct StyleDiffSnapshot {
+    /// Border-box width in logical px (device px / viewport scale).
+    width: Option<f32>,
+    height: Option<f32>,
+    opacity: f32,
+    border_radius: f32,
+    background_color: Color,
+    border_color: Color,
+    color: Color,
+    transform: style::Transform2D,
+}
+
+/// One candidate animation, gathered while immutable layout state is
+/// borrowed and started after (the engine needs `&mut self`).
+struct PendingSpawn {
+    node: dom::NodeId,
+    property: anim::AnimProperty,
+    spec: style::TransitionSpec,
+}
+
+/// One element moving through an Alpine-style enter/leave transition
+/// (ADR 0024). The state machine injects phase classes into the DOM and
+/// advances on animation ticks; the animations themselves are ordinary
+/// engine animations spawned by the style differ.
+struct TransitionPhase {
+    node: dom::NodeId,
+    /// The element's original `class` attribute (restored at completion;
+    /// `None` = the element carried no class attribute).
+    base_class: Option<String>,
+    /// `vx-transition:enter` utilities (or the bare value / defaults).
+    enter: String,
+    enter_end: String,
+    /// The leave leg, same resolution rules.
+    leave: String,
+    leave_end: String,
+    kind: TransitionPhaseKind,
+}
+
+/// Where a [`TransitionPhase`] is in the enter/leave cycle. The start
+/// states render one frame before the swap to the end classes — that
+/// frame is what the animation animates *from*.
+enum TransitionPhaseKind {
+    /// Unhidden with `enter_start` classes applied; the next tick swaps
+    /// to `enter_end` (with `enter` utilities) and spawns animations.
+    EnterStart,
+    /// Animating (or waiting) toward `enter_end`; completes when the
+    /// node's animations settle, restoring the base classes.
+    Entering,
+    /// Visible, `leave_start` classes applied; the next tick swaps to
+    /// `leave_end` (with `leave` utilities) and spawns animations.
+    LeaveStart,
+    /// Animating toward `leave_end`; completes by hiding the node and
+    /// restoring the base classes.
+    Leaving,
+}
+
+/// Assembles the class string for an injected vx-transition frame: the
+/// element's base classes, the leg's transition utilities, and the
+/// frame's state classes, whitespace-normalized.
+fn injected_phase_classes(base: &Option<String>, utilities: &str, state: &str) -> String {
+    let mut out = String::new();
+    if let Some(base) = base {
+        let base = base.trim();
+        if !base.is_empty() {
+            out.push_str(base);
+            out.push(' ');
+        }
+    }
+    let utilities = utilities.trim();
+    if !utilities.is_empty() {
+        out.push_str(utilities);
+        out.push(' ');
+    }
+    out.push_str(state.trim());
+    out
 }
 
 impl VelquView {
@@ -588,6 +685,9 @@ impl VelquView {
             presentation_causes: Vec::new(),
             structural_causes_dropped: 0,
             presentation_causes_dropped: 0,
+            anim: anim::AnimationEngine::new(),
+            pending_style_diffs: std::collections::HashMap::new(),
+            transition_phases: Vec::new(),
         }
     }
 
@@ -994,6 +1094,12 @@ impl VelquView {
         // scroll/hover/focus/control state.
         self.reactive = None;
         self.reactive_hidden.clear();
+        // Animation state is keyed by DOM node ids of the old parse: it
+        // dies with the document too (ADR 0024). The engine's virtual
+        // clock survives — it is schedule time, not document state.
+        self.anim.clear();
+        self.pending_style_diffs.clear();
+        self.transition_phases.clear();
         self.rebuild_reactive();
         // Utility classes are per-document too: recompile when enabled.
         self.rebuild_tailwind();
@@ -1162,6 +1268,23 @@ impl VelquView {
         }
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
+        // Pending style diffs (ADR 0024): structural class/style changes
+        // (reactive mutations and vx-transition phase swaps) captured
+        // their pre-change state; diff the fresh cascade against it
+        // *before* the layout pass below applies the change, so
+        // animations spawn with correct from-values and the first frame
+        // shows the start state, never a jump to the target.
+        if !self.pending_style_diffs.is_empty() {
+            let interaction = self.interaction_state();
+            let root_element = layout::layout_root(&self.dom);
+            let styles = layout::compute_all_styles(
+                &self.dom,
+                root_element,
+                &mut cascade,
+                Some(&interaction),
+            );
+            self.spawn_pending_transition_diffs(&styles);
+        }
         let passes_before = self.layout_passes;
         let repaints_before = self.repaint_passes;
         let mut settled: Vec<u64> = Vec::new();
@@ -1176,6 +1299,14 @@ impl VelquView {
                 causes.push("viewport".to_owned());
             }
             let interaction = self.interaction_state();
+            let root_element = layout::layout_root(&self.dom);
+            let styles = layout::compute_all_styles(
+                &self.dom,
+                root_element,
+                &mut cascade,
+                Some(&interaction),
+            );
+            self.sync_looping_animations(&styles);
             self.run_layout(viewport, &mut cascade, Some(&interaction));
             self.layout_revision += 1;
             if let Some(seq) =
@@ -1318,6 +1449,7 @@ impl VelquView {
             &self.scroll_offsets,
             interaction,
             &self.reactive_hidden,
+            self.anim.overrides(),
         );
         self.layout_passes += 1;
         self.layout_duration_last = started.elapsed();
@@ -1342,14 +1474,632 @@ impl VelquView {
     fn repaint_presentation(&mut self, _viewport: Viewport, cascade: &mut style::Cascade<'_>) {
         let interaction = self.interaction_state();
         let root_element = layout::layout_root(&self.dom);
-        let styles =
+        let mut styles =
             layout::compute_all_styles(&self.dom, root_element, cascade, Some(&interaction));
+        // Transition differ (ADR 0024): compare the fresh targets against
+        // the cached box styles (the previous on-screen values) and spawn
+        // animations for covered, changed properties. Then the overrides
+        // (at t = 0 for fresh spawns, mid-flight for running ones) pin the
+        // animated properties, so this frame shows the from-state — not a
+        // jump to the target.
+        self.spawn_transition_diffs(&styles);
+        self.sync_looping_animations(&styles);
+        layout::apply_animation_overrides(&mut styles, self.anim.overrides());
         if let Some(laid) = self.last_laid.as_mut() {
             layout::patch_presentation_styles(&mut laid.root, &styles);
         }
         self.rebuild_control_presentation();
         self.repaint_passes += 1;
         self.presentation_dirty = false;
+    }
+
+    // -- transition engine (ADR 0024) ------------------------------------
+
+    /// Captures animatable from-values for `nodes` from the cached layout,
+    /// before a structural change rewrites their classes/styles. The
+    /// render's structure branch later diffs the fresh cascade against
+    /// these snapshots and spawns animations whose first frame shows the
+    /// from-state (no jump to the target). Nodes with no cached box (newly
+    /// visible, first layout) capture nothing — there is no on-screen
+    /// state to animate from.
+    fn capture_style_snapshots<I: Iterator<Item = dom::NodeId>>(&mut self, nodes: I) {
+        let Some(laid) = self.last_laid.as_ref() else {
+            return;
+        };
+        let scale = self
+            .last_viewport
+            .map(|viewport| viewport.scale_factor())
+            .unwrap_or(1.0);
+        for node in nodes {
+            if self.pending_style_diffs.contains_key(&node) {
+                // The oldest capture is the pre-change state; a second
+                // change before the diff ran must not overwrite it.
+                continue;
+            }
+            let Some(box_node) = layout::find_box(&laid.root, node) else {
+                continue;
+            };
+            self.pending_style_diffs.insert(
+                node,
+                StyleDiffSnapshot {
+                    width: Some(box_node.border_box.w / scale),
+                    height: Some(box_node.border_box.h / scale),
+                    opacity: box_node.style.opacity,
+                    border_radius: box_node.style.border_radius,
+                    background_color: box_node.style.background_color,
+                    border_color: box_node.style.border_color,
+                    color: box_node.style.color,
+                    transform: box_node.style.transform,
+                },
+            );
+        }
+    }
+
+    /// Shared spawn guard: only covered properties animate; a running
+    /// animation whose target already matches is left alone (a per-tick
+    /// respawn would restart progress forever); a pinned completion value
+    /// equal to the target likewise spawns nothing; a changed target
+    /// retargets from the current on-screen value.
+    fn consider_transition_start(&mut self, spawn: PendingSpawn) {
+        let kind = spawn.property.kind();
+        if !spawn.spec.properties.covers(kind) {
+            return;
+        }
+        let target = spawn.property.target_value();
+        if self.anim.active_target(spawn.node, kind) == Some(target) {
+            return;
+        }
+        if self
+            .anim
+            .overrides()
+            .get(&spawn.node)
+            .and_then(|pinned| pinned.value_for(kind))
+            == Some(target)
+        {
+            return;
+        }
+        self.anim.start(
+            spawn.node,
+            spawn.property,
+            spawn.spec.delay,
+            spawn.spec.duration,
+            spawn.spec.easing,
+        );
+    }
+
+    /// Diffs fresh cascade output against the cached box styles and
+    /// gathers spawn candidates (the interaction/repaint path). Width
+    /// compares use a small epsilon: cached geometry round-trips through
+    /// device px at non-representable scales (e.g. 1.1) and must not
+    /// self-trigger.
+    fn gather_transition_diffs(&self, styles: &layout::StyleMap) -> Vec<PendingSpawn> {
+        let Some(laid) = self.last_laid.as_ref() else {
+            return Vec::new();
+        };
+        let scale = self
+            .last_viewport
+            .map(|viewport| viewport.scale_factor())
+            .unwrap_or(1.0);
+        let mut spawns = Vec::new();
+        for (node, fresh) in styles {
+            let Some(spec) = fresh.transition() else {
+                continue;
+            };
+            let Some(box_node) = layout::find_box(&laid.root, *node) else {
+                continue;
+            };
+            let cached = &box_node.style;
+            if cached.background_color != fresh.background_color {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::BackgroundColor {
+                        from: cached.background_color,
+                        to: fresh.background_color,
+                    },
+                    spec,
+                });
+            }
+            if cached.border_color != fresh.border_color {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::BorderColor {
+                        from: cached.border_color,
+                        to: fresh.border_color,
+                    },
+                    spec,
+                });
+            }
+            if cached.color != fresh.color {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::Color {
+                        from: cached.color,
+                        to: fresh.color,
+                    },
+                    spec,
+                });
+            }
+            if cached.opacity != fresh.opacity {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::Opacity {
+                        from: cached.opacity,
+                        to: fresh.opacity,
+                    },
+                    spec,
+                });
+            }
+            if (cached.border_radius - fresh.border_radius).abs() > 0.01 {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::BorderRadius {
+                        from: cached.border_radius,
+                        to: fresh.border_radius,
+                    },
+                    spec,
+                });
+            }
+            if cached.transform != fresh.transform {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::Transform {
+                        from: cached.transform,
+                        to: fresh.transform,
+                    },
+                    spec,
+                });
+            }
+            if let Some(style::Length::Px(to_width)) = fresh.width {
+                let from_width = box_node.border_box.w / scale;
+                if (from_width - to_width).abs() > 0.01 {
+                    spawns.push(PendingSpawn {
+                        node: *node,
+                        property: anim::AnimProperty::Width {
+                            from: from_width,
+                            to: to_width,
+                        },
+                        spec,
+                    });
+                }
+            }
+            if let Some(style::Length::Px(to_height)) = fresh.height {
+                let from_height = box_node.border_box.h / scale;
+                if (from_height - to_height).abs() > 0.01 {
+                    spawns.push(PendingSpawn {
+                        node: *node,
+                        property: anim::AnimProperty::Height {
+                            from: from_height,
+                            to: to_height,
+                        },
+                        spec,
+                    });
+                }
+            }
+        }
+        spawns
+    }
+
+    /// The interaction-path differ: gather against cached boxes, then
+    /// start with the engine mutably borrowed.
+    fn spawn_transition_diffs(&mut self, styles: &layout::StyleMap) {
+        for spawn in self.gather_transition_diffs(styles) {
+            self.consider_transition_start(spawn);
+        }
+    }
+
+    /// The structure-path differ: diff the fresh cascade against captured
+    /// pre-change snapshots (reactive `SetClass`/`SetStyle`, and the
+    /// vx-transition phase swaps), then clear the snapshots. Runs before
+    /// the layout pass so overrides at `t = 0` shape the first frame.
+    fn spawn_pending_transition_diffs(&mut self, styles: &layout::StyleMap) {
+        if self.pending_style_diffs.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_style_diffs);
+        for (node, snapshot) in pending {
+            let Some(fresh) = styles.get(&node) else {
+                continue;
+            };
+            let Some(spec) = fresh.transition() else {
+                continue;
+            };
+            if snapshot.background_color != fresh.background_color {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::BackgroundColor {
+                        from: snapshot.background_color,
+                        to: fresh.background_color,
+                    },
+                    spec,
+                });
+            }
+            if snapshot.border_color != fresh.border_color {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::BorderColor {
+                        from: snapshot.border_color,
+                        to: fresh.border_color,
+                    },
+                    spec,
+                });
+            }
+            if snapshot.color != fresh.color {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::Color {
+                        from: snapshot.color,
+                        to: fresh.color,
+                    },
+                    spec,
+                });
+            }
+            if snapshot.opacity != fresh.opacity {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::Opacity {
+                        from: snapshot.opacity,
+                        to: fresh.opacity,
+                    },
+                    spec,
+                });
+            }
+            if (snapshot.border_radius - fresh.border_radius).abs() > 0.01 {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::BorderRadius {
+                        from: snapshot.border_radius,
+                        to: fresh.border_radius,
+                    },
+                    spec,
+                });
+            }
+            if snapshot.transform != fresh.transform {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::Transform {
+                        from: snapshot.transform,
+                        to: fresh.transform,
+                    },
+                    spec,
+                });
+            }
+            if let (Some(from_width), Some(style::Length::Px(to_width))) =
+                (snapshot.width, fresh.width)
+            {
+                if (from_width - to_width).abs() > 0.01 {
+                    self.consider_transition_start(PendingSpawn {
+                        node,
+                        property: anim::AnimProperty::Width {
+                            from: from_width,
+                            to: to_width,
+                        },
+                        spec,
+                    });
+                }
+            }
+            if let (Some(from_height), Some(style::Length::Px(to_height))) =
+                (snapshot.height, fresh.height)
+            {
+                if (from_height - to_height).abs() > 0.01 {
+                    self.consider_transition_start(PendingSpawn {
+                        node,
+                        property: anim::AnimProperty::Height {
+                            from: from_height,
+                            to: to_height,
+                        },
+                        spec,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Synchronizes preset looping animations (`animate-spin`, `animate-pulse`, `animate-bounce`)
+    /// with the animation engine (ADR 0024).
+    fn sync_looping_animations(&mut self, styles: &layout::StyleMap) {
+        for (&node, style) in styles {
+            match style.animation {
+                style::AnimationKind::Spin => {
+                    if !self.anim.has_active_for(node) {
+                        self.anim.start_with_repeat(
+                            node,
+                            anim::AnimProperty::Transform {
+                                from: style::Transform2D {
+                                    scale_x: 1.0,
+                                    scale_y: 1.0,
+                                    rotate: 0.0,
+                                    translate_x: 0.0,
+                                    translate_y: 0.0,
+                                },
+                                to: style::Transform2D {
+                                    scale_x: 1.0,
+                                    scale_y: 1.0,
+                                    rotate: 360.0,
+                                    translate_x: 0.0,
+                                    translate_y: 0.0,
+                                },
+                            },
+                            std::time::Duration::ZERO,
+                            std::time::Duration::from_millis(1000),
+                            anim::Easing::Linear,
+                            anim::AnimationRepeat::Infinite,
+                        );
+                    }
+                }
+                style::AnimationKind::Pulse => {
+                    if !self.anim.has_active_for(node) {
+                        self.anim.start_with_repeat(
+                            node,
+                            anim::AnimProperty::PulseOpacity { min: 0.5, max: 1.0 },
+                            std::time::Duration::ZERO,
+                            std::time::Duration::from_millis(2000),
+                            anim::Easing::EASE_IN_OUT,
+                            anim::AnimationRepeat::Infinite,
+                        );
+                    }
+                }
+                style::AnimationKind::Bounce => {
+                    if !self.anim.has_active_for(node) {
+                        self.anim.start_with_repeat(
+                            node,
+                            anim::AnimProperty::BounceTranslateY { distance: 10.0 },
+                            std::time::Duration::ZERO,
+                            std::time::Duration::from_millis(1000),
+                            anim::Easing::EASE_IN_OUT,
+                            anim::AnimationRepeat::Infinite,
+                        );
+                    }
+                }
+                style::AnimationKind::None => {
+                    self.anim.stop_infinite_for(node);
+                }
+            }
+        }
+    }
+
+    /// Whether any animation is pending or running — the host's frame pump
+    /// stays awake only while this is true (ADR 0024: idle is 0% CPU).
+    pub fn has_active_animations(&self) -> bool {
+        self.anim.has_active()
+    }
+
+    /// Advances the animation virtual clock by `dt` and routes the tick's
+    /// invalidation: width/height animations mark structure (a Taffy pass
+    /// per frame — the documented cost of layout animation), everything
+    /// else marks a presentation repaint (zero Taffy passes). Returns
+    /// whether more frames are needed. Deterministic by construction: the
+    /// clock advances only through this method, never from wall time.
+    pub fn step_animations_by(&mut self, dt: std::time::Duration) -> bool {
+        let outcome = self.anim.tick_by(dt);
+        if outcome.layout_dirty {
+            self.note_structural_cause("animation tick (layout property)");
+            self.mark_structure_dirty();
+        } else if outcome.paint_dirty {
+            self.note_presentation_cause("animation tick");
+            self.presentation_dirty = true;
+        }
+        self.advance_transition_phases();
+        outcome.more
+    }
+
+    /// Advances the vx-transition state machine (ADR 0024). One phase
+    /// transition per tick: start-state frames render first, then the
+    /// class swap (with the differ spawning the real animation), then the
+    /// machine only waits for the node's animations to settle.
+    fn advance_transition_phases(&mut self) {
+        let mut index = 0;
+        while index < self.transition_phases.len() {
+            let node = self.transition_phases[index].node;
+            match self.transition_phases[index].kind {
+                TransitionPhaseKind::EnterStart => {
+                    self.swap_phase_classes(index, true);
+                    self.transition_phases[index].kind = TransitionPhaseKind::Entering;
+                    index += 1;
+                }
+                TransitionPhaseKind::LeaveStart => {
+                    self.swap_phase_classes(index, false);
+                    self.transition_phases[index].kind = TransitionPhaseKind::Leaving;
+                    index += 1;
+                }
+                // Not settled yet — unless the diff has not even run (the
+                // swap frame has not rendered); pending diffs keep the
+                // phase alive so it is never completed pre-spawn.
+                TransitionPhaseKind::Entering | TransitionPhaseKind::Leaving => {
+                    if self.anim.has_active_for(node)
+                        || self.pending_style_diffs.contains_key(&node)
+                    {
+                        index += 1;
+                    } else {
+                        let phase = self.transition_phases.remove(index);
+                        self.complete_phase(phase);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Swaps a start-state frame to its end classes: capture the current
+    /// (start-state) on-screen values, rewrite the class attribute, and
+    /// mark structure + tailwind so the next render diff-spawns the
+    /// animation from the captured state.
+    fn swap_phase_classes(&mut self, index: usize, enter: bool) {
+        let node = self.transition_phases[index].node;
+        let (utilities, state) = {
+            let phase = &self.transition_phases[index];
+            if enter {
+                (phase.enter.clone(), phase.enter_end.clone())
+            } else {
+                (phase.leave.clone(), phase.leave_end.clone())
+            }
+        };
+        let base = self.transition_phases[index].base_class.clone();
+        self.capture_style_snapshots(std::iter::once(node));
+        self.dom.set_attribute(
+            node,
+            "class",
+            injected_phase_classes(&base, &utilities, &state),
+        );
+        self.rebuild_tailwind();
+        self.note_structural_cause("vx-transition phase swap");
+        self.mark_structure_dirty();
+    }
+
+    /// Ends a phase: entering restores the base classes (the end state is
+    /// normally identical, so the differ spawns nothing); leaving hides
+    /// the node and then restores.
+    fn complete_phase(&mut self, phase: TransitionPhase) {
+        if matches!(phase.kind, TransitionPhaseKind::Leaving) {
+            self.reactive_hidden.insert(phase.node);
+            // A hidden node has no boxes; any straggler capture is dead.
+            self.pending_style_diffs.remove(&phase.node);
+        } else {
+            self.capture_style_snapshots(std::iter::once(phase.node));
+        }
+        self.restore_phase_classes(phase.node, phase.base_class);
+    }
+
+    /// Restores an element's original class attribute after a phase (or a
+    /// phase cancellation).
+    fn restore_phase_classes(&mut self, node: dom::NodeId, base: Option<String>) {
+        match base {
+            Some(class) => {
+                self.dom.set_attribute(node, "class", class);
+            }
+            None => {
+                self.dom.remove_attribute(node, "class");
+            }
+        }
+        self.rebuild_tailwind();
+        self.note_structural_cause("vx-transition restore");
+        self.mark_structure_dirty();
+    }
+
+    /// The `SetVisible` interception point (ADR 0024): an element with a
+    /// compiled `vx-transition` plan enters/leaves through the phase
+    /// machine instead of the instant hide/show path. Returns `false`
+    /// when the node has no plan (the ordinary path applies).
+    fn begin_visibility_transition(
+        &mut self,
+        plan: &ReactiveDocument<dom::NodeId>,
+        node: dom::NodeId,
+        show: bool,
+    ) -> bool {
+        let Some(entry) = plan
+            .transitions
+            .iter()
+            .find(|transition| transition.node == node)
+        else {
+            return false;
+        };
+        // Resolve the phase classes: explicit values, then the bare
+        // attribute (for the utility classes), then Alpine's defaults.
+        let enter = entry
+            .enter
+            .clone()
+            .or_else(|| entry.bare.clone())
+            .unwrap_or_else(|| "transition duration-150 ease-out".to_owned());
+        let enter_start = entry
+            .enter_start
+            .clone()
+            .unwrap_or_else(|| "opacity-0 scale-95".to_owned());
+        let enter_end = entry
+            .enter_end
+            .clone()
+            .unwrap_or_else(|| "opacity-100 scale-100".to_owned());
+        let leave = entry
+            .leave
+            .clone()
+            .or_else(|| entry.bare.clone())
+            .unwrap_or_else(|| "transition duration-100 ease-in".to_owned());
+        let leave_start = entry
+            .leave_start
+            .clone()
+            .unwrap_or_else(|| "opacity-100 scale-100".to_owned());
+        let leave_end = entry
+            .leave_end
+            .clone()
+            .unwrap_or_else(|| "opacity-0 scale-95".to_owned());
+        let base_class = self.dom.attribute(node, "class").map(str::to_owned);
+
+        // A direction reversal cancels the in-flight phase. Reversals
+        // animate from the current on-screen state directly (no start
+        // frame — the element never left the tree); fresh starts use the
+        // full start/swap sequence.
+        let existing_kind = self
+            .transition_phases
+            .iter()
+            .position(|phase| phase.node == node)
+            .map(|index| self.transition_phases.remove(index).kind);
+        let reversal = match (show, existing_kind) {
+            (true, Some(TransitionPhaseKind::LeaveStart | TransitionPhaseKind::Leaving))
+            | (false, Some(TransitionPhaseKind::EnterStart | TransitionPhaseKind::Entering)) => {
+                // Restore the base classes first so the injected phase
+                // classes below are the only delta.
+                self.restore_phase_classes(node, base_class.clone());
+                true
+            }
+            _ => false,
+        };
+
+        if show {
+            self.reactive_hidden.remove(&node);
+        }
+        // Leaving keeps the node visible until the leave animation ends —
+        // the machine hides it in `complete_phase`.
+
+        let kind = if reversal {
+            // Diff from the current (mid-animation) state: swap straight
+            // to the end classes of the new direction.
+            self.capture_style_snapshots(std::iter::once(node));
+            let (utilities, state) = if show {
+                (enter.clone(), enter_end.clone())
+            } else {
+                (leave.clone(), leave_end.clone())
+            };
+            self.dom.set_attribute(
+                node,
+                "class",
+                injected_phase_classes(&base_class, &utilities, &state),
+            );
+            if show {
+                TransitionPhaseKind::Entering
+            } else {
+                TransitionPhaseKind::Leaving
+            }
+        } else if show {
+            // Frame 1: the start state (opacity-0 …) renders before any
+            // animation exists.
+            self.dom.set_attribute(
+                node,
+                "class",
+                injected_phase_classes(&base_class, &enter, &enter_start),
+            );
+            TransitionPhaseKind::EnterStart
+        } else {
+            self.dom.set_attribute(
+                node,
+                "class",
+                injected_phase_classes(&base_class, &leave, &leave_start),
+            );
+            TransitionPhaseKind::LeaveStart
+        };
+        self.rebuild_tailwind();
+        self.note_structural_cause(if show {
+            "vx-transition enter"
+        } else {
+            "vx-transition leave"
+        });
+        self.mark_structure_dirty();
+        self.transition_phases.push(TransitionPhase {
+            node,
+            base_class,
+            enter,
+            enter_end,
+            leave,
+            leave_end,
+            kind,
+        });
+        true
     }
 
     /// Rebuilds runtime control paint from the cached outer layout. This is a
@@ -1620,7 +2370,8 @@ impl VelquView {
     /// per-container scroll offsets; the point never triggers layout.
     pub fn hit_test(&self, viewport: Viewport, x: f32, y: f32) -> Option<HitTarget> {
         let laid = self.cached_layout(viewport)?;
-        let node = input::hit_at(&laid.root, laid.root_offset, x, y)?;
+        let scale = viewport.scale_factor();
+        let node = input::hit_at(&laid.root, laid.root_offset, scale, x, y)?;
         Some(HitTarget {
             handle: self.node_handle(node.node),
             element_id: node.element_id.clone(),
@@ -1655,9 +2406,10 @@ impl VelquView {
     }
 
     fn update_hover(&mut self, viewport: Viewport, x: f32, y: f32) {
+        let scale = viewport.scale_factor();
         let hit = self
             .cached_layout(viewport)
-            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, scale, x, y))
             .map(|node| node.node);
         if hit == self.hover {
             return;
@@ -1739,9 +2491,10 @@ impl VelquView {
         let before = self.pressed;
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
+        let scale = viewport.scale_factor();
         let hit = self
             .cached_layout(viewport)
-            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, scale, x, y))
             .map(|node| node.node);
         self.pressed = hit;
         if let Some(node) = hit {
@@ -1778,9 +2531,10 @@ impl VelquView {
         self.note_presentation_cause("active");
         self.pointer_pos = Some((x, y));
         self.update_hover(viewport, x, y);
+        let scale = viewport.scale_factor();
         let released = self
             .cached_layout(viewport)
-            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, scale, x, y))
             .map(|node| node.node);
         if Some(pressed) == released {
             // HTML semantics: disabled elements do not activate — no
@@ -1884,7 +2638,8 @@ impl VelquView {
                 && cached.scale_factor() == viewport.scale_factor())
             .then_some(last)?
         };
-        let (point_x, point_y) = input::point_in_node(&laid.root, laid.root_offset, node, x, y)?;
+        let (point_x, point_y) =
+            input::point_in_node(&laid.root, laid.root_offset, scale, node, x, y)?;
         let box_node = layout::find_box(&laid.root, node)?.clone();
         let state = self.controls.get(&node)?;
         Some(control::offset_at_point(
@@ -2416,8 +3171,9 @@ impl VelquView {
     /// under the pointer or no layout is cached. Reading it never lays
     /// out and never repaints.
     pub fn cursor_under(&self, viewport: Viewport, x: f32, y: f32) -> CursorStyle {
+        let scale = viewport.scale_factor();
         self.cached_layout(viewport)
-            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, x, y))
+            .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, scale, x, y))
             .map(|node| node.style.cursor)
             .unwrap_or_default()
     }
@@ -2514,8 +3270,12 @@ impl VelquView {
         let pending_initial = std::mem::take(pending_initial);
         let plan: &ReactiveDocument<dom::NodeId> = plan;
 
-        // Turn zero: initial binding outputs from document load.
-        if !pending_initial.is_empty() && !self.apply_mutations_validated(plan, &pending_initial) {
+        // Turn zero: initial binding outputs from document load. No
+        // transitions (ADR 0024): initial visibility is the document's
+        // starting state, not a change.
+        if !pending_initial.is_empty()
+            && !self.apply_mutations_validated(plan, &pending_initial, false)
+        {
             // Initial batch invalid (should not happen: the plan was
             // compiled against this DOM): drop it with a diagnostic.
             *initial_batch_rejected = true;
@@ -2618,7 +3378,7 @@ impl VelquView {
                             continue;
                         }
                         machine.commit(pending);
-                        self.apply_mutations(plan, &mutations);
+                        self.apply_mutations(plan, &mutations, true);
                         self.state_revision += 1;
                         self.reactive_turns += 1;
                         let elapsed = started.elapsed();
@@ -3615,6 +4375,7 @@ impl VelquView {
         &mut self,
         plan: &ReactiveDocument<dom::NodeId>,
         mutations: &[velqu_reactive::Mutation],
+        allow_transitions: bool,
     ) {
         let plan_bindings: Vec<(dom::NodeId, BindingKind)> = plan
             .bindings
@@ -3635,6 +4396,17 @@ impl VelquView {
                     self.note_structural_cause("reactive SetText");
                 }
                 MutationKind::SetVisible(visible) => {
+                    // vx-transition interception (ADR 0024): elements
+                    // with a compiled plan enter/leave through the phase
+                    // machine; everything else hides/shows instantly.
+                    // Turn zero is exempt — an initially hidden element
+                    // must never flash a leave animation on load.
+                    if allow_transitions && self.begin_visibility_transition(plan, node, *visible) {
+                        structural = true;
+                        tailwind = true;
+                        self.note_structural_cause("reactive SetVisible (vx-transition)");
+                        continue;
+                    }
                     let was_hidden = self.reactive_hidden.contains(&node);
                     let now_hidden = !visible;
                     if was_hidden != now_hidden {
@@ -3648,12 +4420,22 @@ impl VelquView {
                     }
                 }
                 MutationKind::SetClass(class) => {
+                    // Turn zero is exempt from captures (ADR 0024): the
+                    // initial class binding is the document's starting
+                    // state, not a change — animating from the unbound
+                    // (auto-sized) geometry would flash a load animation.
+                    if allow_transitions {
+                        self.capture_style_snapshots(std::iter::once(node));
+                    }
                     self.dom.set_attribute(node, "class", class.clone());
                     structural = true;
                     tailwind = true;
                     self.note_structural_cause("reactive SetClass");
                 }
                 MutationKind::SetStyle(style) => {
+                    if allow_transitions {
+                        self.capture_style_snapshots(std::iter::once(node));
+                    }
                     self.dom.set_attribute(node, "style", style.clone());
                     structural = true;
                     self.note_structural_cause("reactive SetStyle");
@@ -3707,16 +4489,19 @@ impl VelquView {
         }
     }
 
-    /// Validates and (if valid) applies: the initial-batch path.
+    /// Validates and (if valid) applies: the initial-batch path. Turn
+    /// zero suppresses transitions — an initially hidden element must
+    /// never flash a leave animation on load (ADR 0024).
     fn apply_mutations_validated(
         &mut self,
         plan: &ReactiveDocument<dom::NodeId>,
         mutations: &[velqu_reactive::Mutation],
+        allow_transitions: bool,
     ) -> bool {
         if !self.mutations_valid(plan, mutations) {
             return false;
         }
-        self.apply_mutations(plan, mutations);
+        self.apply_mutations(plan, mutations, allow_transitions);
         true
     }
 }

@@ -46,7 +46,7 @@ use velqu_view::{
 };
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -268,6 +268,8 @@ fn run_inner(
         error: None,
         watch_wake: false,
         watch_hook,
+        last_anim_tick: None,
+        occluded: false,
     };
     if let Some(spawn_watcher) = spawn_watcher {
         spawn_watcher(event_loop.create_proxy());
@@ -314,7 +316,18 @@ struct ShellApp<'a> {
     watch_wake: bool,
     /// The host's watch hook, run on the main thread per wake.
     watch_hook: Option<WatchHook<'a>>,
+    /// Wall-clock timestamp of the last animation tick (ADR 0024): the
+    /// shell owns real time, the renderer's engine runs on the virtual
+    /// clock this delta feeds. `None` until the first redraw.
+    last_anim_tick: Option<Instant>,
+    /// Whether the window is occluded/minimized (ADR 0024): frame pumping pauses
+    /// to guarantee 0% CPU consumption while hidden.
+    occluded: bool,
 }
+
+/// The animation frame pacing (ADR 0024): ~60 FPS deadlines while any
+/// animation is active; pure `Wait` (0% idle CPU) otherwise.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 impl ShellApp<'_> {
     fn take_result(self) -> Result<ShellStats, ShellError> {
@@ -516,6 +529,18 @@ impl ShellApp<'_> {
         let batch = self.view.take_events();
         self.view.pump_reactive(&batch);
         drop(batch);
+        // Advance the animation clock by the real time since the last
+        // redraw (ADR 0024): the shell owns wall time, the engine stays
+        // on its virtual clock. Mutations applied by the turn above are
+        // seen by this tick's differ on the next render — the same
+        // ordering the headless stepper drives.
+        let now = Instant::now();
+        let dt = self
+            .last_anim_tick
+            .map(|last| now.saturating_duration_since(last))
+            .unwrap_or(Duration::ZERO);
+        self.view.step_animations_by(dt);
+        self.last_anim_tick = Some(now);
         let Some(window) = self.window.clone() else {
             return Ok(());
         };
@@ -637,6 +662,13 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
                 // Ancestor scrolling moves the candidate anchor (M4c3).
                 self.update_ime();
             }
+            winit::event::WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded && self.view.has_active_animations() {
+                    self.dirty = true;
+                    self.request_redraw();
+                }
+            }
             winit::event::WindowEvent::RedrawRequested => {
                 self.redraw(event_loop);
                 self.dirty = false;
@@ -665,6 +697,34 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
                 }
             }
         }
+        // The animation frame pump (ADR 0024): while any animation runs,
+        // pace redraws at ~60 FPS via `WaitUntil` deadlines — never
+        // `Poll`, so the CPU stays quiet between frames — and fall back
+        // to pure `Wait` (0% idle CPU) the moment the engine goes idle.
+        // If the window is occluded/minimized, pause frame pumping in Wait
+        // to guarantee 0% background CPU consumption while hidden.
+        // An `exit_after` deadline keeps priority over frame pacing.
+        let is_visible = !self.occluded
+            && self.window.as_ref().is_some_and(|w| {
+                let size = w.inner_size();
+                size.width > 0 && size.height > 0
+            });
+        if self.view.has_active_animations() && is_visible {
+            self.dirty = true;
+            self.request_redraw();
+        }
+        let flow = if self.view.has_active_animations() && is_visible {
+            let next_frame = Instant::now() + ANIMATION_FRAME_INTERVAL;
+            ControlFlow::WaitUntil(match self.config.exit_after {
+                Some(exit) => next_frame.min(self.started + exit),
+                None => next_frame,
+            })
+        } else if let Some(exit) = self.config.exit_after {
+            ControlFlow::WaitUntil(self.started + exit)
+        } else {
+            ControlFlow::Wait
+        };
+        event_loop.set_control_flow(flow);
         if self.dirty {
             self.request_redraw();
         }

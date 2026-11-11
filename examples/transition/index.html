@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>VelquView Transitions</title>
+    <style>
+      .panel {
+        padding: 16px;
+      }
+      .vv-card {
+        /* Tailwind utilities compile to CSS; the base background lives
+           in an author rule so the :hover rule can win the cascade. */
+        background-color: #1e293b;
+      }
+      .vv-card:hover {
+        background-color: #4338ca;
+      }
+      .vv-hint {
+        padding: 4px 0;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-950 text-slate-200" style="margin: 0">
+    <div vx-state="{ open: false, wide: false }" class="p-6 flex flex-col gap-6">
+      <h2 class="text-xl font-bold">VelquView Transition Engine (ADR 0024)</h2>
+
+      <div class="flex flex-col gap-2">
+        <p class="vv-hint">Hover the card — the color transition repaints with zero layout passes:</p>
+        <div
+          class="vv-card rounded-xl h-24 w-96 transition duration-300 ease-out"
+        ></div>
+      </div>
+
+      <div class="flex flex-col gap-2">
+        <p class="vv-hint">Toggle the panel width — the width transition animates through layout:</p>
+        <div
+          data-vv-test="width-panel"
+          class="h-10 rounded-lg transition-all duration-200 ease-linear"
+          :class="wide
+              ? 'w-96 h-10 rounded-lg bg-emerald-500 transition-all duration-200 ease-linear'
+              : 'w-64 h-10 rounded-lg bg-emerald-500 transition-all duration-200 ease-linear'"
+        ></div>
+        <button
+          id="wide-toggle"
+          class="w-32 rounded-md bg-slate-800 px-3 py-2"
+          @click="wide = !wide"
+        >
+          Toggle width
+        </button>
+      </div>
+
+      <div class="flex flex-col gap-2">
+        <p class="vv-hint">Toggle visibility — Alpine-style enter/leave phases on vx-show:</p>
+        <div
+          data-vv-test="vx-panel"
+          class="rounded-xl bg-indigo-500 p-4 w-80"
+          vx-show="open"
+          vx-transition:enter="transition duration-300 ease-out"
+          vx-transition:enter-start="opacity-0 scale-95"
+          vx-transition:enter-end="opacity-100 scale-100"
+          vx-transition:leave="transition duration-200 ease-in"
+          vx-transition:leave-end="opacity-0 scale-95"
+        >
+          A panel that enters and leaves through vx-transition phases.
+        </div>
+        <button
+          id="panel-toggle"
+          class="w-32 rounded-md bg-slate-800 px-3 py-2"
+          @click="open = !open"
+        >
+          Toggle panel
+        </button>
+      </div>
+      <div class="flex flex-col gap-2">
+        <p class="vv-hint">Rotating disclosure chevron — transition-transform with rotate-180:</p>
+        <button
+          id="chevron-toggle"
+          class="w-48 rounded-md bg-slate-800 px-3 py-2 flex items-center justify-between"
+          @click="open = !open"
+        >
+          <span>Options</span>
+          <span
+            class="transition-transform duration-200 ease-out font-bold text-indigo-400"
+            :class="open ? 'rotate-180 transition-transform duration-200 ease-out font-bold text-indigo-400' : 'rotate-0 transition-transform duration-200 ease-out font-bold text-indigo-400'"
+          >
+            v
+          </span>
+        </button>
+      </div>
+
+      <div class="flex flex-col gap-2">
+        <p class="vv-hint">Looping animations — animate-spin and animate-pulse:</p>
+        <div class="flex gap-4 items-center">
+          <div class="animate-spin w-8 h-8 rounded-full border-2 border-indigo-500"></div>
+          <div class="animate-pulse w-32 h-6 rounded bg-slate-700"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

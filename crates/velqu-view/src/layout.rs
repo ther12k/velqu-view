@@ -16,7 +16,7 @@
 //! metric space.
 
 use crate::color::Color;
-use crate::display_list::{DisplayItem, DisplayList, Rect};
+use crate::display_list::{Affine2D, DisplayItem, DisplayList, Rect};
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::font::FontStore;
 use crate::image::{DecodedImage, ImageStore};
@@ -191,6 +191,49 @@ pub(crate) struct RunBox {
 
 /// Computed styles for every element, from one top-down cascade pass.
 pub(crate) type StyleMap = std::collections::HashMap<NodeId, ComputedStyle>;
+
+/// Applies in-flight animation overrides over freshly computed styles
+/// (ADR 0024): animated values win over the cascade's targets until the
+/// animation settles, where the target already equals the final sample.
+/// Both render paths (full layout and presentation repaint) run this
+/// after the cascade, before boxes are built/patched.
+pub(crate) fn apply_animation_overrides(
+    styles: &mut StyleMap,
+    overrides: &crate::anim::PropertyOverrideMap,
+) {
+    if overrides.is_empty() {
+        return;
+    }
+    for (node, override_values) in overrides {
+        let Some(style) = styles.get_mut(node) else {
+            continue;
+        };
+        if let Some(width) = override_values.width {
+            style.width = Some(crate::style::Length::Px(width));
+        }
+        if let Some(height) = override_values.height {
+            style.height = Some(crate::style::Length::Px(height));
+        }
+        if let Some(opacity) = override_values.opacity {
+            style.opacity = opacity;
+        }
+        if let Some(radius) = override_values.border_radius {
+            style.border_radius = radius;
+        }
+        if let Some(color) = override_values.background_color {
+            style.background_color = color;
+        }
+        if let Some(color) = override_values.border_color {
+            style.border_color = color;
+        }
+        if let Some(color) = override_values.color {
+            style.color = color;
+        }
+        if let Some(transform) = override_values.transform {
+            style.transform = transform;
+        }
+    }
+}
 
 /// Runs the cascade over the whole tree once. `interaction` carries the
 /// runtime hover/focus/active state for selector matching; `None` is the
@@ -463,10 +506,12 @@ pub(crate) fn layout_document(
     scroll_offsets: &ScrollOffsets,
     interaction: Option<&crate::style::InteractionState>,
     hidden: &std::collections::HashSet<NodeId>,
+    overrides: &crate::anim::PropertyOverrideMap,
 ) -> Option<LaidOutDocument> {
     let root_element = layout_root(dom);
 
-    let styles = compute_all_styles(dom, root_element, cascade, interaction);
+    let mut styles = compute_all_styles(dom, root_element, cascade, interaction);
+    apply_animation_overrides(&mut styles, overrides);
     let mut root = build_boxes(dom, root_element, &styles, images, hidden)?;
 
     crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts, scroll_offsets);
@@ -537,8 +582,7 @@ pub(crate) fn build_display_list_with_controls(
         list.items.insert(
             0,
             DisplayItem::PushTransform {
-                x: -document_offset.0,
-                y: -document_offset.1,
+                matrix: Affine2D::translation(-document_offset.0, -document_offset.1),
             },
         );
         list.items.push(DisplayItem::PopTransform);
@@ -569,6 +613,25 @@ pub(crate) fn patch_presentation_styles(root: &mut BoxNode, styles: &StyleMap) {
     walk(root, styles)
 }
 
+/// Computes the complete 2D transformation matrix for a node (ADR 0024):
+/// scales and rotates about the element's transform origin, then applies
+/// the device-pixel translation. Shared between display list emission
+/// (`emit_box`) and transformed hit testing (`input::hit_in`).
+pub(crate) fn element_transform_matrix(node: &BoxNode, scale: f32) -> Affine2D {
+    let transform = &node.style.transform;
+    let origin_x = node.border_box.x + node.border_box.w * node.style.transform_origin.x;
+    let origin_y = node.border_box.y + node.border_box.h * node.style.transform_origin.y;
+    Affine2D::translate_scale_rotate(
+        transform.scale_x,
+        transform.scale_y,
+        transform.rotate,
+        origin_x,
+        origin_y,
+        transform.translate_x * scale,
+        transform.translate_y * scale,
+    )
+}
+
 /// Emits paint-ready items: backgrounds, borders, text, with
 /// `overflow: hidden`/`clip` boxes scoping their descendants via clip
 /// items. Layout owns geometry; the display list owns paint ordering and
@@ -585,6 +648,22 @@ fn emit_box(
     let _ = parent_clip;
     // `border_radius` is authored in logical px; layout runs in device px.
     let radius = style.border_radius * scale;
+
+    // Paint-time element effects (ADR 0024): opacity and 2D transforms
+    // scope the box's whole paint contribution — chrome, replaced content,
+    // controls, text, and children (including their clips, which scale
+    // with the element). Identity opacity and identity transforms emit
+    // nothing, so pre-existing documents paint byte-identically.
+    let opacity_scope = style.opacity < 1.0;
+    let transform_scope = !style.transform.is_identity();
+    if opacity_scope {
+        list.items
+            .push(DisplayItem::PushOpacity(style.opacity.clamp(0.0, 1.0)));
+    }
+    if transform_scope {
+        let matrix = element_transform_matrix(node, scale);
+        list.items.push(DisplayItem::PushTransform { matrix });
+    }
 
     // Own chrome (background, border): the painter applies the current
     // clip stack, which at this point is the ancestors' clips.
@@ -749,14 +828,24 @@ fn emit_box(
                 list.items.push(DisplayItem::PushClip(node.padding_box));
             }
             let (ox, oy) = node.applied_scroll;
-            list.items
-                .push(DisplayItem::PushTransform { x: -ox, y: -oy });
+            list.items.push(DisplayItem::PushTransform {
+                matrix: Affine2D::translation(-ox, -oy),
+            });
             for child in &node.children {
                 emit_box(child, list, Some(node.padding_box), scale, controls);
             }
             list.items.push(DisplayItem::PopTransform);
             list.items.push(DisplayItem::PopClip);
         }
+    }
+
+    // Close the paint-time effect scopes opened at the top (ADR 0024) in
+    // reverse (innermost first).
+    if transform_scope {
+        list.items.push(DisplayItem::PopTransform);
+    }
+    if opacity_scope {
+        list.items.push(DisplayItem::PopOpacity);
     }
 }
 
@@ -981,6 +1070,7 @@ mod tests {
             scroll_offsets,
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let mut facts = LayoutFacts {
@@ -1100,6 +1190,7 @@ mod tests {
             &Vec::new(),
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1156,6 +1247,7 @@ mod tests {
             &Vec::new(),
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let list = &laid.display_list;
@@ -1462,6 +1554,7 @@ mod tests {
             &Vec::new(),
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1636,6 +1729,7 @@ mod tests {
             &vec![(Some(pane_node), (500.0, -25.0))],
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let pane = &laid.root.children[0];
@@ -1651,6 +1745,7 @@ mod tests {
             &Vec::new(),
             None,
             &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         assert_eq!(plain.root.children[0].applied_scroll, (0.0, 0.0));

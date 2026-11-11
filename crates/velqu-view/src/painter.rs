@@ -14,7 +14,7 @@
 //! * frame buffers are pixel-bounded upstream and allocated fallibly.
 
 use crate::color::Color;
-use crate::display_list::{DisplayItem, DisplayList, Rect};
+use crate::display_list::{Affine2D, DisplayItem, DisplayList, Rect};
 use crate::font::FontStore;
 use crate::viewport::Viewport;
 use crate::{Frame, VelquError};
@@ -57,8 +57,10 @@ pub(crate) fn paint_document(
         glyphs: 0,
         items: 0,
         clip: Vec::new(),
-        offset: (0.0, 0.0),
-        offset_stack: Vec::new(),
+        transform: Affine2D::IDENTITY,
+        transform_stack: Vec::new(),
+        opacity: 1.0,
+        opacity_stack: Vec::new(),
     };
 
     for item in &list.items {
@@ -113,8 +115,10 @@ pub(crate) fn paint_document(
                 ctx.draw_image(rect, image);
                 ctx.items += 1;
             }
-            DisplayItem::PushTransform { x, y } => ctx.push_transform(*x, *y),
+            DisplayItem::PushTransform { matrix } => ctx.push_transform(*matrix),
             DisplayItem::PopTransform => ctx.pop_transform(),
+            DisplayItem::PushOpacity(alpha) => ctx.push_opacity(*alpha),
+            DisplayItem::PopOpacity => ctx.pop_opacity(),
         }
     }
 
@@ -137,10 +141,14 @@ struct PaintCtx<'a> {
     /// inside all of them; balanced push/pop emission keeps the stack
     /// correct for nesting).
     clip: Vec<ClipShape>,
-    /// Current translation (accumulated scroll transforms, ADR 0008) plus
-    /// the saved offsets of enclosing scopes.
-    offset: (f32, f32),
-    offset_stack: Vec<(f32, f32)>,
+    /// Current transform (accumulated scroll + element transforms, ADR
+    /// 0008/0024) plus the saved transforms of enclosing scopes.
+    transform: Affine2D,
+    transform_stack: Vec<Affine2D>,
+    /// Current cumulative source opacity (ADR 0024) plus the saved values
+    /// of enclosing scopes.
+    opacity: f32,
+    opacity_stack: Vec<f32>,
 }
 
 /// One active clip scope: a rectangle in device pixels, optionally with
@@ -152,34 +160,55 @@ struct ClipShape {
 }
 
 impl PaintCtx<'_> {
-    /// Enters a transform scope: items are translated by `(x, y)` until the
-    /// matching `pop_transform`.
-    fn push_transform(&mut self, x: f32, y: f32) {
-        self.offset_stack.push(self.offset);
-        self.offset.0 += x;
-        self.offset.1 += y;
+    /// Enters a transform scope: items are mapped by `matrix` after (inside)
+    /// the enclosing transform until the matching `pop_transform`.
+    fn push_transform(&mut self, matrix: Affine2D) {
+        self.transform_stack.push(self.transform);
+        self.transform = self.transform.compose(&matrix);
     }
 
     /// Leaves the innermost transform scope, restoring the enclosing
-    /// translation. Emission is balanced; a stray pop is a harmless no-op.
+    /// transform. Emission is balanced; a stray pop is a harmless no-op.
     fn pop_transform(&mut self) {
-        if let Some(offset) = self.offset_stack.pop() {
-            self.offset = offset;
+        if let Some(transform) = self.transform_stack.pop() {
+            self.transform = transform;
         }
+    }
+
+    /// Enters an opacity scope: source alpha is multiplied by `alpha`
+    /// (clamped to `[0, 1]`) until the matching `pop_opacity`.
+    fn push_opacity(&mut self, alpha: f32) {
+        self.opacity_stack.push(self.opacity);
+        self.opacity *= alpha.clamp(0.0, 1.0);
+    }
+
+    /// Leaves the innermost opacity scope. Emission is balanced; a stray
+    /// pop is a harmless no-op.
+    fn pop_opacity(&mut self) {
+        if let Some(opacity) = self.opacity_stack.pop() {
+            self.opacity = opacity;
+        }
+    }
+
+    /// Scales a color's alpha by the current opacity scope chain. The
+    /// rounding is deterministic (`f32` multiply + `round`), and identity
+    /// opacity (1.0) passes every alpha through unchanged.
+    fn modulate(&self, color: Color) -> Color {
+        if self.opacity >= 1.0 {
+            return color;
+        }
+        let a = (color.a as f32 * self.opacity).round().clamp(0.0, 255.0) as u8;
+        Color::from_rgba8(color.r, color.g, color.b, a)
     }
 
     /// Pushes a clip scope. Clip shapes live in the space of the scope
     /// they are pushed in (scroll containers clip in parent space), so the
-    /// current translation applies.
+    /// current transform applies. Corner radii scale by the transform's
+    /// scale factor (equal-axis scales only, per ADR 0024).
     fn push_clip(&mut self, rect: Rect, radius: f32) {
         self.clip.push(ClipShape {
-            rect: Rect {
-                x: rect.x + self.offset.0,
-                y: rect.y + self.offset.1,
-                w: rect.w,
-                h: rect.h,
-            },
-            radius: radius.max(0.0),
+            rect: self.transform.apply_rect(&rect),
+            radius: (radius * self.transform.scale_factor()).max(0.0),
         });
     }
 
@@ -209,19 +238,36 @@ impl PaintCtx<'_> {
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
-        // Rects arrive in layout space; the current translation (scroll
-        // scopes) applies before edge snapping.
-        let x = x + self.offset.0;
-        let y = y + self.offset.1;
-        // Snap the edges only.
-        let x0 = x.round().max(0.0) as u32;
-        let y0 = y.round().max(0.0) as u32;
-        let x1 = (x + w).round().clamp(0.0, self.width as f32) as u32;
-        let y1 = (y + h).round().clamp(0.0, self.height as f32) as u32;
-        for py in y0..y1 {
-            for px in x0..x1 {
-                if self.clip_contains(px as i64, py as i64) {
-                    self.blend_pixel(px as usize, py as usize, color);
+        let color = self.modulate(color);
+        if self.transform.is_axis_aligned() {
+            let placed = self.transform.apply_rect(&Rect { x, y, w, h });
+            let x0 = placed.x.round().max(0.0) as u32;
+            let y0 = placed.y.round().max(0.0) as u32;
+            let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as u32;
+            let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as u32;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if self.clip_contains(px as i64, py as i64) {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
+                }
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            let (x0, y0, x1, y1) = transform_bounds(
+                &self.transform,
+                &Rect { x, y, w, h },
+                self.width,
+                self.height,
+            );
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py as i64) {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
+                    if lx >= x && lx < x + w && ly >= y && ly < y + h {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
                 }
             }
         }
@@ -230,27 +276,40 @@ impl PaintCtx<'_> {
     /// Fills a rounded rectangle: same edge snapping as `fill_rect`, with
     /// per-pixel shape coverage (pixel **center** inside the rounded
     /// bounds). No anti-aliasing — coverage is a strict in/out test, so
-    /// results are deterministic.
+    /// results are deterministic. The corner radius scales with the
+    /// transform (ADR 0024). Rotated shapes sample via inverse transform mapping.
     fn fill_rounded(&mut self, rect: &Rect, radius: f32, color: Color) {
-        let placed = Rect {
-            x: rect.x + self.offset.0,
-            y: rect.y + self.offset.1,
-            w: rect.w,
-            h: rect.h,
-        };
-        let x0 = placed.x.round().max(0.0) as i64;
-        let y0 = placed.y.round().max(0.0) as i64;
-        let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
-        let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
-        for py in y0..y1 {
-            for px in x0..x1 {
-                if !self.clip_contains(px, py) {
-                    continue;
+        let color = self.modulate(color);
+        if self.transform.is_axis_aligned() {
+            let placed = self.transform.apply_rect(rect);
+            let radius = radius * self.transform.scale_factor();
+            let x0 = placed.x.round().max(0.0) as i64;
+            let y0 = placed.y.round().max(0.0) as i64;
+            let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
+            let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    if point_in_rounded_rect(cx, cy, &placed, radius) {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
                 }
-                let cx = px as f32 + 0.5;
-                let cy = py as f32 + 0.5;
-                if point_in_rounded_rect(cx, cy, &placed, radius) {
-                    self.blend_pixel(px as usize, py as usize, color);
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            let (x0, y0, x1, y1) = transform_bounds(&self.transform, rect, self.width, self.height);
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py as i64) {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
+                    if point_in_rounded_rect(lx, ly, rect, radius) {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
                 }
             }
         }
@@ -259,7 +318,7 @@ impl PaintCtx<'_> {
     /// Fills a rounded border ring: pixels inside the outer rounded shape
     /// and outside the inner one. Inner corner radii are the outer radius
     /// minus the adjacent border widths (clamped at 0), so uneven borders
-    /// keep a sensible ring.
+    /// keep a sensible ring. Transforms map both edges (ADR 0024).
     fn fill_rounded_ring(
         &mut self,
         outer: &Rect,
@@ -268,37 +327,54 @@ impl PaintCtx<'_> {
         inner_radii: &[f32; 4],
         color: Color,
     ) {
-        let placed_outer = Rect {
-            x: outer.x + self.offset.0,
-            y: outer.y + self.offset.1,
-            w: outer.w,
-            h: outer.h,
-        };
-        let placed_inner = Rect {
-            x: inner.x + self.offset.0,
-            y: inner.y + self.offset.1,
-            w: inner.w,
-            h: inner.h,
-        };
-        let x0 = placed_outer.x.round().max(0.0) as i64;
-        let y0 = placed_outer.y.round().max(0.0) as i64;
-        let x1 = (placed_outer.x + placed_outer.w)
-            .round()
-            .clamp(0.0, self.width as f32) as i64;
-        let y1 = (placed_outer.y + placed_outer.h)
-            .round()
-            .clamp(0.0, self.height as f32) as i64;
-        for py in y0..y1 {
-            for px in x0..x1 {
-                if !self.clip_contains(px, py) {
-                    continue;
+        let color = self.modulate(color);
+        if self.transform.is_axis_aligned() {
+            let scale = self.transform.scale_factor();
+            let placed_outer = self.transform.apply_rect(outer);
+            let placed_inner = self.transform.apply_rect(inner);
+            let radius = radius * scale;
+            let inner_radii = [
+                inner_radii[0] * scale,
+                inner_radii[1] * scale,
+                inner_radii[2] * scale,
+                inner_radii[3] * scale,
+            ];
+            let x0 = placed_outer.x.round().max(0.0) as i64;
+            let y0 = placed_outer.y.round().max(0.0) as i64;
+            let x1 = (placed_outer.x + placed_outer.w)
+                .round()
+                .clamp(0.0, self.width as f32) as i64;
+            let y1 = (placed_outer.y + placed_outer.h)
+                .round()
+                .clamp(0.0, self.height as f32) as i64;
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    let in_outer = point_in_rounded_rect(cx, cy, &placed_outer, radius);
+                    let in_inner = point_in_rounded_rect4(cx, cy, &placed_inner, &inner_radii);
+                    if in_outer && !in_inner {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
                 }
-                let cx = px as f32 + 0.5;
-                let cy = py as f32 + 0.5;
-                let in_outer = point_in_rounded_rect(cx, cy, &placed_outer, radius);
-                let in_inner = point_in_rounded_rect4(cx, cy, &placed_inner, inner_radii);
-                if in_outer && !in_inner {
-                    self.blend_pixel(px as usize, py as usize, color);
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            let (x0, y0, x1, y1) =
+                transform_bounds(&self.transform, outer, self.width, self.height);
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py as i64) {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
+                    let in_outer = point_in_rounded_rect(lx, ly, outer, radius);
+                    let in_inner = point_in_rounded_rect4(lx, ly, inner, inner_radii);
+                    if in_outer && !in_inner {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
                 }
             }
         }
@@ -306,51 +382,89 @@ impl PaintCtx<'_> {
 
     /// Blits a decoded image into `rect` with nearest-neighbor sampling
     /// (`object-fit: fill`). Edges snap like fills; source indices come from
-    /// integer math only, so sampling is deterministic across runs.
+    /// integer math only, so sampling is deterministic across runs. The
+    /// transform maps the destination rect (ADR 0024).
     fn draw_image(&mut self, rect: &Rect, image: &crate::image::DecodedImage) {
-        let x = rect.x + self.offset.0;
-        let y = rect.y + self.offset.1;
-        let x0 = x.round().max(0.0) as i64;
-        let y0 = y.round().max(0.0) as i64;
-        let x1 = (x + rect.w).round().clamp(0.0, self.width as f32) as i64;
-        let y1 = (y + rect.h).round().clamp(0.0, self.height as f32) as i64;
-        let dst_w = (x1 - x0).max(1);
-        let dst_h = (y1 - y0).max(1);
         let src_w = i64::from(image.width.max(1));
         let src_h = i64::from(image.height.max(1));
-        for dy in y0..y1 {
-            let sy = ((dy - y0) * src_h / dst_h) as usize;
-            for dx in x0..x1 {
-                if !self.clip_contains(dx, dy) {
-                    continue;
+        if self.transform.is_axis_aligned() {
+            let placed = self.transform.apply_rect(rect);
+            let x0 = placed.x.round().max(0.0) as i64;
+            let y0 = placed.y.round().max(0.0) as i64;
+            let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
+            let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
+            let dst_w = (x1 - x0).max(1);
+            let dst_h = (y1 - y0).max(1);
+            for dy in y0..y1 {
+                let sy = ((dy - y0) * src_h / dst_h) as usize;
+                for dx in x0..x1 {
+                    if !self.clip_contains(dx, dy) {
+                        continue;
+                    }
+                    let sx = ((dx - x0) * src_w / dst_w) as usize;
+                    let i = (sy * src_w as usize + sx) * 4;
+                    let color = self.modulate(Color::from_rgba8(
+                        image.rgba[i],
+                        image.rgba[i + 1],
+                        image.rgba[i + 2],
+                        image.rgba[i + 3],
+                    ));
+                    self.blend_pixel(dx as usize, dy as usize, color);
                 }
-                let sx = ((dx - x0) * src_w / dst_w) as usize;
-                let i = (sy * src_w as usize + sx) * 4;
-                let color = Color::from_rgba8(
-                    image.rgba[i],
-                    image.rgba[i + 1],
-                    image.rgba[i + 2],
-                    image.rgba[i + 3],
-                );
-                self.blend_pixel(dx as usize, dy as usize, color);
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            let (x0, y0, x1, y1) = transform_bounds(&self.transform, rect, self.width, self.height);
+            let rect_w = rect.w.max(1.0);
+            let rect_h = rect.h.max(1.0);
+            for py in y0..y1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py as i64) {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
+                    if lx >= rect.x && lx < rect.x + rect.w && ly >= rect.y && ly < rect.y + rect.h
+                    {
+                        let sx = (((lx - rect.x) / rect_w * src_w as f32) as i64)
+                            .clamp(0, src_w - 1) as usize;
+                        let sy = (((ly - rect.y) / rect_h * src_h as f32) as i64)
+                            .clamp(0, src_h - 1) as usize;
+                        let i = (sy * src_w as usize + sx) * 4;
+                        let color = self.modulate(Color::from_rgba8(
+                            image.rgba[i],
+                            image.rgba[i + 1],
+                            image.rgba[i + 2],
+                            image.rgba[i + 3],
+                        ));
+                        self.blend_pixel(px as usize, py as usize, color);
+                    }
+                }
             }
         }
     }
 
     /// Draws one run: glyphs are placed so the run's *baseline* sits at
     /// `run.baseline_y`, matching the layout pass's line-box centering.
-    /// Pixels outside the active clip are skipped.
+    /// Pixels outside the active clip are skipped. Under a scaled
+    /// transform (ADR 0024) the pen position maps through the matrix and
+    /// the raster size scales by the transform's scale factor (rounded to
+    /// a whole-pixel size — fontdue's deterministic whole-pixel contract).
     fn draw_text(&mut self, fonts: &mut FontStore, run: &TextRunPlacement<'_>) {
         let weight = if run.bold {
             crate::font::FontWeight::Bold
         } else {
             crate::font::FontWeight::Regular
         };
-        let mut pen_x = run.x.round() + self.offset.0;
-        let baseline = run.baseline_y.round() + self.offset.1;
+        let scale = self.transform.scale_factor();
+        let (pen_start, baseline_start) = self
+            .transform
+            .apply_point(run.x.round(), run.baseline_y.round());
+        let px = (run.px as f32 * scale).round().max(1.0) as u16;
+        let color = self.modulate(run.color);
+        let mut pen_x = pen_start;
+        let baseline = baseline_start;
         for ch in run.text.chars() {
-            let glyph = fonts.glyph(weight, ch, run.px);
-            let advance = glyph.advance;
+            let glyph = fonts.glyph(weight, ch, px);
+            let advance = glyph.advance * scale;
             let bitmap_left = pen_x as i64 + glyph.xmin as i64;
             let bitmap_top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
             for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
@@ -366,12 +480,8 @@ impl PaintCtx<'_> {
                     if !self.clip_contains(dx, dy) {
                         continue;
                     }
-                    let shade = Color::from_rgba8(
-                        run.color.r,
-                        run.color.g,
-                        run.color.b,
-                        scale_u8(*alpha, run.color.a),
-                    );
+                    let shade =
+                        Color::from_rgba8(color.r, color.g, color.b, scale_u8(*alpha, color.a));
                     self.blend_pixel(dx as usize, dy as usize, shade);
                 }
             }
@@ -472,4 +582,26 @@ fn point_in_rounded_rect4(x: f32, y: f32, rect: &Rect, radii: &[f32; 4]) -> bool
 /// Coverage-to-alpha scaling that stays exact at the ends (0, 255).
 fn scale_u8(a: u8, b: u8) -> u8 {
     ((a as u16 * b as u16 + 127) / 255) as u8
+}
+
+/// Computes the pixel bounds of a transformed rectangle, clamped to the viewport.
+fn transform_bounds(
+    transform: &Affine2D,
+    rect: &Rect,
+    viewport_w: u32,
+    viewport_h: u32,
+) -> (u32, u32, u32, u32) {
+    let p0 = transform.apply_point(rect.x, rect.y);
+    let p1 = transform.apply_point(rect.x + rect.w, rect.y);
+    let p2 = transform.apply_point(rect.x + rect.w, rect.y + rect.h);
+    let p3 = transform.apply_point(rect.x, rect.y + rect.h);
+    let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
+    let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
+    let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
+    let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
+    let x0 = min_x.floor().max(0.0) as u32;
+    let y0 = min_y.floor().max(0.0) as u32;
+    let x1 = max_x.ceil().clamp(0.0, viewport_w as f32) as u32;
+    let y1 = max_y.ceil().clamp(0.0, viewport_h as f32) as u32;
+    (x0, y0, x1, y1)
 }

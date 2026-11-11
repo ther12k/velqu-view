@@ -29,6 +29,9 @@ struct Args {
     scale: f32,
     out: Option<PathBuf>,
     frames: u32,
+    /// Headless animation stepping (ADR 0024): advance the renderer's
+    /// virtual clock by N ms before each frame.
+    step_ms: Option<u64>,
     exit_after: Option<Duration>,
     tailwind: bool,
     reactive: bool,
@@ -60,6 +63,9 @@ OPTIONS:
     --size WxH         Logical viewport size (default 1024x640)
     --scale F          DPI scale factor (default 1.0)
     --frames N         Headless: render N frames and verify determinism (default 1)
+    --step-ms N        Headless: advance the animation clock N ms per frame
+                       (ADR 0024); the frame sequence is verified by running
+                       it twice and comparing every hash
     --out PATH         Headless: PNG output path (default <APP_DIR>/out/frame.png)
     --exit-after-ms N  Window: auto-close after N milliseconds (smoke tests)
     -h, --help         Print this help
@@ -73,6 +79,7 @@ fn parse_args() -> Result<Args, String> {
         scale: 1.0,
         out: None,
         frames: 1,
+        step_ms: None,
         exit_after: None,
         tailwind: false,
         reactive: false,
@@ -115,6 +122,16 @@ fn parse_args() -> Result<Args, String> {
                 if args.frames == 0 {
                     return Err("frame count must be >= 1".into());
                 }
+            }
+            "--step-ms" => {
+                let value = argv.next().ok_or("--step-ms requires a duration")?;
+                let ms = value
+                    .parse()
+                    .map_err(|_| format!("invalid step-ms duration {value:?}"))?;
+                if ms == 0 {
+                    return Err("step-ms must be >= 1".into());
+                }
+                args.step_ms = Some(ms);
             }
             "--out" => {
                 let value = argv.next().ok_or("--out requires a path")?;
@@ -377,28 +394,52 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
     let physical = |logical: u32| (logical as f32 * args.scale).round() as u32;
     let viewport = Viewport::try_new(physical(args.size.0), physical(args.size.1), args.scale)
         .map_err(|e| e.to_string())?;
-    let mut hashes: Vec<String> = Vec::new();
-    let mut durations: Vec<Duration> = Vec::new();
-    let mut first: Option<velqu_view::FrameResult> = None;
-    for _ in 0..args.frames {
-        // One pump per frame, mirroring the shell's redraw order (M5c):
-        // drain the queue into a batch, pump the batch (M6a ownership,
-        // ADR 0019), then render. Turn-zero mutations land before the
-        // first render; drained batches are not re-observed here.
-        let batch = view.take_events();
-        view.pump_reactive(&batch);
-        drop(batch);
-        let started = Instant::now();
-        let result = view.render(viewport).map_err(|e| e.to_string())?;
-        durations.push(started.elapsed());
-        hashes.push(result.frame.sha256_hex());
-        if first.is_none() {
-            first = Some(result);
-        }
-    }
-    let first = first.expect("frames >= 1");
 
-    let identical = hashes.iter().filter(|h| **h == hashes[0]).count();
+    // One frame sequence: pump (the shell's redraw order, M5c), step the
+    // animation clock when `--step-ms` drives it (ADR 0024), render.
+    let step = args.step_ms.map(Duration::from_millis);
+    let run_sequence = |view: &mut VelquView| -> Result<
+        (Vec<String>, Vec<Duration>, velqu_view::FrameResult),
+        String,
+    > {
+        let mut hashes: Vec<String> = Vec::new();
+        let mut durations: Vec<Duration> = Vec::new();
+        let mut first: Option<velqu_view::FrameResult> = None;
+        for _ in 0..args.frames {
+            let batch = view.take_events();
+            view.pump_reactive(&batch);
+            drop(batch);
+            if let Some(step) = step {
+                view.step_animations_by(step);
+            }
+            let started = Instant::now();
+            let result = view.render(viewport).map_err(|e| e.to_string())?;
+            durations.push(started.elapsed());
+            hashes.push(result.frame.sha256_hex());
+            if first.is_none() {
+                first = Some(result);
+            }
+        }
+        Ok((hashes, durations, first.expect("frames >= 1")))
+    };
+
+    let (hashes, durations, first) = run_sequence(view)?;
+    // With animation stepping, frames legitimately differ mid-flight;
+    // determinism is proven by re-running the exact sequence on a fresh
+    // load and comparing every hash (ADR 0024: identical schedules
+    // produce identical bytes). Without stepping, a static document must
+    // render identical frames outright.
+    let (identical, sequence_reproducible) = if step.is_some() {
+        load_app(view, &args.app_dir)?;
+        let (repeat_hashes, _, _) = run_sequence(view)?;
+        let reproducible = repeat_hashes == hashes;
+        (
+            hashes.iter().filter(|h| **h == hashes[0]).count(),
+            reproducible,
+        )
+    } else {
+        (hashes.iter().filter(|h| **h == hashes[0]).count(), true)
+    };
     println!(
         "app: {} (html {}, css {} sheet(s))",
         args.app_dir.display(),
@@ -447,7 +488,16 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
         }
     }
     println!("sha256: {}", hashes[0]);
-    if args.frames > 1 {
+    if step.is_some() {
+        println!(
+            "determinism: frame sequence {} across two fresh runs",
+            if sequence_reproducible {
+                "reproduced"
+            } else {
+                "DIVERGED"
+            }
+        );
+    } else if args.frames > 1 {
         println!("determinism: {identical}/{} frames identical", args.frames);
     }
     let avg = durations.iter().sum::<Duration>() / durations.len() as u32;
@@ -470,7 +520,11 @@ fn run_headless(args: &Args, view: &mut VelquView) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     println!("png: {}", out.display());
 
-    if identical != hashes.len() {
+    if step.is_some() {
+        if !sequence_reproducible {
+            return Err("determinism check FAILED: frame sequence diverged across runs".into());
+        }
+    } else if identical != hashes.len() {
         return Err("determinism check FAILED: frames differ".into());
     }
     Ok(())

@@ -201,7 +201,25 @@ pub const PROFILE_V0: CssProfile = CssProfile {
         FeatureArea {
             slug: "transform",
             title: "Transform",
-            properties: &["transform", "translate", "scale", "rotate"],
+            properties: &[
+                "transform",
+                "translate",
+                "scale",
+                "rotate",
+                "transform-origin",
+            ],
+        },
+        FeatureArea {
+            slug: "transition",
+            title: "Transition",
+            properties: &[
+                "transition",
+                "transition-property",
+                "transition-duration",
+                "transition-timing-function",
+                "transition-delay",
+                "animation",
+            ],
         },
     ],
     deferred: &[
@@ -368,6 +386,57 @@ pub fn classify_declaration(property: &str, value: &str) -> Classification {
                 Classification::tier(Compatibility::Supported)
             }
         }
+        "transition-property" => {
+            // Comma-separated animatable names, `all`, or `none`. The
+            // renderer's transition engine owns the final say (properties it
+            // cannot interpolate fall back to an instant jump with a
+            // diagnostic); classification only vets the shape.
+            if value == "none" || value == "all" || !value.is_empty() {
+                Classification::tier(Compatibility::Supported)
+            } else {
+                Classification::tier(Compatibility::Unsupported)
+            }
+        }
+        "transition-duration" | "transition-delay" => {
+            // One or more comma-separated non-negative times (ms/s).
+            let times_ok = value.split(',').all(|time| {
+                let time = time.trim();
+                match (time.strip_suffix("ms"), time.strip_suffix('s')) {
+                    (Some(ms), None) => ms.parse::<f32>().is_ok_and(|v| v >= 0.0),
+                    (None, Some(s)) => s.parse::<f32>().is_ok_and(|v| v >= 0.0),
+                    _ => false,
+                }
+            });
+            if times_ok && !value.is_empty() {
+                Classification::tier(Compatibility::Supported)
+            } else {
+                Classification::tier(Compatibility::Unsupported)
+            }
+        }
+        "transition-timing-function" => {
+            // Named curves, linear, or cubic-bezier(x1, y1, x2, y2) with
+            // x ordinates in [0, 1] (CSS requires it; the solver relies on it).
+            let named = matches!(
+                value.as_str(),
+                "linear" | "ease" | "ease-in" | "ease-out" | "ease-in-out"
+            );
+            let bezier = value.starts_with("cubic-bezier(") && value.ends_with(')') && {
+                let args: Vec<f32> = value["cubic-bezier(".len()..value.len() - 1]
+                    .split(',')
+                    .filter_map(|arg| arg.trim().parse::<f32>().ok())
+                    .collect();
+                args.len() == 4
+                    && args[0] >= 0.0
+                    && args[0] <= 1.0
+                    && args[2] >= 0.0
+                    && args[2] <= 1.0
+            };
+            if named || bezier {
+                Classification::tier(Compatibility::Supported)
+            } else {
+                Classification::tier(Compatibility::Unsupported)
+            }
+        }
         _ if COLOR_PROPERTIES.contains(&property.as_str()) => {
             if value.contains("oklch(")
                 || value.contains("oklab(")
@@ -395,7 +464,7 @@ pub fn classify_declaration(property: &str, value: &str) -> Classification {
 /// pointer move can never invalidate layout. The renderer's cascade
 /// defers everything else inside stateful rules with a diagnostic; the
 /// checker reports the same verdict.
-pub const INTERACTION_PAINT_PROPERTIES: [&str; 7] = [
+pub const INTERACTION_PAINT_PROPERTIES: [&str; 11] = [
     "background-color",
     "background",
     "color",
@@ -403,6 +472,12 @@ pub const INTERACTION_PAINT_PROPERTIES: [&str; 7] = [
     "border-style",
     "border-radius",
     "cursor",
+    // Transition-engine paint properties (ADR 0024): opacity, 2D
+    // transforms, origin, and animation repaint without layout.
+    "opacity",
+    "transform",
+    "transform-origin",
+    "animation",
 ];
 
 /// Is this property inside [`INTERACTION_PAINT_PROPERTIES`]?
