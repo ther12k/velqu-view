@@ -770,6 +770,15 @@ impl VelquView {
         self.images.clear();
     }
 
+    /// Clears the decoded-image cache. Call after replacing an image
+    /// file that an `<img>` references by an unchanged `src` (e.g. a
+    /// host-generated album-art slot): the next render re-resolves and
+    /// re-decodes every image. Paint-only; no layout pass.
+    pub fn clear_images(&mut self) {
+        self.images.clear();
+        self.presentation_dirty = true;
+    }
+
     /// Deterministic diagnostics about `<img>` assets from the last render
     /// or layout pass, in document order (ADR 0008). A broken or missing
     /// image still lays out — at the default object size — so this list is
