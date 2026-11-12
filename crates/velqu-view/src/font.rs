@@ -25,6 +25,10 @@ pub(crate) enum FontWeight {
 const DEJAVU_SANS: &[u8] = include_bytes!("../assets/fonts/DejaVuSans.ttf");
 const DEJAVU_SANS_BOLD: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");
 
+/// Indices of the two always-present default faces in [`FontStore::faces`].
+pub(crate) const DEFAULT_REGULAR: usize = 0;
+pub(crate) const DEFAULT_BOLD: usize = 1;
+
 /// A rasterized glyph bitmap plus its placement metrics, in device pixels.
 pub(crate) struct Glyph {
     /// Whole-pixel offset of the bitmap's left edge from the pen position.
@@ -43,15 +47,20 @@ pub(crate) struct Glyph {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct GlyphKey {
-    weight: FontWeight,
+    face: usize,
     ch: char,
     px: u16,
 }
 
-/// The renderer's font set: two bundled faces plus a glyph cache.
+/// The renderer's font set: the two bundled default faces, any faces the
+/// host registered by family name, and a glyph cache.
+///
+/// Faces live in a flat `Vec` (index = cache key component); the `ids`
+/// map resolves `(family, bold)` to an index once per text run, so the
+/// per-glyph hot path stays a plain integer lookup.
 pub(crate) struct FontStore {
-    regular: Font,
-    bold: Font,
+    faces: Vec<Font>,
+    ids: HashMap<(String, bool), usize>,
     cache: HashMap<GlyphKey, Glyph>,
 }
 
@@ -62,18 +71,66 @@ impl FontStore {
         // settings on every load keep rasterization reproducible.
         let settings = fontdue::FontSettings::default();
         Self {
-            regular: Font::from_bytes(DEJAVU_SANS, settings)
-                .expect("bundled DejaVuSans.ttf is valid"),
-            bold: Font::from_bytes(DEJAVU_SANS_BOLD, settings)
-                .expect("bundled DejaVuSans-Bold.ttf is valid"),
+            faces: vec![
+                Font::from_bytes(DEJAVU_SANS, settings).expect("bundled DejaVuSans.ttf is valid"),
+                Font::from_bytes(DEJAVU_SANS_BOLD, settings)
+                    .expect("bundled DejaVuSans-Bold.ttf is valid"),
+            ],
+            ids: HashMap::new(),
             cache: HashMap::new(),
         }
     }
 
-    fn face(&self, weight: FontWeight) -> &Font {
-        match weight {
-            FontWeight::Regular => &self.regular,
-            FontWeight::Bold => &self.bold,
+    /// Registers a TTF/OTF face under `family` (matched case-insensitively
+    /// at resolution time; the stored key is lowercased here). Re-registering
+    /// the same `(family, bold)` slot replaces the face in place — indices
+    /// (and therefore glyph cache keys) stay stable. Invalid font data is an
+    /// error; the previous face (if any) is untouched.
+    pub(crate) fn register(&mut self, family: &str, data: &[u8], bold: bool) -> Result<(), String> {
+        let key = (family.to_ascii_lowercase(), bold);
+        if let Some(&index) = self.ids.get(&key) {
+            let font = Font::from_bytes(data, fontdue::FontSettings::default())
+                .map_err(|error| format!("font '{family}' (bold={bold}): {error}"))?;
+            self.faces[index] = font;
+            self.cache.clear();
+            return Ok(());
+        }
+        let font = Font::from_bytes(data, fontdue::FontSettings::default())
+            .map_err(|error| format!("font '{family}' (bold={bold}): {error}"))?;
+        let index = self.faces.len();
+        self.faces.push(font);
+        self.ids.insert(key, index);
+        Ok(())
+    }
+
+    /// Resolves `(family, weight)` to a face index. Unknown families and
+    /// `None` fall back to the bundled DejaVu face for the weight, so a
+    /// typo in `font-family` can never panic or change metrics silently
+    /// beyond the default.
+    pub(crate) fn face_index(&self, family: Option<&str>, weight: FontWeight) -> usize {
+        let bold = weight == FontWeight::Bold;
+        match family {
+            Some(name) if !name.is_empty() => {
+                let key = (name.to_ascii_lowercase(), bold);
+                match self.ids.get(&key) {
+                    Some(&index) => index,
+                    // No bold face registered for the family: use its
+                    // regular face rather than falling back to DejaVu.
+                    None if bold => self
+                        .ids
+                        .get(&(name.to_ascii_lowercase(), false))
+                        .copied()
+                        .unwrap_or(DEFAULT_BOLD),
+                    None => DEFAULT_REGULAR,
+                }
+            }
+            _ => {
+                if bold {
+                    DEFAULT_BOLD
+                } else {
+                    DEFAULT_REGULAR
+                }
+            }
         }
     }
 
@@ -81,21 +138,18 @@ impl FontStore {
     /// Unused since layout centers text with constant metric ratios (layout.rs);
     /// kept for the M2b text overhaul which needs real font metrics.
     #[allow(dead_code)]
-    pub(crate) fn ascent(&self, weight: FontWeight, px: u16) -> f32 {
-        self.face(weight)
+    pub(crate) fn ascent(&self, face: usize, px: u16) -> f32 {
+        self.faces[face]
             .vertical_line_metrics(px as f32)
             .map(|line| line.ascent)
             .unwrap_or(px as f32 * 0.8)
     }
 
-    /// Ascent (distance above the baseline) in device pixels; unused since the
-    /// layout pass centers text with constant metric ratios (see layout.rs).
-    #[allow(dead_code)]
-    /// Returns the rasterized glyph for `ch`, caching by weight + pixel size.
-    pub(crate) fn glyph(&mut self, weight: FontWeight, ch: char, px: u16) -> &Glyph {
-        let key = GlyphKey { weight, ch, px };
+    /// Returns the rasterized glyph for `ch`, caching by face + pixel size.
+    pub(crate) fn glyph(&mut self, face: usize, ch: char, px: u16) -> &Glyph {
+        let key = GlyphKey { face, ch, px };
         if !self.cache.contains_key(&key) {
-            let (metrics, coverage) = self.face(weight).rasterize(ch, px as f32);
+            let (metrics, coverage) = self.faces[face].rasterize(ch, px as f32);
             let glyph = Glyph {
                 xmin: metrics.xmin,
                 ymin: metrics.ymin,
@@ -125,9 +179,9 @@ mod tests {
     #[test]
     fn bundled_faces_rasterize() {
         let mut fonts = FontStore::bundled();
-        for weight in [FontWeight::Regular, FontWeight::Bold] {
-            let g = fonts.glyph(weight, 'V', 16);
-            assert!(g.width > 0 && g.height > 0, "{weight:?} 'V' has a bitmap");
+        for face in [DEFAULT_REGULAR, DEFAULT_BOLD] {
+            let g = fonts.glyph(face, 'V', 16);
+            assert!(g.width > 0 && g.height > 0, "face {face} 'V' has a bitmap");
             assert!(g.advance > 0.0);
             assert!(g.coverage.len() >= g.width * g.height);
         }
@@ -136,8 +190,8 @@ mod tests {
     #[test]
     fn glyph_cache_is_hit_on_second_request() {
         let mut fonts = FontStore::bundled();
-        let first_ptr: *const Glyph = fonts.glyph(FontWeight::Regular, 'a', 12);
-        let second_ptr: *const Glyph = fonts.glyph(FontWeight::Regular, 'a', 12);
+        let first_ptr: *const Glyph = fonts.glyph(DEFAULT_REGULAR, 'a', 12);
+        let second_ptr: *const Glyph = fonts.glyph(DEFAULT_REGULAR, 'a', 12);
         assert_eq!(first_ptr, second_ptr);
     }
 }

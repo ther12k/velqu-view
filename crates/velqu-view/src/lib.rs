@@ -175,6 +175,9 @@ pub enum VelquError {
     DocumentNotLoaded,
     /// A viewport violated its invariants.
     InvalidViewport(InvalidViewport),
+    /// A font registration failed (invalid or unsupported font data).
+    /// The string names the family and the underlying fontdue error.
+    FontRegister(String),
     /// The frame buffer could not be allocated (allocation refused by the
     /// allocator). Viewports are pixel-bounded at construction
     /// ([`MAX_PIXELS`]); this covers the residual OOM path gracefully.
@@ -213,6 +216,9 @@ impl fmt::Display for VelquError {
             }
             VelquError::InvalidScrollOffset { x, y } => {
                 write!(f, "scroll offset must be finite, got ({x}, {y})")
+            }
+            VelquError::FontRegister(detail) => {
+                write!(f, "font registration failed: {detail}")
             }
         }
     }
@@ -770,6 +776,41 @@ impl VelquView {
     /// the only place its failure is reported.
     pub fn image_diagnostics(&self) -> Vec<String> {
         self.image_diagnostics.clone()
+    }
+
+    /// Registers a TTF/OTF face under `family`, selectable with the CSS
+    /// `font-family` property (matched case-insensitively; the first
+    /// family in a comma list wins). `bold` supplies the face used when
+    /// the computed `font-weight` is >= 600; when absent, bold text in
+    /// that family renders with the regular face. Re-registering the
+    /// same family/weight slot replaces the face in place.
+    ///
+    /// Registration invalidates layout: the next render re-measures all
+    /// text. Unregistered or unknown families fall back to the bundled
+    /// DejaVu Sans, so a missing registration can never panic.
+    pub fn register_font(
+        &mut self,
+        family: &str,
+        regular: Vec<u8>,
+        bold: Option<Vec<u8>>,
+    ) -> Result<(), VelquError> {
+        if family.trim().is_empty() {
+            return Err(VelquError::EmptySource { kind: SourceKind::Css });
+        }
+        self.fonts
+            .register(family, &regular, false)
+            .map_err(VelquError::FontRegister)?;
+        if let Some(bold_data) = bold {
+            self.fonts
+                .register(family, &bold_data, true)
+                .map_err(VelquError::FontRegister)?;
+        }
+        // Fonts change text measurement, not just paint.
+        self.mark_structure_dirty();
+        if self.recording() {
+            self.note_structural_cause(&format!("register_font {family}"));
+        }
+        Ok(())
     }
 
     /// Enables the Tailwind utility pipeline (ADR 0009): the document's

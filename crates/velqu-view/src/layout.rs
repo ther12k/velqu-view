@@ -185,6 +185,8 @@ pub(crate) struct RunBox {
     pub px: u16,
     pub bold: bool,
     pub color: Color,
+    /// Normalized `font-family` for this run (`None` = default face).
+    pub family: Option<String>,
     /// Node whose inline content produced this run (for fixture facts).
     pub source: NodeId,
 }
@@ -320,7 +322,117 @@ pub(crate) fn build_boxes(
     }
 
     let mut pending_space_before = false;
+    // Flex containers make a flex item out of every child: contiguous
+    // inline runs become one anonymous block item (CSS Flexbox §4
+    // "anonymous flex items"), never flattened into the container's own
+    // word list — flattening there both drops the box (empty spans) and
+    // reorders content (words paint before/after items arbitrarily).
+    // Grid containers keep the words-in-parent behavior for inline
+    // children (the grid-nested fixture depends on it); block
+    // containers unchanged.
+    let itemifies_children = style.display == Display::Flex;
+    let mut anonymous_run: Option<BoxNode> = None;
+    // Runs of inline content flush here when the parent itemifies.
+    fn flush_anonymous_run(
+        run: &mut Option<BoxNode>,
+        children: &mut Vec<BoxNode>,
+    ) {
+        if let Some(mut item) = run.take() {
+            item.style.display = Display::Block;
+            children.push(item);
+        }
+    }
     for &child in &dom.node(root).children {
+        if itemifies_children {
+            match &dom.node(child).data {
+                NodeData::Element { .. } => {
+                    let display = styles
+                        .get(&child)
+                        .map(|s| s.display)
+                        .unwrap_or(Display::Inline);
+                    match display {
+                        Display::None => {}
+                        Display::Block | Display::Flex | Display::Grid => {
+                            flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                                box_node.children.push(child_box);
+                            }
+                        }
+                        // Replaced elements are real boxes everywhere,
+                        // even where display is inline.
+                        _ if dom.tag_name(child) == Some("img") => {
+                            flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                                box_node.children.push(child_box);
+                            }
+                        }
+                        // An inline element becomes (joins) the current
+                        // anonymous item instead of dissolving into the
+                        // container's words.
+                        _ => {
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                                let run = anonymous_run.get_or_insert_with(|| BoxNode {
+                                    node: root,
+                                    fixture_id: None,
+                                    element_id: None,
+                                    tag: "#anonymous".to_owned(),
+                                    style: style.clone(),
+                                    children: Vec::new(),
+                                    lines: Vec::new(),
+                                    content: Rect::default(),
+                                    padding_box: Rect::default(),
+                                    border_box: Rect::default(),
+                                    margin: crate::style::Sides::default(),
+                                    words: Vec::new(),
+                                    text_origin: None,
+                                    replaced: None,
+                                    control: crate::control::kind_for_node(dom, root),
+                                    scroll: None,
+                                    applied_scroll: (0.0, 0.0),
+                                });
+                                run.children.push(child_box);
+                            }
+                        }
+                    }
+                }
+                NodeData::Text(raw) => {
+                    // Non-whitespace text in an itemifying container gets
+                    // an anonymous block item of its own run.
+                    let collapsed = crate::text::collapse_whitespace(raw);
+                    if collapsed.is_empty() {
+                        continue;
+                    }
+                    let run = anonymous_run.get_or_insert_with(|| BoxNode {
+                        node: root,
+                        fixture_id: None,
+                        element_id: None,
+                        tag: "#anonymous".to_owned(),
+                        style: style.clone(),
+                        children: Vec::new(),
+                        lines: Vec::new(),
+                        content: Rect::default(),
+                        padding_box: Rect::default(),
+                        border_box: Rect::default(),
+                        margin: crate::style::Sides::default(),
+                        words: Vec::new(),
+                        text_origin: None,
+                        replaced: None,
+                        control: crate::control::kind_for_node(dom, root),
+                        scroll: None,
+                        applied_scroll: (0.0, 0.0),
+                    });
+                    append_text_words(
+                        raw,
+                        style.clone(),
+                        child,
+                        &mut run.words,
+                        &mut pending_space_before,
+                    );
+                }
+                _ => {}
+            }
+            continue;
+        }
         match &dom.node(child).data {
             NodeData::Element { .. } => {
                 let display = styles
@@ -364,6 +476,7 @@ pub(crate) fn build_boxes(
             _ => {}
         }
     }
+    flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
     Some(box_node)
 }
 
@@ -790,6 +903,7 @@ fn emit_box(
                 px: run.px,
                 bold: run.bold,
                 color: run.color,
+                family: run.family.clone(),
             });
         }
     }
@@ -1135,7 +1249,7 @@ mod tests {
     fn text_wraps_at_content_width() {
         let mut fonts = FontStore::bundled();
         let mut measure = |word: &str| {
-            crate::text::measure_run(&mut fonts, word, 16, crate::font::FontWeight::Regular)
+            crate::text::measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, word, 16)
         };
         let space = measure(" ");
         // Content width fits "Hello wrapped" but not the third word.
@@ -1253,7 +1367,7 @@ mod tests {
         let list = &laid.display_list;
         let run = &list.text_runs()[0];
         let run_width =
-            crate::text::measure_run(&mut fonts, "hi", 16, crate::font::FontWeight::Regular);
+            crate::text::measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "hi", 16);
         assert!((run.x - (8.0 + (300.0 - run_width) / 2.0)).abs() < 1.0);
     }
 

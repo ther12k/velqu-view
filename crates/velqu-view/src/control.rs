@@ -345,6 +345,7 @@ fn paint_control(
     let style = &node.style;
     let px = (style.font_size * scale).round().max(1.0) as u16;
     let weight = crate::text::face_weight(style.font_weight);
+    let face = fonts.face_index(style.font_family.as_deref(), weight);
     let line_height = line_height(style, scale);
     let content = node.content;
     // The editor paints its effective text: value + composition (M4c3,
@@ -368,10 +369,11 @@ fn paint_control(
         fonts,
         px,
         weight,
+        face,
     );
     let line_widths: Vec<f32> = lines
         .iter()
-        .map(|(start, end, _)| text::measure_run(fonts, &value[*start..*end], px, weight))
+        .map(|(start, end, _)| text::measure_run(fonts, face, &value[*start..*end], px))
         .collect();
 
     let mut scroll_x = state.scroll_offset.0.max(0.0);
@@ -478,8 +480,8 @@ fn paint_control(
             if from >= to {
                 continue;
             }
-            let x0 = prefix_width(&value, *start, from, fonts, px, weight);
-            let x1 = prefix_width(&value, *start, to, fonts, px, weight);
+            let x0 = prefix_width(&value, *start, from, fonts, px, weight, face);
+            let x1 = prefix_width(&value, *start, to, fonts, px, weight, face);
             paint.push(crate::display_list::DisplayItem::FillRect {
                 rect: Rect {
                     x: content.x + x0 - scroll_x,
@@ -498,8 +500,8 @@ fn paint_control(
             if from >= to {
                 continue;
             }
-            let x0 = prefix_width(&value, *start, from, fonts, px, weight);
-            let x1 = prefix_width(&value, *start, to, fonts, px, weight);
+            let x0 = prefix_width(&value, *start, from, fonts, px, weight, face);
+            let x1 = prefix_width(&value, *start, to, fonts, px, weight, face);
             paint.push(crate::display_list::DisplayItem::FillRect {
                 rect: Rect {
                     x: content.x + x0 - scroll_x,
@@ -516,6 +518,7 @@ fn paint_control(
             continue;
         }
         paint.push(crate::display_list::DisplayItem::TextRun {
+            family: style.font_family.clone(),
             x: content.x - scroll_x,
             y: baseline(
                 content.y + line_index as f32 * line_height - scroll_y,
@@ -591,10 +594,12 @@ fn prefix_width(
     fonts: &mut FontStore,
     px: u16,
     weight: FontWeight,
+    face: usize,
 ) -> f32 {
+    let _ = weight;
     let start = start.min(value.len());
     let end = end.clamp(start, value.len());
-    text::measure_run(fonts, &value[start..end], px, weight)
+    text::measure_run(fonts, face, &value[start..end], px)
 }
 
 /// The visible byte range for the current vertical scroll: the union of the
@@ -627,6 +632,7 @@ pub(crate) fn offset_at_point(
 ) -> usize {
     let px = (node.style.font_size * scale).round().max(1.0) as u16;
     let weight = crate::text::face_weight(node.style.font_weight);
+    let face = fonts.face_index(node.style.font_family.as_deref(), weight);
     let height = line_height(&node.style, scale);
     let lines = line_spans(state.value(), state.kind);
     let line_index = (((y - node.content.y + state.scroll_offset.1) / height)
@@ -639,7 +645,7 @@ pub(crate) fn offset_at_point(
     let mut previous = 0.0;
     for (offset, grapheme) in text.grapheme_indices(true) {
         let absolute = start + offset;
-        let width = text::measure_run(fonts, grapheme, px, weight);
+        let width = text::measure_run(fonts, face, grapheme, px);
         if local_x < previous + width / 2.0 {
             return absolute;
         }

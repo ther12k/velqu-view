@@ -449,6 +449,10 @@ pub(crate) struct ComputedStyle {
     pub background_color: Color,
     pub font_size: f32,
     pub font_weight: u16,
+    /// `font-family` first family, normalized (lowercased, unquoted).
+    /// `None` = the bundled default face; unknown families fall back to
+    /// the default at glyph resolution time (font.rs `face_index`).
+    pub font_family: Option<String>,
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
@@ -521,6 +525,7 @@ impl ComputedStyle {
             background_color: Color::TRANSPARENT,
             font_size: 16.0,
             font_weight: 400,
+            font_family: None,
             line_height: LineHeight::Normal,
             text_align: TextAlign::Left,
             white_space: WhiteSpace::Normal,
@@ -798,6 +803,7 @@ impl ComputedStyle {
         self.color = parent.color;
         self.font_size = parent.font_size;
         self.font_weight = parent.font_weight;
+        self.font_family = parent.font_family.clone();
         self.line_height = parent.line_height;
         self.text_align = parent.text_align;
         self.white_space = parent.white_space;
@@ -1211,6 +1217,9 @@ fn apply_declaration(
             }
             _ => diagnostics.push(unsupported("font-weight value")),
         },
+        "font-family" => {
+            style.font_family = normalize_font_family(&declaration.value);
+        }
         "line-height" => match declaration.value.as_str() {
             "normal" => style.line_height = LineHeight::Normal,
             other => {
@@ -2182,6 +2191,27 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
         "transparent" => Color::TRANSPARENT,
         _ => return None,
     })
+}
+
+
+
+/// Normalizes a `font-family` declaration to the first named family:
+/// lowercased, quotes stripped, generic families and lists reduced to
+/// the first entry. `None` = use the bundled default face.
+fn normalize_font_family(value: &str) -> Option<String> {
+    let first = value.split(',').next().unwrap_or("").trim();
+    let unquoted = first.trim_matches(|c| c == '\'' || c == '"').trim();
+    if unquoted.is_empty() {
+        return None;
+    }
+    let lowered = unquoted.to_ascii_lowercase();
+    match lowered.as_str() {
+        // Generic families resolve to the bundled default.
+        "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy"
+        | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace"
+        | "-apple-system" | "inherit" | "initial" | "unset" => None,
+        _ => Some(lowered),
+    }
 }
 
 #[cfg(test)]

@@ -94,6 +94,7 @@ pub(crate) fn paint_document(
                 px,
                 bold,
                 color,
+                family,
             } => {
                 ctx.draw_text(
                     fonts,
@@ -104,6 +105,7 @@ pub(crate) fn paint_document(
                         px: *px,
                         bold: *bold,
                         color: *color,
+                        family,
                     },
                 );
                 ctx.items += 1;
@@ -454,6 +456,7 @@ impl PaintCtx<'_> {
         } else {
             crate::font::FontWeight::Regular
         };
+        let face = fonts.face_index(run.family.as_deref(), weight);
         let scale = self.transform.scale_factor();
         let (pen_start, baseline_start) = self
             .transform
@@ -463,7 +466,7 @@ impl PaintCtx<'_> {
         let mut pen_x = pen_start;
         let baseline = baseline_start;
         for ch in run.text.chars() {
-            let glyph = fonts.glyph(weight, ch, px);
+            let glyph = fonts.glyph(face, ch, px);
             let advance = glyph.advance * scale;
             let bitmap_left = pen_x as i64 + glyph.xmin as i64;
             let bitmap_top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
@@ -499,6 +502,8 @@ struct TextRunPlacement<'a> {
     px: u16,
     bold: bool,
     color: Color,
+    /// Normalized `font-family` (`None` = bundled default face).
+    family: &'a Option<String>,
 }
 
 /// Does the pixel (x, y) sit inside every part of the clip shape? Square

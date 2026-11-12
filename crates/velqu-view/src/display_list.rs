@@ -204,6 +204,8 @@ pub(crate) enum DisplayItem {
         px: u16,
         bold: bool,
         color: Color,
+        /// Normalized `font-family` (`None` = bundled default face).
+        family: Option<String>,
     },
     /// Constrains all items until the matching [`DisplayItem::PopClip`] to
     /// this rectangle (intersected with any enclosing clip).
@@ -273,6 +275,7 @@ impl DisplayList {
                     px,
                     bold,
                     color,
+                    family: _,
                 } => Some(DisplayText {
                     x: *x,
                     y: *y,

@@ -39,9 +39,9 @@ pub(crate) fn collapse_whitespace(text: &str) -> String {
 }
 
 /// Measures one run's advance width in device pixels.
-pub(crate) fn measure_run(fonts: &mut FontStore, text: &str, px: u16, weight: FontWeight) -> f32 {
+pub(crate) fn measure_run(fonts: &mut FontStore, face: usize, text: &str, px: u16) -> f32 {
     text.chars()
-        .map(|ch| fonts.glyph(weight, ch, px).advance)
+        .map(|ch| fonts.glyph(face, ch, px).advance)
         .sum()
 }
 
@@ -49,10 +49,10 @@ pub(crate) fn measure_run(fonts: &mut FontStore, text: &str, px: u16, weight: Fo
 /// occupies its own line (no hyphenation — overflow is allowed and visible).
 pub(crate) fn wrap_lines(
     fonts: &mut FontStore,
+    face: usize,
     text: &str,
     max_width: f32,
     px: u16,
-    weight: FontWeight,
 ) -> Vec<Line> {
     let mut lines = Vec::new();
     for paragraph in text.split('\n') {
@@ -67,11 +67,11 @@ pub(crate) fn wrap_lines(
             }
             continue;
         }
-        let space_width = measure_run(fonts, " ", px, weight);
+        let space_width = measure_run(fonts, face, " ", px);
         let mut current = String::new();
         let mut current_width = 0.0;
         for word in words {
-            let word_width = measure_run(fonts, word, px, weight);
+            let word_width = measure_run(fonts, face, word, px);
             if current.is_empty() {
                 current = word.to_owned();
                 current_width = word_width;
@@ -127,22 +127,22 @@ mod tests {
     #[test]
     fn measurement_is_positive_and_deterministic() {
         let mut fonts = measurer();
-        let a = measure_run(&mut fonts, "Hello Velqu", 16, FontWeight::Regular);
-        let b = measure_run(&mut fonts, "Hello Velqu", 16, FontWeight::Regular);
+        let a = measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "Hello Velqu", 16);
+        let b = measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "Hello Velqu", 16);
         assert!(a > 0.0);
         assert_eq!(a, b);
         // Bold is wider than regular for DejaVu.
-        let bold = measure_run(&mut fonts, "Hello Velqu", 16, FontWeight::Bold);
+        let bold = measure_run(&mut fonts, crate::font::DEFAULT_BOLD, "Hello Velqu", 16);
         assert!(bold > a);
-        assert_eq!(measure_run(&mut fonts, "", 16, FontWeight::Regular), 0.0);
+        assert_eq!(measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "", 16), 0.0);
     }
 
     #[test]
     fn wrapping_breaks_at_word_boundaries() {
         let mut fonts = measurer();
         // Chosen so two words fit and the third wraps.
-        let width = measure_run(&mut fonts, "one two", 16, FontWeight::Regular);
-        let lines = wrap_lines(&mut fonts, "one two three", width, 16, FontWeight::Regular);
+        let width = measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "one two", 16);
+        let lines = wrap_lines(&mut fonts, crate::font::DEFAULT_REGULAR, "one two three", width, 16);
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "one two");
         assert_eq!(lines[1].text, "three");
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn hard_breaks_always_split() {
         let mut fonts = measurer();
-        let lines = wrap_lines(&mut fonts, "a\nb\nc", 1000.0, 16, FontWeight::Regular);
+        let lines = wrap_lines(&mut fonts, crate::font::DEFAULT_REGULAR, "a\nb\nc", 1000.0, 16);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1].text, "b");
     }
@@ -161,10 +161,10 @@ mod tests {
         let mut fonts = measurer();
         let lines = wrap_lines(
             &mut fonts,
+            crate::font::DEFAULT_REGULAR,
             "tiny enormousword",
             10.0,
             16,
-            FontWeight::Regular,
         );
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "tiny");
@@ -174,7 +174,7 @@ mod tests {
     #[test]
     fn empty_text_yields_single_empty_line() {
         let mut fonts = measurer();
-        let lines = wrap_lines(&mut fonts, "", 100.0, 16, FontWeight::Regular);
+        let lines = wrap_lines(&mut fonts, crate::font::DEFAULT_REGULAR, "", 100.0, 16);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].width, 0.0);
     }

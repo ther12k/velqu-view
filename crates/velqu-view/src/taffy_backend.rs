@@ -725,7 +725,7 @@ fn longest_word(box_node: &BoxNode, fonts: &mut FontStore, scale: f32) -> f32 {
         .iter()
         .map(|word| {
             let px = word_px(word, scale);
-            text_run_width(fonts, &word.text, px, word.style.font_weight)
+            text_run_width(fonts, &word.text, px, word.style.font_weight, word.style.font_family.as_deref())
         })
         .fold(0.0, f32::max)
 }
@@ -741,9 +741,9 @@ fn unwrapped_width(box_node: &BoxNode, fonts: &mut FontStore, scale: f32) -> f32
         } else {
             // Space width follows the previous word's size, matching
             // break_lines' placement.
-            text_run_width(fonts, " ", last_px, 400)
+            text_run_width(fonts, " ", last_px, 400, None)
         };
-        width += space + text_run_width(fonts, &word.text, px, word.style.font_weight);
+        width += space + text_run_width(fonts, &word.text, px, word.style.font_weight, word.style.font_family.as_deref());
         last_px = px;
         first = false;
     }
@@ -772,8 +772,15 @@ fn word_px(word: &crate::layout::Word, scale: f32) -> u16 {
     (word.style.font_size * scale).round().max(1.0) as u16
 }
 
-fn text_run_width(fonts: &mut FontStore, text: &str, px: u16, weight: u16) -> f32 {
-    crate::text::measure_run(fonts, text, px, crate::text::face_weight(weight))
+fn text_run_width(
+    fonts: &mut FontStore,
+    text: &str,
+    px: u16,
+    weight: u16,
+    family: Option<&str>,
+) -> f32 {
+    let face = fonts.face_index(family, crate::text::face_weight(weight));
+    crate::text::measure_run(fonts, face, text, px)
 }
 
 // -- write-back ----------------------------------------------------------------
@@ -913,12 +920,14 @@ pub(crate) fn break_lines(
     for word in words {
         let px = word_px(word, scale);
         let weight = crate::text::face_weight(word.style.font_weight);
-        let word_width = crate::text::measure_run(fonts, &word.text, px, weight);
+        let face = fonts.face_index(word.style.font_family.as_deref(), weight);
+        let word_width = crate::text::measure_run(fonts, face, &word.text, px);
         let space_width = if current.runs.is_empty() || !word.space_before {
             0.0
         } else {
             let last = current.runs.last().expect("checked non-empty");
-            crate::text::measure_run(fonts, " ", last.px, crate::text::face_weight(400))
+            let last_face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
+            crate::text::measure_run(fonts, last_face, " ", last.px)
         };
         if !current.runs.is_empty()
             && max_width > 0.0
@@ -937,6 +946,7 @@ pub(crate) fn break_lines(
             px,
             bold: weight == crate::font::FontWeight::Bold,
             color: word.style.color,
+            family: word.style.font_family.clone(),
             source: word.source,
         });
         cursor_x = run_x + word_width;
