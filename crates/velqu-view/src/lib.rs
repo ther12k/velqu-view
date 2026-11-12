@@ -1380,8 +1380,13 @@ impl VelquView {
                 &mut cascade,
                 Some(&interaction),
             );
-            self.sync_looping_animations(&styles);
+            self.sync_looping_animations(&styles, false);
             self.run_layout(viewport, &mut cascade, Some(&interaction));
+            // Post-layout re-sync: the pre-layout pass cannot know which
+            // nodes ended up box-less (transitive hides inside a hidden
+            // subtree). start is guarded by has_active_for, so this is
+            // idempotent for visible loops; it stops the invisible ones.
+            self.sync_looping_animations(&styles, true);
             self.layout_revision += 1;
             if let Some(seq) =
                 self.trace_invalidation(InvalidationClass::Structural, causes, dropped)
@@ -1557,7 +1562,7 @@ impl VelquView {
         // animated properties, so this frame shows the from-state — not a
         // jump to the target.
         self.spawn_transition_diffs(&styles);
-        self.sync_looping_animations(&styles);
+        self.sync_looping_animations(&styles, true);
         layout::apply_animation_overrides(&mut styles, self.anim.overrides());
         if let Some(laid) = self.last_laid.as_mut() {
             layout::patch_presentation_styles(&mut laid.root, &styles);
@@ -1868,10 +1873,34 @@ impl VelquView {
         }
     }
 
+    /// Whether the node produced a box in the last layout pass (hidden
+    /// nodes and hidden subtrees produce none).
+    fn node_has_box(&self, node: dom::NodeId) -> bool {
+        self.last_laid
+            .as_ref()
+            .is_some_and(|laid| layout::find_box(&laid.root, node).is_some())
+    }
+
     /// Synchronizes preset looping animations (`animate-spin`, `animate-pulse`, `animate-bounce`)
     /// with the animation engine (ADR 0024).
-    fn sync_looping_animations(&mut self, styles: &layout::StyleMap) {
+    /// `boxes_current`: whether `last_laid` reflects the layout these
+    /// styles will paint with. The structural path runs before
+    /// `run_layout` (the box tree is about to be rebuilt — the cached
+    /// boxes are stale/absent), so only the presentation path, which
+    /// syncs against the cached tree, may consult box existence.
+    fn sync_looping_animations(&mut self, styles: &layout::StyleMap, boxes_current: bool) {
         for (&node, style) in styles {
+            // Nodes that never paint (vx-show false directly, or hidden
+            // transitively inside a hidden subtree) must not keep the
+            // frame pump awake at 60fps with an invisible infinite
+            // animation. Stop it; sync restarts it when the node paints
+            // again.
+            let hidden = self.reactive_hidden.contains(&node)
+                || (boxes_current && !self.node_has_box(node));
+            if hidden {
+                self.anim.stop_infinite_for(node);
+                continue;
+            }
             match style.animation {
                 style::AnimationKind::Spin => {
                     if !self.anim.has_active_for(node) {
@@ -1935,6 +1964,15 @@ impl VelquView {
     /// stays awake only while this is true (ADR 0024: idle is 0% CPU).
     pub fn has_active_animations(&self) -> bool {
         self.anim.has_active()
+    }
+
+    /// Debug: lists active animations as (node, property-kind) pairs.
+    pub fn active_animations_debug(&self) -> Vec<(usize, String)> {
+        self.anim
+            .active
+            .iter()
+            .map(|a| (a.node, format!("{:?}", a.property)))
+            .collect()
     }
 
     /// Advances the animation virtual clock by `dt` and routes the tick's

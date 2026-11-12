@@ -514,7 +514,7 @@ pub(crate) struct AnimationEngine {
     /// The virtual clock; advanced only by [`AnimationEngine::tick_by`].
     clock: Duration64,
     /// In-flight animations in spawn order.
-    active: Vec<ActiveAnimation>,
+    pub(crate) active: Vec<ActiveAnimation>,
     /// Current mid-flight values per node (rebuilt on each tick; also
     /// seeded at spawn so the first frame holds the from-value).
     overrides: HashMap<NodeId, PropertyOverrides>,

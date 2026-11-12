@@ -391,3 +391,49 @@ fn looping_animations_pulse_and_spin_run_infinitely() {
         );
     }
 }
+
+/// A looping animation inside a hidden subtree (vx-show false on an
+/// ancestor) must not keep the frame pump awake: hidden nodes never
+/// paint, so their infinite animations are stopped until they paint.
+#[test]
+fn looping_animation_in_hidden_subtree_stays_idle() {
+    let vp = viewport();
+    let html = r#"<html><body style="margin: 0">
+        <main vx-state="{ open: false }">
+            <div id="panel" vx-show="open">
+                <div id="pulsing" class="animate-pulse w-10 h-10 bg-red-500"></div>
+            </div>
+        </main>
+    </body></html>"#;
+    let mut view = VelquView::new();
+    view.enable_tailwind();
+    view.enable_reactive();
+    view.load_html(html).unwrap();
+    settle(&mut view, vp);
+
+    // The panel is hidden: the pulse must NOT be running.
+    assert!(
+        !view.has_active_animations(),
+        "an invisible looping animation must not keep the pump awake"
+    );
+
+    // Show the panel: sync restarts the pulse (visible again).
+    view.write_state("open", velqu_view::ReactiveValue::Bool(true))
+        .unwrap();
+    view.pump_reactive(&[]);
+    view.render(vp).unwrap();
+    assert!(
+        view.has_active_animations(),
+        "a visible looping animation must run"
+    );
+
+    // Hide it again: the pump goes back to sleep.
+    view.write_state("open", velqu_view::ReactiveValue::Bool(false))
+        .unwrap();
+    view.pump_reactive(&[]);
+    view.render(vp).unwrap();
+    assert!(
+        !view.has_active_animations(),
+        "re-hiding must stop the loop again"
+    );
+}
