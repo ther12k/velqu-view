@@ -337,8 +337,10 @@ pub(crate) fn build_boxes(
         run: &mut Option<BoxNode>,
         children: &mut Vec<BoxNode>,
     ) {
-        if let Some(mut item) = run.take() {
-            item.style.display = Display::Block;
+        // The run's style is already a flex row (set at construction) —
+        // it must NOT be forced to block here, or multi-child runs (e.g.
+        // EQ-bar spans, inline button groups) stack vertically.
+        if let Some(item) = run.take() {
             children.push(item);
         }
     }
@@ -368,27 +370,40 @@ pub(crate) fn build_boxes(
                         }
                         // An inline element becomes (joins) the current
                         // anonymous item instead of dissolving into the
-                        // container's words.
+                        // container's words. The item itself is a flex
+                        // ROW (inline-flow semantics for box children) —
+                        // a plain block would stack them vertically —
+                        // inheriting the parent's cross-alignment and
+                        // gap, which were authored for these children.
                         _ => {
                             if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
-                                let run = anonymous_run.get_or_insert_with(|| BoxNode {
-                                    node: root,
-                                    fixture_id: None,
-                                    element_id: None,
-                                    tag: "#anonymous".to_owned(),
-                                    style: style.clone(),
-                                    children: Vec::new(),
-                                    lines: Vec::new(),
-                                    content: Rect::default(),
-                                    padding_box: Rect::default(),
-                                    border_box: Rect::default(),
-                                    margin: crate::style::Sides::default(),
-                                    words: Vec::new(),
-                                    text_origin: None,
-                                    replaced: None,
-                                    control: crate::control::kind_for_node(dom, root),
-                                    scroll: None,
-                                    applied_scroll: (0.0, 0.0),
+                                let run = anonymous_run.get_or_insert_with(|| {
+                                    let mut run_style = style.clone();
+                                    run_style.display = Display::Flex;
+                                    run_style.flex_direction = crate::style::FlexDirection::Row;
+                                    run_style.align_items = style.align_items;
+                                    run_style.row_gap = style.row_gap;
+                                    run_style.column_gap = style.column_gap;
+                                    run_style.justify_content = crate::style::JustifyContent::default();
+                                    BoxNode {
+                                        node: root,
+                                        fixture_id: None,
+                                        element_id: None,
+                                        tag: "#anonymous".to_owned(),
+                                        style: run_style,
+                                        children: Vec::new(),
+                                        lines: Vec::new(),
+                                        content: Rect::default(),
+                                        padding_box: Rect::default(),
+                                        border_box: Rect::default(),
+                                        margin: crate::style::Sides::default(),
+                                        words: Vec::new(),
+                                        text_origin: None,
+                                        replaced: None,
+                                        control: crate::control::kind_for_node(dom, root),
+                                        scroll: None,
+                                        applied_scroll: (0.0, 0.0),
+                                    }
                                 });
                                 run.children.push(child_box);
                             }
