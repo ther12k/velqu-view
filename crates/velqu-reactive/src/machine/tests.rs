@@ -438,3 +438,90 @@ fn state_capture_rejects_functions_and_exotic_values() {
         other => panic!("expected rollback, got {other:?}"),
     }
 }
+
+#[test]
+fn host_write_commits_every_value_kind() {
+    let dom = counter_dom("count = count + 1");
+    let plan = compile(&dom);
+    let (mut machine, _initial) = ReactiveMachine::new(1, limits(), &plan).expect("machine");
+
+    // Preparing never mutates committed state; commit is the only
+    // state-changing step — the same contract as event turns.
+    let pending = match machine.prepare_host_write("count", ReactiveValue::Number(7.0)) {
+        TurnOutcome::Prepared(pending) => pending,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        machine.state().get_path("count"),
+        ReactiveValue::Number(0.0)
+    );
+    machine.commit(pending);
+    assert_eq!(
+        machine.state().get_path("count"),
+        ReactiveValue::Number(7.0)
+    );
+
+    // The text binding followed the written value, not a stringified
+    // event payload.
+    let pending = match machine.prepare_host_write("count", ReactiveValue::Number(8.0)) {
+        TurnOutcome::Prepared(pending) => pending,
+        other => panic!("{other:?}"),
+    };
+    assert!(
+        pending
+            .mutations
+            .iter()
+            .any(|m| matches!(&m.kind, MutationKind::SetText(t) if t == "Count: 8")),
+        "{:?}",
+        pending.mutations
+    );
+    machine.commit(pending);
+}
+
+#[test]
+fn host_write_creates_nested_object_paths() {
+    let dom = counter_dom("count = count + 1");
+    let plan = compile(&dom);
+    let (mut machine, _initial) = ReactiveMachine::new(1, limits(), &plan).expect("machine");
+    let pending = match machine.prepare_host_write(
+        "media.now",
+        ReactiveValue::Object(vec![
+            ("title".to_owned(), ReactiveValue::String("Song".to_owned())),
+            ("playing".to_owned(), ReactiveValue::Bool(true)),
+        ]),
+    ) {
+        TurnOutcome::Prepared(pending) => pending,
+        other => panic!("{other:?}"),
+    };
+    machine.commit(pending);
+    assert_eq!(
+        machine.state().get_path("media.now.title"),
+        ReactiveValue::String("Song".to_owned())
+    );
+    assert!(matches!(
+        machine.state().get_path("media.now.playing"),
+        ReactiveValue::Bool(true)
+    ));
+}
+
+#[test]
+fn host_write_rolls_back_when_a_binding_is_poisoned() {
+    let mut dom = counter_dom("count = count + 1");
+    // Rewrite the text binding to read a property of undefined: the
+    // expression compiles, then throws on every evaluation.
+    let scope = dom.nodes[0].children[0];
+    let p = dom.nodes[scope].children[0];
+    dom.nodes[p].attrs.clear();
+    dom.attr(p, "vx-text", "count + missing.deeper.value");
+    let plan = compile(&dom);
+    let (mut machine, _initial) = ReactiveMachine::new(1, limits(), &plan).expect("machine");
+    match machine.prepare_host_write("count", ReactiveValue::Number(3.0)) {
+        TurnOutcome::RolledBack(_) => {}
+        other => panic!("expected rollback, got {other:?}"),
+    }
+    assert_eq!(
+        machine.state().get_path("count"),
+        ReactiveValue::Number(0.0)
+    );
+    assert!(!machine.diagnostics().is_empty());
+}

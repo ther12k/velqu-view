@@ -137,7 +137,7 @@ pub use source::{
 pub use style::CursorStyle;
 pub use velqu_reactive::{
     Binding, BindingKind, EventBinding, MutationKind, PendingTurn, ReactiveDiagnostic,
-    ReactiveDocument, ScopePlan, SourceSpan, TurnOutcome,
+    ReactiveDocument, ReactiveValue, ScopePlan, SourceSpan, TurnOutcome,
 };
 use velqu_reactive::{EventPayload, PayloadValue};
 pub use viewport::{InvalidViewport, InvalidViewportReason, MAX_PIXELS, Viewport};
@@ -219,6 +219,39 @@ impl fmt::Display for VelquError {
 }
 
 impl std::error::Error for VelquError {}
+
+/// Why a host-initiated state write ([`VelquView::write_state`]) did not
+/// commit. Neither case touches state or UI: a failed write is a no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostWriteError {
+    /// Reactive is disabled, no document is loaded, the document has no
+    /// reactive markup, or the machine belongs to a generation awaiting
+    /// reload. Nothing ran.
+    NoReactiveDocument,
+    /// The turn rolled back (a JS failure, a budget, or a rejected
+    /// mutation batch). The diagnostic string is also retained in
+    /// [`VelquView::reactive_diagnostics`].
+    RolledBack(String),
+}
+
+impl fmt::Display for HostWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostWriteError::NoReactiveDocument => {
+                write!(
+                    f,
+                    "no reactive document to write into; enable reactive and load a \
+                     document with reactive markup"
+                )
+            }
+            HostWriteError::RolledBack(reason) => {
+                write!(f, "host state write rolled back: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostWriteError {}
 
 impl From<InvalidViewport> for VelquError {
     fn from(invalid: InvalidViewport) -> Self {
@@ -3409,6 +3442,110 @@ impl VelquView {
     pub fn pump_reactive_queued(&mut self) {
         let batch = self.take_events();
         self.pump_reactive(&batch);
+    }
+
+    /// Writes one state path as a **host-initiated reactive turn**
+    /// (ADR 0025): the same bounded, transactional, non-reentrant
+    /// machinery an event turn runs, with the model write supplied by
+    /// the host instead of a `vx-model` control. Bindings reevaluate
+    /// against the candidate, the diffed mutations apply atomically,
+    /// and transitions run — a host write is a change, not a load.
+    ///
+    /// This is the data-in seam for hosts that own state the document
+    /// cannot produce from user input: clocks, media metadata, sensor
+    /// readings. A write before the first [`VelquView::pump_reactive`]
+    /// first applies the document's pending initial binding outputs
+    /// (turn zero), so the write's outputs are never clobbered by a
+    /// stale initial batch.
+    ///
+    /// A write can also make a turn the *host* observes: mutations are
+    /// applied, but no events are synthesized (a `SetControlValue`
+    /// never fabricates a `ValueChanged`), preserving the no-feedback
+    /// loop contract of ADR 0017.
+    ///
+    /// Errors leave state and UI untouched
+    /// ([`HostWriteError`]); the rolled-back diagnostic is also visible
+    /// in [`VelquView::reactive_diagnostics`]. Documents without
+    /// reactive markup are `NoReactiveDocument`, mirroring
+    /// [`VelquView::reactive_state`].
+    pub fn write_state(
+        &mut self,
+        path: &str,
+        value: velqu_reactive::ReactiveValue,
+    ) -> Result<(), HostWriteError> {
+        let Some(state) = self.reactive.take() else {
+            return Err(HostWriteError::NoReactiveDocument);
+        };
+        let mut state = state;
+        if state.machine.is_none()
+            || state.plan.is_empty()
+            || state
+                .machine
+                .as_ref()
+                .is_some_and(|machine| machine.generation() != self.document_generation)
+        {
+            self.reactive = Some(state);
+            return Err(HostWriteError::NoReactiveDocument);
+        }
+
+        // Disjoint field borrows of the local `state`, mirroring the
+        // pump: the plan is read-only, the machine slot moves through
+        // the turn. (`self.reactive` stays taken, so nothing below may
+        // read it back.)
+        let ReactiveState {
+            plan,
+            machine: machine_slot,
+            pending_initial,
+            initial_batch_rejected,
+            ..
+        } = &mut state;
+
+        // Bring turn zero current first: a write arriving before any
+        // pumped batch still owes the document its initial outputs.
+        let pending_initial = std::mem::take(pending_initial);
+        if !pending_initial.is_empty()
+            && !self.apply_mutations_validated(plan, &pending_initial, false)
+        {
+            *initial_batch_rejected = true;
+            if let Some(machine) = machine_slot.as_mut() {
+                machine.record_host_diagnostic("initial mutation batch rejected");
+            }
+        }
+
+        let Some(machine) = machine_slot.as_mut() else {
+            self.reactive = Some(state);
+            return Err(HostWriteError::NoReactiveDocument);
+        };
+        match machine.prepare_host_write(path, value) {
+            velqu_reactive::TurnOutcome::Prepared(pending) => {
+                let mutations = pending.mutations.clone();
+                if !self.mutations_valid(plan, &mutations) {
+                    machine.record_host_diagnostic(
+                        "host write mutation batch rejected: a target failed validation",
+                    );
+                    self.reactive = Some(state);
+                    return Err(HostWriteError::RolledBack(
+                        "mutation batch rejected".to_owned(),
+                    ));
+                }
+                machine.commit(pending);
+                self.apply_mutations(plan, &mutations, true);
+                self.state_revision += 1;
+                self.reactive_turns += 1;
+                self.reactive = Some(state);
+                Ok(())
+            }
+            velqu_reactive::TurnOutcome::RolledBack(reason) => {
+                self.reactive = Some(state);
+                Err(HostWriteError::RolledBack(reason))
+            }
+            // Unreachable with a model write (prepare_inner only
+            // returns NoChange when nothing ran); a committed no-op.
+            velqu_reactive::TurnOutcome::NoChange => {
+                self.reactive = Some(state);
+                Ok(())
+            }
+        }
     }
 
     // -- transactional reload (M6b, ADR 0021) ------------------------------

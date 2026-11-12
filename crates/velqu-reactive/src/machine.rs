@@ -272,8 +272,8 @@ impl ReactiveMachine {
     /// Prepares one reactive turn. `payload` is the sanitized event
     /// (already byte-budgeted), `handlers` the plan event indices to
     /// invoke in order (target → ancestors), `model_write` an optional
-    /// `(state path, value)` applied **before** the handlers (the
-    /// vx-model ordering contract).
+    /// `(state path, string value)` applied **before** the handlers
+    /// (the vx-model ordering contract).
     ///
     /// Preparing never mutates committed state — a caller that cannot
     /// apply the batch simply drops the [`PendingTurn`].
@@ -283,7 +283,19 @@ impl ReactiveMachine {
         handlers: &[usize],
         model_write: Option<(&str, &str)>,
     ) -> TurnOutcome {
-        self.prepare_inner(payload, handlers, model_write, false)
+        let write =
+            model_write.map(|(path, value)| (path, ReactiveValue::String(value.to_owned())));
+        self.prepare_inner(payload, handlers, write, false)
+    }
+
+    /// Prepares one host-initiated turn (ADR 0025): the state write is
+    /// the whole turn — no event payload, no handlers, the value any
+    /// [`ReactiveValue`] kind. Bindings still reevaluate against the
+    /// candidate, so outputs and mutations reflect the write exactly
+    /// as a `vx-model` write would; the same budgets, atomicity, and
+    /// rollback semantics apply.
+    pub fn prepare_host_write(&mut self, path: &str, value: ReactiveValue) -> TurnOutcome {
+        self.prepare_inner(None, &[], Some((path, value)), false)
     }
 
     /// The initial evaluation (machine construction) runs the bindings
@@ -292,7 +304,7 @@ impl ReactiveMachine {
         &mut self,
         payload: Option<&EventPayload>,
         handlers: &[usize],
-        model_write: Option<(&str, &str)>,
+        model_write: Option<(&str, ReactiveValue)>,
         force: bool,
     ) -> TurnOutcome {
         if !force && handlers.is_empty() && model_write.is_none() {
@@ -321,8 +333,8 @@ impl ReactiveMachine {
                 .get("__velquUnits")
                 .map_err(|_| "compiled units missing".to_owned())?;
             let mut candidate = self.state.clone();
-            if let Some((path, value)) = model_write {
-                candidate.set_path(path, ReactiveValue::String(value.to_owned()));
+            if let Some((path, value)) = &model_write {
+                candidate.set_path(path, value.clone());
             }
             let state_obj: Object = candidate
                 .clone()
