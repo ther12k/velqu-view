@@ -443,14 +443,29 @@ impl PaintCtx<'_> {
             let x1 = (placed.x + placed.w).min(self.width as f32).ceil() as i64;
             let y1 = (placed.y + placed.h).min(self.height as f32).ceil() as i64;
             let (rows0, rows1) = self.damage_rows(y0, y1);
+            // Straight-zone rows: the span equals the true shape extent, so
+            // pixels ≥2px inside it are fully covered (≥1.5px from any
+            // boundary) and skip the SDF entirely; corner rows and edge
+            // pixels classify per pixel as before. Identical pixels, less
+            // per-pixel math on the interior.
+            let outer_r = radius.min(placed.w / 2.0).min(placed.h / 2.0).max(0.0);
+            let straight_top = (placed.y + outer_r).ceil() as i64;
+            let straight_bottom = (placed.y + placed.h - outer_r).floor() as i64;
+            let left_edge = placed.x.ceil() as i64 + 2;
+            let right_edge = (placed.x + placed.w).floor() as i64 - 2;
             for py in rows0..rows1 {
                 let (span0, span1) = rounded_row_span(&placed, radius, py);
                 if span0 >= span1 {
                     continue;
                 }
+                let straight_row = py >= straight_top && py < straight_bottom;
                 let (cols0, cols1) = self.damage_cols(span0 - 2, span1 + 2);
                 for px in cols0.max(x0)..cols1.min(x1) {
                     if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    if straight_row && px >= left_edge && px < right_edge {
+                        self.blend_pixel(px as usize, py as usize, color);
                         continue;
                     }
                     let cx = px as f32 + 0.5;
@@ -522,34 +537,128 @@ impl PaintCtx<'_> {
                 .min(self.height as f32)
                 .ceil() as i64;
             let (rows0, rows1) = self.damage_rows(y0, y1);
+            // Per-row the ring is two horizontal bands (left/right of the
+            // hole) on rows where every pixel is *certainly* deep inside
+            // the hole, and the full outer span otherwise. The exclusion
+            // mirrors `pixel_deep_inside_inner` in range form: a pixel is
+            // skippable only when its whole 4x4 sample footprint (±0.375
+            // around the center) sits ≥ [`SDF_MARGIN`] inside every hole
+            // edge and outside every corner zone (`r_max + SDF_MARGIN`
+            // reach). Everything the range form cannot guarantee is
+            // visited and decided per pixel, so coverage is bit-identical
+            // to the full-span scan while the hole interior — eight rings
+            // × the whole shadow bbox during a morph — is never touched.
+            let sub_radius = (SUBGRID - 1) as f32 / (2.0 * SUBGRID as f32);
+            // The corner-zone reach uses the hole radius clamped to the
+            // hole's half-dimensions exactly like
+            // `point_in_rounded_rect4` clamps per-corner radii — a
+            // `rounded-full` author radius (9999px) must not turn the
+            // zone into the whole shape and void the interior exclusion.
+            let r_inner_max = inner_radii
+                .iter()
+                .cloned()
+                .fold(0.0f32, f32::max)
+                .min(placed_inner.w / 2.0)
+                .min(placed_inner.h / 2.0)
+                .max(0.0);
+            let zone = r_inner_max + SDF_MARGIN;
+            let y0e = placed_inner.y;
+            let y1e = placed_inner.y + placed_inner.h;
+            let cross_lo = (y0e + SDF_MARGIN + sub_radius - 0.5).ceil() as i64;
+            let cross_hi = (y1e - SDF_MARGIN - sub_radius - 0.5).ceil() as i64;
             for py in rows0..rows1 {
                 let (span0, span1) = rounded_row_span(&placed_outer, radius, py);
                 if span0 >= span1 {
                     continue;
                 }
-                let (cols0, cols1) = self.damage_cols(span0 - 2, span1 + 2);
-                for px in cols0.max(x0)..cols1.min(x1) {
-                    if !self.clip_contains(px, py) {
+                let cy = py as f32 + 0.5;
+                // Skippable interior on crossing rows: pixels whose whole
+                // sample footprint sits beyond every corner zone reach
+                // (`zone`) and ≥ [`SDF_MARGIN`] inside the straight edges.
+                // Corner-zone rows keep only their middle range — the
+                // zones hug the hole's left/right ends.
+                let x_pad = zone + sub_radius;
+                let excl_lo = (placed_inner.x + x_pad - 0.5).ceil() as i64;
+                let excl_hi = (placed_inner.x + placed_inner.w - x_pad - 0.5).ceil() as i64;
+                let crossing = py >= cross_lo && py < cross_hi;
+                let bands: [(i64, i64); 2] = if crossing {
+                    [
+                        (span0.max(x0), excl_lo.min(span1)),
+                        (excl_hi.max(span0), span1.min(x1)),
+                    ]
+                } else {
+                    [(span0.max(x0), span1.min(x1)), (0, 0)]
+                };
+                for (band0, band1) in bands {
+                    if band1 <= band0 {
                         continue;
                     }
-                    let cx = px as f32 + 0.5;
-                    let cy = py as f32 + 0.5;
-                    let sd = rounded_rect_sdf(cx, cy, &placed_outer, radius);
-                    if sd >= SDF_MARGIN {
-                        continue; // fully outside the outer shape
+                    // The +-2px wing covers the SDF boundary band (±0.71
+                    // around the exact span edge — fractional shapes put
+                    // real partial coverage there); the per-pixel SDF
+                    // classifies wing pixels exactly as the full scan did.
+                    let (cols0, cols1) = self.damage_cols(band0 - 2, band1 + 2);
+                    for px in cols0.max(x0)..cols1.min(x1) {
+                        if !self.clip_contains(px, py) {
+                            continue;
+                        }
+                        let cx = px as f32 + 0.5;
+                        // Squared SDF classification (no sqrt): with
+                        // q = |p - center| - (half_extent - r), the signed
+                        // distance is sqrt(dx^2+dy^2) + min(max(qx,qy),0)
+                        // - r, so `sd >= m` reduces to `d2 >= (r+m)^2` and
+                        // `sd <= -m` to `qx <= -m || qy <= -m` — exact in
+                        // every region of the distance field.
+                        let qxo = (cx - (placed_outer.x + placed_outer.w / 2.0)).abs()
+                            - outer_hw(radius, &placed_outer);
+                        let qyo = (cy - (placed_outer.y + placed_outer.h / 2.0)).abs()
+                            - outer_hh(radius, &placed_outer);
+                        let dxo = qxo.max(0.0);
+                        let dyo = qyo.max(0.0);
+                        if dxo * dxo + dyo * dyo
+                            >= (radius + SDF_MARGIN) * (radius + SDF_MARGIN)
+                        {
+                            continue; // fully outside the outer shape
+                        }
+                        // Fast path: deep inside the outer shape and safely
+                        // outside the hole — coverage is exactly 1 and the
+                        // 16x2 subsample grid would only confirm it. The
+                        // hole test uses the smallest per-corner radius, so
+                        // the assumed hole is the LARGEST the shape can be
+                        // and the "safely outside" verdict is conservative.
+                        let r_inner_min = inner_radii
+                            .iter()
+                            .cloned()
+                            .fold(f32::MAX, f32::min)
+                            .min(placed_inner.w / 2.0)
+                            .min(placed_inner.h / 2.0)
+                            .max(0.0);
+                        let qxi = (cx - (placed_inner.x + placed_inner.w / 2.0)).abs()
+                            - outer_hw(r_inner_min, &placed_inner);
+                        let qyi = (cy - (placed_inner.y + placed_inner.h / 2.0)).abs()
+                            - outer_hh(r_inner_min, &placed_inner);
+                        let dxi = qxi.max(0.0);
+                        let dyi = qyi.max(0.0);
+                        let safe_outside_hole = dxi * dxi + dyi * dyi
+                            >= (r_inner_min + SDF_MARGIN) * (r_inner_min + SDF_MARGIN);
+                        let deep_in_outer = qxo <= -SDF_MARGIN || qyo <= -SDF_MARGIN;
+                        if deep_in_outer && safe_outside_hole {
+                            self.blend_pixel(px as usize, py as usize, color);
+                            continue;
+                        }
+                        if pixel_deep_inside_inner(cx, cy, &placed_inner, &inner_radii) {
+                            continue; // fully inside the hole: ring alpha ≤ 0
+                        }
+                        let cov = ring_subsample_coverage(
+                            &placed_outer,
+                            radius,
+                            &placed_inner,
+                            &inner_radii,
+                            px as f32,
+                            py as f32,
+                        );
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
-                    if pixel_deep_inside_inner(cx, cy, &placed_inner, &inner_radii) {
-                        continue; // fully inside the hole: ring alpha ≤ 0
-                    }
-                    let cov = ring_subsample_coverage(
-                        &placed_outer,
-                        radius,
-                        &placed_inner,
-                        &inner_radii,
-                        px as f32,
-                        py as f32,
-                    );
-                    self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                 }
             }
         } else if let Some(inv) = self.transform.inverse() {
@@ -586,15 +695,18 @@ impl PaintCtx<'_> {
         }
     }
 
-    /// Paints one outer box-shadow layer: ring fills between the shadow's
-    /// expanded bounds and the element's border box, so the shadow never
+    /// Paints one outer box-shadow layer in a **single pass** (ADR 0026):
+    /// per pixel, the signed distance `d` to the shadow shape (the bounds
+    /// rect — offset and spread already applied) drives a linear falloff —
+    /// full strength inside the shape, fading to transparent at `blur`
+    /// beyond it — masked by the element's border box so the shadow never
     /// shows inside a transparent element (CSS clips outer shadows at the
-    /// border edge). The blur feather is approximated with
-    /// [`SHADOW_FEATHER_STEPS`] stacked rings — each carries an equal slice
-    /// of the shadow alpha, so alpha accumulates toward the element edge
-    /// and fades outward (deterministic; the rings inherit the coverage
-    /// rasterization of ADR 0026). A zero blur paints one solid ring.
-    /// Rings compose under the current transform/clip/opacity like any fill.
+    /// border edge). This is the exact envelope the previous
+    /// [`SHADOW_FEATHER_STEPS`]-ring stack approximated (its equal alpha
+    /// slices accumulated to ≈ `a·(1 − d/blur)`), rasterized in one sweep
+    /// of the band instead of eight — the morph-frame paint cost drops
+    /// ~8×. A zero blur paints one solid ring. Composes under the current
+    /// transform/clip/opacity like any fill.
     fn draw_outer_shadow(
         &mut self,
         bounds: Rect,
@@ -607,26 +719,99 @@ impl PaintCtx<'_> {
         if color.a == 0 || bounds.w <= 0.0 || bounds.h <= 0.0 {
             return;
         }
-        let steps = if blur > 0.0 { SHADOW_FEATHER_STEPS } else { 1 };
-        let slice = ((color.a as f32) / steps as f32).round().max(1.0) as u8;
-        let slice_color = Color::from_rgba8(color.r, color.g, color.b, slice.min(color.a));
-        for step in 0..steps {
-            // Outermost ring first: nearer rings stack over them, so the
-            // alpha accumulates toward the element edge.
-            let expand = blur * (step as f32 + 1.0) / steps as f32;
-            let rect = Rect {
-                x: bounds.x - expand,
-                y: bounds.y - expand,
-                w: bounds.w + 2.0 * expand,
-                h: bounds.h + 2.0 * expand,
-            };
-            self.fill_rounded_ring(
-                &rect,
-                (radius + expand).max(0.0),
-                &inner,
-                &[inner_radius; 4],
-                slice_color,
-            );
+        if blur <= 0.0 {
+            self.fill_rounded_ring(&bounds, radius, &inner, &[inner_radius; 4], color);
+            return;
+        }
+        if self.transform.is_axis_aligned() {
+            let scale = self.transform.scale_factor();
+            let placed_bounds = self.transform.apply_rect(&bounds);
+            let placed_inner = self.transform.apply_rect(&inner);
+            let blur = blur * scale;
+            let inner_radius = inner_radius * scale;
+            let x0 = (placed_bounds.x - blur).max(0.0).floor() as i64;
+            let y0 = (placed_bounds.y - blur).max(0.0).floor() as i64;
+            let x1 = (placed_bounds.x + placed_bounds.w + blur)
+                .min(self.width as f32)
+                .ceil() as i64;
+            let y1 = (placed_bounds.y + placed_bounds.h + blur)
+                .min(self.height as f32)
+                .ceil() as i64;
+            let (rows0, rows1) = self.damage_rows(y0, y1);
+            for py in rows0..rows1 {
+                let (cols0, cols1) = self.damage_cols(x0, x1);
+                for px in cols0..cols1 {
+                    if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    let d = rounded_rect_sdf(cx, cy, &placed_bounds, radius);
+                    if d >= blur {
+                        continue; // beyond the falloff
+                    }
+                    // Mask at the element's border box: the shadow never
+                    // shows inside it. The mask subsamples only within
+                    // ±√2/2 px of the card edge; the falloff needs one SDF.
+                    let d_card = rounded_rect_sdf(cx, cy, &placed_inner, inner_radius);
+                    let outside = if d_card >= SDF_MARGIN {
+                        1.0
+                    } else if d_card <= -SDF_MARGIN {
+                        0.0
+                    } else {
+                        1.0
+                            - rounded_subsample_coverage(
+                                &placed_inner,
+                                inner_radius,
+                                px as f32,
+                                py as f32,
+                            )
+                    };
+                    if outside <= 0.0 {
+                        continue;
+                    }
+                    let falloff = (1.0 - d / blur).clamp(0.0, 1.0);
+                    let cov = falloff * outside;
+                    if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
+                    }
+                }
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            // Rotated: per-sample falloff × card mask averaged over the
+            // fixed grid, matching the other transformed fills.
+            let (bx0, by0, bx1, by1) =
+                transform_bounds(&self.transform, &bounds, self.width, self.height);
+            let x0 = ((bx0 as f32 - blur).max(0.0)).floor() as u32;
+            let y0 = ((by0 as f32 - blur).max(0.0)).floor() as u32;
+            let x1 = ((bx1 as f32 + blur).min(self.width as f32)).ceil() as u32;
+            let y1 = ((by1 as f32 + blur).min(self.height as f32)).ceil() as u32;
+            let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
+            for py in rows0..rows1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py as i64) {
+                        continue;
+                    }
+                    let mut accumulated = 0.0f32;
+                    for sy in SUB_OFFSETS {
+                        for sx in SUB_OFFSETS {
+                            let (lx, ly) = inv.apply_point(px as f32 + sx, py as f32 + sy);
+                            let d = rounded_rect_sdf(lx, ly, &bounds, radius);
+                            if d >= blur {
+                                continue;
+                            }
+                            if rounded_rect_sdf(lx, ly, &inner, inner_radius) <= 0.0 {
+                                continue; // inside the element: masked
+                            }
+                            accumulated += (1.0 - d / blur).clamp(0.0, 1.0);
+                        }
+                    }
+                    let cov = accumulated / (SUBGRID * SUBGRID) as f32;
+                    if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
+                    }
+                }
+            }
         }
     }
 
@@ -850,11 +1035,6 @@ impl PaintCtx<'_> {
     }
 }
 
-/// How many stacked rings approximate the box-shadow blur feather. More
-/// rings smooth the falloff at linear cost; 8 keeps a `shadow-md` (6px
-/// blur) visibly soft without dominating paint time.
-const SHADOW_FEATHER_STEPS: usize = 8;
-
 /// Per-item device-pixel bounds, in paint order — **one entry per item**
 /// (index-aligned with `items`; scoping items that paint nothing carry the
 /// empty [`Rect::default`]). Transform scopes are resolved
@@ -868,6 +1048,14 @@ pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
     let mut bounds = Vec::with_capacity(items.len());
     let mut transform = Affine2D::IDENTITY;
     let mut stack: Vec<Affine2D> = Vec::new();
+    // Running clip intersection, mirroring the painter's clip semantics
+    // (clips live in the scope's parent space, applied by the current
+    // transform). Without this, children of a zero-height overflow-hidden
+    // container (a morphing card at height 0) carry full unclipped
+    // geometry far outside anything they can paint, and the damage diff
+    // over-covers from their (item, bounds) mismatches alone.
+    let mut clip: Option<Rect> = None;
+    let mut clip_stack: Vec<Option<Rect>> = Vec::new();
     for item in items {
         let rect = match item {
             DisplayItem::FillRect { rect, .. }
@@ -909,14 +1097,36 @@ pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
                 transform = stack.pop().unwrap_or(Affine2D::IDENTITY);
                 None
             }
-            DisplayItem::PushClip(_)
-            | DisplayItem::PushClipRounded { .. }
-            | DisplayItem::PopClip
-            | DisplayItem::PushOpacity(_)
-            | DisplayItem::PopOpacity => None,
+            DisplayItem::PushClip(clip_rect) => {
+                clip_stack.push(clip);
+                let placed = transform.apply_rect(clip_rect);
+                clip = Some(match clip {
+                    Some(outer) => intersect_rects(outer, placed),
+                    None => placed,
+                });
+                None
+            }
+            DisplayItem::PushClipRounded { rect, .. } => {
+                clip_stack.push(clip);
+                let placed = transform.apply_rect(rect);
+                clip = Some(match clip {
+                    Some(outer) => intersect_rects(outer, placed),
+                    None => placed,
+                });
+                None
+            }
+            DisplayItem::PopClip => {
+                clip = clip_stack.pop().flatten();
+                None
+            }
+            DisplayItem::PushOpacity(_) | DisplayItem::PopOpacity => None,
         };
         bounds.push(rect.map_or_else(Rect::default, |placed_rect| {
             let placed = transform.apply_rect(&placed_rect);
+            let placed = match clip {
+                Some(outer) => intersect_rects(outer, placed),
+                None => placed,
+            };
             Rect {
                 x: placed.x - MARGIN,
                 y: placed.y - MARGIN,
@@ -926,6 +1136,20 @@ pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
         }));
     }
     bounds
+}
+
+/// Integer-free rect intersection (empty when disjoint).
+fn intersect_rects(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.max(b.x);
+    let y0 = a.y.max(b.y);
+    let x1 = (a.x + a.w).min(b.x + b.w);
+    let y1 = (a.y + a.h).min(b.y + b.h);
+    Rect {
+        x: x0,
+        y: y0,
+        w: (x1 - x0).max(0.0),
+        h: (y1 - y0).max(0.0),
+    }
 }
 
 /// Borrowed view of one [`DisplayItem::TextRun`] for painting.
@@ -1059,6 +1283,16 @@ fn span_coverage(px: f32, lo: f32, hi: f32) -> f32 {
 /// negative inside, positive outside. Pure `f32` (one `sqrt`), so the
 /// classification is bit-identical across runs (ADR 0026). `sd ≤ 0` is
 /// equivalent to [`point_in_rounded_rect`].
+/// Half-extent minus radius on the x axis (the SDF's inset rectangle).
+fn outer_hw(radius: f32, rect: &Rect) -> f32 {
+    (rect.w / 2.0 - radius.min(rect.w / 2.0).min(rect.h / 2.0)).max(0.0)
+}
+
+/// Half-extent minus radius on the y axis.
+fn outer_hh(radius: f32, rect: &Rect) -> f32 {
+    (rect.h / 2.0 - radius.min(rect.w / 2.0).min(rect.h / 2.0)).max(0.0)
+}
+
 fn rounded_rect_sdf(x: f32, y: f32, rect: &Rect, radius: f32) -> f32 {
     let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
     let hw = rect.w / 2.0 - r;

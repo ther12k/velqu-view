@@ -58,6 +58,10 @@ pub(crate) struct FramePerf {
     pub(crate) presentation: Duration,
     /// Rasterization (`painter::paint_document`).
     pub(crate) paint: Duration,
+    /// Scratch: ring scan pixels reported by the painter.
+    pub(crate) ring: u64,
+    /// Scratch: the damage rect passed to the painter.
+    pub(crate) damage_rect: Option<(i64, i64, i64, i64)>,
     pub(crate) items: usize,
     pub(crate) glyphs: usize,
     /// Damage actually rasterized: full-surface paints report 1 rect of
@@ -106,6 +110,7 @@ impl FramePerf {
         self.glyphs = 0;
         self.damage_rects = 0;
         self.damage_area = 0;
+        self.damage_rect = None;
         self.viewport = (0, 0);
         self.path = None;
     }
@@ -121,7 +126,7 @@ impl FramePerf {
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "-".to_owned());
         eprintln!(
-            "vv-perf f={frame_index} path={} css={}ms style={}ms layout={}ms (style={}ms boxes={}ms taffy={}ms emit={}ms) present={}ms paint={}ms items={} glyphs={} damage={}rects/{}px viewport={}x{} interval={}ms",
+            "vv-perf f={frame_index} path={} css={}ms style={}ms layout={}ms (style={}ms boxes={}ms taffy={}ms emit={}ms) present={}ms paint={}ms items={} glyphs={} damage={}rects/{}px {:?} ring={} viewport={}x{} interval={}ms",
             self.path.map(FramePath::as_str).unwrap_or("none"),
             ms(self.css_parse),
             ms(self.style),
@@ -136,6 +141,8 @@ impl FramePerf {
             self.glyphs,
             self.damage_rects,
             self.damage_area,
+            self.damage_rect,
+            self.ring,
             self.viewport.0,
             self.viewport.1,
             interval,

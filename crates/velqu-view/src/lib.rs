@@ -1523,14 +1523,101 @@ impl VelquView {
             state.viewport
                 == (viewport.width(), viewport.height(), viewport.scale_factor())
                 && state.background == background
-                && state.items.len() == display_list.items.len()
         });
+        // Paint reach of the currently animating nodes (border box + own
+        // shadow extent + snap margin). Empty when nothing animates.
+        let animated_now: Vec<display_list::Rect> = {
+            let overrides = self.anim.overrides();
+            let laid = self.last_laid.as_ref();
+            let scale = viewport.scale_factor();
+            overrides
+                .keys()
+                .filter_map(|node| laid.and_then(|laid| layout::find_box(&laid.root, *node)))
+                .map(|box_node| {
+                    let mut reach = box_node.border_box;
+                    for shadow in &box_node.style.box_shadows {
+                        let spread = shadow.spread * scale;
+                        let blur = shadow.blur * scale;
+                        let b = display_list::Rect {
+                            x: box_node.border_box.x + shadow.offset_x * scale - spread - blur,
+                            y: box_node.border_box.y + shadow.offset_y * scale - spread - blur,
+                            w: box_node.border_box.w + 2.0 * (spread + blur),
+                            h: box_node.border_box.h + 2.0 * (spread + blur),
+                        };
+                        reach.x = reach.x.min(b.x);
+                        reach.y = reach.y.min(b.y);
+                        reach.w = reach.w.max(b.x + b.w - reach.x);
+                        reach.h = reach.h.max(b.y + b.h - reach.y);
+                    }
+                    display_list::Rect {
+                        x: reach.x - 3.0,
+                        y: reach.y - 3.0,
+                        w: reach.w + 6.0,
+                        h: reach.h + 6.0,
+                    }
+                })
+                .collect()
+        };
         let damage = usable.as_ref().and_then(|state| {
+            // Paint-order prefix stability: items before the first
+            // divergence painted identical pixels, so the diff walks the
+            // common prefix per index and unions the tail when the lists'
+            // lengths differ (a width morph re-wraps text inside the
+            // animating card, shifting its item count — everything past
+            // the common prefix is suspect, everything before is not).
+            //
+            // The animated region (previous ∪ current reach) covers every
+            // pixel an animation tick can change; changed items fully
+            // inside it need no separate union. Items outside it — shifted
+            // siblings, unrelated repaints — union individually.
+            let mut animated_union: Option<(i64, i64, i64, i64)> = None;
+            for rect in state.animated.iter().chain(animated_now.iter()) {
+                animated_union = grow_union(animated_union, *rect);
+            }
+            let inside_animated = |rect: &display_list::Rect, union: Option<(i64, i64, i64, i64)>| {
+                match union {
+                    None => false,
+                    Some((x0, y0, x1, y1)) => {
+                        rect.w > 0.0
+                            && rect.h > 0.0
+                            && rect.x.floor() as i64 >= x0
+                            && rect.y.floor() as i64 >= y0
+                            && (rect.x + rect.w).ceil() as i64 <= x1
+                            && (rect.y + rect.h).ceil() as i64 <= y1
+                    }
+                }
+            };
+            let common = state.items.len().min(display_list.items.len());
             let mut union: Option<(i64, i64, i64, i64)> = None;
-            for (index, item) in display_list.items.iter().enumerate() {
-                if *item != state.items[index] || bounds_now[index] != state.bounds[index] {
-                    union = grow_union(union, bounds_now[index]);
-                    union = grow_union(union, state.bounds[index]);
+            for ((item, bound), (prev_item, prev_bound)) in display_list
+                .items
+                .iter()
+                .zip(&bounds_now)
+                .zip(state.items.iter().zip(&state.bounds))
+                .take(common)
+            {
+                if (*item != *prev_item || *bound != *prev_bound)
+                    && (!inside_animated(bound, animated_union)
+                        || !inside_animated(prev_bound, animated_union))
+                {
+                    union = grow_union(union, *bound);
+                    union = grow_union(union, *prev_bound);
+                }
+            }
+            for bound in bounds_now.iter().skip(common) {
+                if !inside_animated(bound, animated_union) {
+                    union = grow_union(union, *bound);
+                }
+            }
+            for bound in state.bounds.iter().skip(common) {
+                if !inside_animated(bound, animated_union) {
+                    union = grow_union(union, *bound);
+                }
+            }
+            // The animated region itself always repaints when it moved.
+            if animated_union.is_some() {
+                for rect in state.animated.iter().chain(animated_now.iter()) {
+                    union = grow_union(union, *rect);
                 }
             }
             union.map(|(x0, y0, x1, y1)| {
@@ -1565,6 +1652,7 @@ impl VelquView {
         self.perf.items = items;
         self.perf.glyphs = glyphs;
         self.perf.viewport = (viewport.width(), viewport.height());
+        self.perf.damage_rect = damage.map(|(x, y, w, h)| (i64::from(x), i64::from(y), i64::from(w), i64::from(h)));
         match damage {
             Some((_, _, w, h)) => {
                 self.perf.damage_rects = 1;
@@ -1589,6 +1677,7 @@ impl VelquView {
                 frame.pixels().to_vec(),
             ),
             viewport: (viewport.width(), viewport.height(), viewport.scale_factor()),
+            animated: animated_now,
         });
         let damage_out = damage.filter(|&(_, _, w, h)| w > 0 && h > 0);
         self.perf.log(self.frame_index);
@@ -5089,6 +5178,13 @@ struct PaintedFrame {
     frame: Frame,
     /// The viewport the frame was rendered into (mismatch = full repaint).
     viewport: (u32, u32, f32),
+    /// Paint reach of every node carrying an animation override at paint
+    /// time: its border box inflated by its own shadow extent. During
+    /// animation ticks all changed pixels lie inside the union of these
+    /// (previous ∪ current), which is far tighter than the item diff —
+    /// a width morph re-wraps text mid-list and the per-index item diff
+    /// over-covers from the first insertion onward.
+    animated: Vec<display_list::Rect>,
 }
 
 /// Grows a half-open integer rect union with one bound.
