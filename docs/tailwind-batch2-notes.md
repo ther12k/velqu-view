@@ -46,3 +46,16 @@ so a future renderer slice knows exactly what to land to unlock them.
 
 Nothing above is silently dropped: each compiles to a named
 `UtilityDiagnostic` that names the renderer gap.
+
+## Batch 3 (renderer unlocks, commit 1b70d32)
+
+| Item | Status |
+|---|---|
+| box-shadow (single layer, rgba()/8-digit hex) | done — ComputedStyle field + painter; `shadow-[...]`/`shadow-md` family compiles and paints |
+| cursor grab/grabbing | done — CursorStyle + GDK mapping |
+| user-select none | done — honored in the selection path |
+| truncate (text-overflow: ellipsis) | done — single-line ellipsis in the text painter |
+| negative margins (px) | done |
+| focus-visible | skipped — InteractionState focus-vis bit needs keyboard-path input; blocker documented |
+
+Comparable extraction-style audit after batch 3: **135/276 reference classes compile (was 129)**; the remaining 141 are dominated by message-text fragments from the original capture (not real classes), `ring-*` (composes from CSS vars), `pointer-events` (hit testing owns routing — the lekuvo app uses the hostTick hit-rect instead), `tabular-nums`/`outline-none`/`text-overflow` edge cases, theme palette names (butter/notch/mint/navy/pink — supplied by the app's @theme CSS, not the compiler), and `focus-visible`/`sm:` variants. Full workspace tests: 21 suites ok, 0 failed; clippy clean.
