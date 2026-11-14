@@ -9,11 +9,20 @@
 //! `<number>px` arbitrary lengths the reference UI needs, typography,
 //! borders/radius, overflow, opacity/scale/translate, and the transition
 //! families (`transition-*`, `duration-*`, `ease-*`, `delay-*`, ADR 0024,
-//! with the named animations' `@keyframes` emitted alongside). Everything
-//! else — variants (`hover:`), fractional classes (`w-1/2`), non-px
-//! arbitrary values (`w-[91%]`), and utilities outside the renderer
-//! profile (`shadow`, `position: sticky`) — produces a deterministic
-//! diagnostic, never a silent drop.
+//! with the named animations' `@keyframes` emitted alongside). The
+//! interaction variants (`hover:`, `focus:`, `active:`) compile to
+//! `.class:hover`-style pseudo-class rules restricted to the renderer's
+//! paint-only interaction set (ADR 0011); fractional sizes and insets
+//! (`w-1/2`, `left-1/2`) resolve to percentages; negative insets
+//! (`-top-5`) negate the spacing scale; `cursor-pointer` maps onto the
+//! renderer's cursor set; and `border-[#hex]` arbitrary colors emit
+//! `border-color`. Everything else — other variants (`focus-visible:`,
+//! `disabled:`, `sm:`), non-px arbitrary values (`w-[91%]`),
+//! box-shadow utilities (the renderer has no shadow property yet), and
+//! utilities outside the renderer profile (`position: sticky`,
+//! `pointer-events-*`, `select-none`, `truncate`) — produces a
+//! deterministic diagnostic, never a silent drop
+//! (docs/tailwind-batch2-notes.md records the renderer-side limits).
 //!
 //! The output is plain CSS: one rule per class, in first-use order, so the
 //! renderer's normal cascade applies (class specificity beats element
@@ -21,9 +30,11 @@
 //! utilities at equal specificity). Class selectors escape every character
 //! outside `[A-Za-z0-9-_]` (`.bg-white\/10`, `.p-2\.5`, `.h-\[48px\]`) so
 //! the generated sheet stays parseable while still matching the DOM class
-//! attribute text-for-text.
+//! attribute text-for-text; a variant rule appends the real pseudo-class
+//! (`.hover\:bg-white\/10:hover`), which is exactly the shape the
+//! renderer's M4b interaction styling matches.
 
-use crate::palette;
+use crate::{is_interaction_paint_property, palette};
 
 /// One utility class the compiler could not map, with the reason. The
 /// renderer never sees the class, so this list is the only place a dropped
@@ -83,28 +94,22 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
         if class.starts_with("vv-") {
             continue;
         }
-        match utility_declarations(class) {
-            Ok(declarations) => {
+        match compile_one_class(class) {
+            Ok((selector, declarations)) => {
                 let body = declarations
                     .iter()
                     .map(|(property, value)| format!("{property}: {value};"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let selector = escape_class_selector(class);
                 css.push_str(&format!(".{selector} {{ {body} }}\n"));
                 rules += 1;
                 // Tailwind emits the `@keyframes` a named animation needs
                 // alongside the utility; mirror that so the build output is
                 // self-contained (the renderer drives the presets natively,
                 // so this is output completeness, not a runtime dependency).
-                if let Some(animation) = class.strip_prefix("animate-") {
-                    if let Some(&(name, _)) = ANIMATION_KEYFRAMES
-                        .iter()
-                        .find(|(known, _)| *known == animation)
-                    {
-                        if !keyframes.contains(&name) {
-                            keyframes.push(name);
-                        }
+                if let Some(name) = named_animation(class) {
+                    if !keyframes.contains(&name) {
+                        keyframes.push(name);
                     }
                 }
             }
@@ -148,6 +153,82 @@ fn escape_class_selector(class: &str) -> String {
     escaped
 }
 
+/// One compiled class: the escaped selector text that follows the leading
+/// `.` plus its declarations.
+type CompiledClass = (String, Vec<(&'static str, String)>);
+
+/// The interaction variants the renderer's M4b profile matches (ADR 0011,
+/// frozen set): Tailwind variant name → emitted pseudo-class. Anything
+/// else after the first colon (`focus-visible:`, `disabled:`, `sm:`,
+/// `group-hover:`) is diagnosed — the renderer's selector parser skips
+/// rules whose pseudo-classes fall outside this set.
+const VARIANT_PSEUDO_CLASSES: [(&str, &str); 3] =
+    [("hover", "hover"), ("focus", "focus"), ("active", "active")];
+
+/// Compiles one class (bare utility or `variant:utility`) into the escaped
+/// selector text that follows the leading `.` plus its declarations.
+fn compile_one_class(class: &str) -> Result<CompiledClass, String> {
+    match class.split_once(':') {
+        Some((variant, inner)) => variant_declarations(class, variant, inner),
+        None => utility_declarations(class).map(|d| (escape_class_selector(class), d)),
+    }
+}
+
+/// Compiles a `hover:bg-white/10`-style variant: the inner utility is
+/// compiled to the same declarations as its bare form, then wrapped in the
+/// pseudo-class selector the renderer's M4b interaction styling already
+/// matches (`.hover\:bg-white\/10:hover`). ADR 0011 keeps interaction
+/// rules paint-only — the cascade defers layout properties inside
+/// stateful rules with a runtime diagnostic — so a variant whose inner
+/// utility touches anything outside the frozen paint set is diagnosed
+/// here, at build time, instead.
+fn variant_declarations(class: &str, variant: &str, inner: &str) -> Result<CompiledClass, String> {
+    let Some(&(_, pseudo)) = VARIANT_PSEUDO_CLASSES
+        .iter()
+        .find(|(name, _)| *name == variant)
+    else {
+        return Err(format!(
+            "variant {variant}: is outside the renderer's interaction profile \
+             (hover:/focus:/active: per ADR 0011); focus-visible:, disabled:, \
+             responsive, and group-* variants are not applied in profile v0"
+        ));
+    };
+    if inner.is_empty() {
+        return Err(format!(
+            "variant {variant}: needs a utility after the colon"
+        ));
+    }
+    let declarations = utility_declarations(inner)?;
+    if let Some((property, _)) = declarations
+        .iter()
+        .find(|(property, _)| !is_interaction_paint_property(property))
+    {
+        return Err(format!(
+            "variant {variant}: may only change paint properties (ADR 0011); \
+             {property} under :{pseudo} would be deferred at runtime — put it \
+             on the base utility instead"
+        ));
+    }
+    Ok((
+        format!("{}:{pseudo}", escape_class_selector(class)),
+        declarations,
+    ))
+}
+
+/// The named `@keyframes` a class needs: `animate-spin` and the
+/// variant-wrapped `hover:animate-spin` both carry the spin keyframes.
+fn named_animation(class: &str) -> Option<&'static str> {
+    let bare = match class.split_once(':') {
+        Some((_, inner)) => inner,
+        None => class,
+    };
+    let animation = bare.strip_prefix("animate-")?;
+    ANIMATION_KEYFRAMES
+        .iter()
+        .find(|(known, _)| *known == animation)
+        .map(|(name, _)| *name)
+}
+
 /// The `@keyframes` the named animation utilities reference (Tailwind v3
 /// definitions, verbatim shapes).
 const ANIMATION_KEYFRAMES: &[(&str, &str)] = &[
@@ -189,34 +270,43 @@ fn is_plain_class(class: &str) -> bool {
 fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, String> {
     // Structural refusals first, with targeted guidance.
     if class.contains(':') {
-        return Err(
-            "variant classes (hover:, md:, dark:, …) are not applied in \
-                    the v0 static profile"
-                .into(),
-        );
+        return Err("nested variants (a:b:…) are not applied; one interaction \
+                    variant (hover:/focus:/active:) per class"
+            .into());
     }
     if class.contains('!') {
         return Err("the !important modifier is not part of profile v0".into());
     }
     // Negative utilities (ADR 0024): a leading dash is a sign, not part of
-    // the identifier. Only `translate-*` and `rotate-*` accept one in profile v0.
+    // the identifier. `translate-*`, `rotate-*`, and the inset families
+    // accept one in profile v0.
     let (negative, class) = match class.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, class),
     };
-    if negative && !class.starts_with("translate-") && !class.starts_with("rotate-") {
+    if negative
+        && !(class.starts_with("translate-")
+            || class.starts_with("rotate-")
+            || NEGATABLE_INSETS
+                .iter()
+                .any(|prefix| class.starts_with(prefix)))
+    {
         return Err(
-            "negative utilities are only supported for translate-* and rotate-* in profile v0"
+            "negative utilities are only supported for translate-*, rotate-*, \
+             and inset-* in profile v0"
                 .into(),
         );
     }
     // Opacity modifiers (`bg-white/10`, `text-white/[0.06]`) are only
-    // meaningful on the color utilities, so a `/` elsewhere (`w-1/2`,
-    // `left-1/2`) keeps reaching the escaping diagnostic below.
+    // meaningful on the color utilities, so a `/` elsewhere is a fraction
+    // (`w-1/2`) or a malformed modifier (`bg-white/200`).
     let (class, alpha) = split_alpha_modifier(class);
     // Arbitrary values (`w-[48px]`): the bracketed tail replaces the
     // utility's argument. Malformed brackets keep the deferral diagnostic.
     let (class, arbitrary) = split_arbitrary_value(class)?;
+    // Fractional sizes/insets (`w-1/2`, `left-1/2`): a digit/digit tail on
+    // a size or inset utility. Anything else keeps its usual diagnostic.
+    let (class, fraction) = split_fraction(class);
     if !is_plain_class(class) {
         return Err(format!(
             "class {class:?} needs CSS escaping (fractions or symbols); \
@@ -240,6 +330,13 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
     // diagnose instead of silently ignoring the `/50`.
     if let Some(alpha) = alpha {
         return modified_color(class, alpha);
+    }
+
+    // A fractional size/inset value resolves to a percentage; other
+    // fractions diagnose (deterministically) instead of hitting the
+    // generic escaping refusal.
+    if let Some(fraction) = fraction {
+        return fraction_declarations(class, fraction, negative);
     }
 
     // Three-level families: the first dash is part of the utility name, so
@@ -275,12 +372,25 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         return translate_axis('y', rest, negative);
     }
     if let Some(rest) = class.strip_prefix("inset-x-") {
-        let value = inset_value(rest)?;
+        let value = negate_inset(inset_value(rest)?, negative, "inset-x")?;
         return Ok(vec![("left", value.clone()), ("right", value)]);
     }
     if let Some(rest) = class.strip_prefix("inset-y-") {
-        let value = inset_value(rest)?;
+        let value = negate_inset(inset_value(rest)?, negative, "inset-y")?;
         return Ok(vec![("top", value.clone()), ("bottom", value)]);
+    }
+
+    // Renderer-absent property (docs/tailwind-batch2-notes.md): named
+    // diagnostic instead of the generic catch-all. The dash-bearing class
+    // never reaches the base/arg split as a `pointer-events` family, so it
+    // is handled before it.
+    if let Some(rest) = class.strip_prefix("pointer-events-") {
+        if rest == "none" || rest == "auto" {
+            return Err("pointer-events is not applied by the renderer yet (hit \
+                 testing owns pointer routing)"
+                .into());
+        }
+        return Err(format!("unknown pointer-events utility {class:?}"));
     }
 
     let (base, arg) = match class.split_once('-') {
@@ -570,7 +680,7 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
              anchor with a relative/absolute parent instead"
         )),
         ("inset", Some(value)) => {
-            let value = inset_value(value)?;
+            let value = negate_inset(inset_value(value)?, negative, "inset")?;
             Ok(vec![
                 ("top", value.clone()),
                 ("right", value.clone()),
@@ -578,10 +688,22 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
                 ("left", value),
             ])
         }
-        ("top", Some(value)) => Ok(vec![("top", inset_value(value)?)]),
-        ("right", Some(value)) => Ok(vec![("right", inset_value(value)?)]),
-        ("bottom", Some(value)) => Ok(vec![("bottom", inset_value(value)?)]),
-        ("left", Some(value)) => Ok(vec![("left", inset_value(value)?)]),
+        ("top", Some(value)) => Ok(vec![(
+            "top",
+            negate_inset(inset_value(value)?, negative, "top")?,
+        )]),
+        ("right", Some(value)) => Ok(vec![(
+            "right",
+            negate_inset(inset_value(value)?, negative, "right")?,
+        )]),
+        ("bottom", Some(value)) => Ok(vec![(
+            "bottom",
+            negate_inset(inset_value(value)?, negative, "bottom")?,
+        )]),
+        ("left", Some(value)) => Ok(vec![(
+            "left",
+            negate_inset(inset_value(value)?, negative, "left")?,
+        )]),
 
         // -- stacking ----------------------------------------------------------
         ("z", Some(step)) => match z_index(step) {
@@ -591,16 +713,56 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             )),
         },
 
+        // -- cursor (renderer set: auto/default/pointer/text) ------------------
+        ("cursor", Some(name)) => match name {
+            "auto" | "default" | "pointer" | "text" => Ok(vec![("cursor", name.to_owned())]),
+            "grab" | "grabbing" => Err(format!(
+                "cursor: {name} is outside the renderer's cursor set \
+                 (auto/default/pointer/text); grab cursors are deferred"
+            )),
+            _ => Err(format!(
+                "unknown cursor utility {class:?} (auto/default/pointer/text)"
+            )),
+        },
+
         // -- deliberately unsupported but common -----------------------------------
-        ("shadow" | "cursor" | "ring" | "blur", _)
-        | (
-            "container" | "truncate" | "underline" | "italic" | "uppercase" | "lowercase"
-            | "capitalize" | "sr-only" | "antialiased",
+        // box-shadow: the profile manifest commits to it, but the renderer
+        // has no shadow property or painter yet — deferred with a named
+        // diagnostic (docs/tailwind-batch2-notes.md records the limits,
+        // including the rgba()-to-8-digit-hex plan for when it lands).
+        ("shadow" | "ring" | "blur", _) => Err(format!(
+            "utility {base:?} needs box-shadow, which the renderer does not \
+             apply yet; shadows/rings are deferred"
+        )),
+        (
+            "container" | "underline" | "italic" | "uppercase" | "lowercase" | "capitalize"
+            | "sr-only" | "antialiased",
             None,
         ) => Err(format!(
             "utility {class:?} is outside the renderer profile v0 \
-             (shadows/cursor/decorations are deferred)"
+             (decorations are deferred)"
         )),
+        ("truncate", None) => Err(
+            "truncate needs text-overflow: ellipsis, which the renderer does \
+             not apply yet; overflow-hidden + whitespace-nowrap clip without \
+             the ellipsis"
+                .into(),
+        ),
+        ("tabular", Some("nums")) => {
+            Err("font-variant-numeric is not applied by the renderer yet; \
+             tabular-nums is deferred"
+                .into())
+        }
+        ("select", Some("none")) => Err(
+            "user-select is not applied by the renderer yet; select-none is \
+             deferred"
+                .into(),
+        ),
+        ("outline", Some("none")) => {
+            Err("outline properties are not applied by the renderer yet; \
+             outline-none is deferred"
+                .into())
+        }
         (
             "aspect" | "columns" | "list" | "object" | "align" | "select" | "appearance" | "order"
             | "basis" | "place" | "content" | "outline" | "accent" | "divide" | "space" | "skew"
@@ -674,6 +836,125 @@ fn split_arbitrary_value(class: &str) -> Result<(&str, Option<&str>), String> {
     }
 }
 
+/// Splits a fractional tail off a size or inset utility: `w-1/2` →
+/// (`w`, Some("1/2")). Only a plain `digits/digits` tail splits; anything
+/// else (`w-1/x`, `bg-white/200` malformed modifiers) stays whole so the
+/// class reaches its usual diagnostic.
+fn split_fraction(class: &str) -> (&str, Option<&str>) {
+    let Some((left, den)) = class.split_once('/') else {
+        return (class, None);
+    };
+    let den_is_digits = !den.is_empty() && den.chars().all(|c| c.is_ascii_digit());
+    let (num_digits_len, num_is_digits) = match left.rsplit_once('-') {
+        Some((_, num)) => (
+            num.len(),
+            !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
+        ),
+        None => (0, false),
+    };
+    if !num_is_digits || !den_is_digits {
+        return (class, None);
+    }
+    let base = &left[..left.len() - num_digits_len - 1];
+    if base.is_empty() {
+        return (class, None);
+    }
+    (base, Some(&class[base.len() + 1..]))
+}
+
+/// The inset utility prefixes that accept a leading `-` (`-top-5`,
+/// `-left-4`). `inset-x-*`/`inset-y-*` start with `inset-`, so one entry
+/// covers them.
+const NEGATABLE_INSETS: [&str; 5] = ["top-", "right-", "bottom-", "left-", "inset-"];
+
+/// Negates a spacing-scale inset length for the negative inset utilities
+/// (`-top-5` → -20px). `auto`/`full` have no negative form and diagnose.
+fn negate_inset(value: String, negative: bool, utility: &str) -> Result<String, String> {
+    if !negative {
+        return Ok(value);
+    }
+    if value.ends_with("px") && !value.starts_with('-') {
+        Ok(format!("-{value}"))
+    } else {
+        Err(format!(
+            "cannot negate {utility} value {value:?} (only spacing-scale \
+             lengths have negative forms)"
+        ))
+    }
+}
+
+/// Fractional size/inset values (`w-1/2`, `left-1/2`): resolved to a
+/// percentage of the containing block at layout time (the same contract as
+/// `h-full`), which the renderer's length parser accepts. Other fractions
+/// diagnose — the compiler never emits a value the renderer would reject.
+fn fraction_declarations(
+    base: &str,
+    fraction: &str,
+    negative: bool,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let pct = fraction_percent(fraction)?;
+    let sign = if negative { "-" } else { "" };
+    let value = format!("{sign}{pct}%");
+    match base {
+        "w" => Ok(vec![("width", value)]),
+        "h" => Ok(vec![("height", value)]),
+        "inset" => Ok(vec![
+            ("top", value.clone()),
+            ("right", value.clone()),
+            ("bottom", value.clone()),
+            ("left", value),
+        ]),
+        "inset-x" => Ok(vec![("left", value.clone()), ("right", value)]),
+        "inset-y" => Ok(vec![("top", value.clone()), ("bottom", value)]),
+        "top" => Ok(vec![("top", value)]),
+        "right" => Ok(vec![("right", value)]),
+        "bottom" => Ok(vec![("bottom", value)]),
+        "left" => Ok(vec![("left", value)]),
+        _ => Err(format!(
+            "fractional values ({fraction}) are only supported on the size \
+             (w/h) and inset utilities in profile v0"
+        )),
+    }
+}
+
+/// `1/2` → `50`, `2/3` → `66.666667` (Tailwind's 6-decimal percentages,
+/// trailing zeros trimmed so `1/2` is `50`, not `50.000000`).
+fn fraction_percent(fraction: &str) -> Result<String, String> {
+    let (num, den) = fraction
+        .split_once('/')
+        .expect("fraction shape checked by split_fraction");
+    let num: u32 = num
+        .parse()
+        .map_err(|_| format!("fraction numerator {num:?} must be a non-negative integer"))?;
+    let den: u32 = den
+        .parse()
+        .map_err(|_| format!("fraction denominator {den:?} must be a positive integer"))?;
+    if den == 0 {
+        return Err(format!(
+            "fraction {fraction:?} must have a denominator greater than 0"
+        ));
+    }
+    let mut text = format!("{:.6}", num as f64 * 100.0 / den as f64);
+    if text.contains('.') {
+        while text.ends_with('0') {
+            text.pop();
+        }
+        if text.ends_with('.') {
+            text.pop();
+        }
+    }
+    Ok(text)
+}
+
+/// A `#RGB`/`#RRGGBB`/`#RRGGBBAA` literal the renderer's color parser
+/// accepts, returned verbatim.
+fn hex_color_literal(value: &str) -> Option<&str> {
+    let hex = value.strip_prefix('#')?;
+    let len = hex.len();
+    let digits = (len == 3 || len == 6 || len == 8) && hex.chars().all(|c| c.is_ascii_hexdigit());
+    digits.then_some(value)
+}
+
 /// Arbitrary `<number>px` lengths for the utilities the reference UI needs
 /// (`w-[3px]`, `gap-[2.5px]`, `rounded-[26px]`, `text-[12px]`,
 /// `transition-[width]`). Everything else keeps the deferral diagnostic.
@@ -693,6 +974,15 @@ fn arbitrary_value_declarations(
         return Err(format!(
             "arbitrary transition property {value:?} must be a comma-separated \
              list of lowercase CSS property names"
+        ));
+    }
+    // `shadow-[…]`/`ring-[…]` need box-shadow, which the renderer has no
+    // property or painter for yet — the same named deferral as the
+    // named-scale forms (`shadow-md`).
+    if matches!(base, "shadow" | "ring" | "blur") {
+        return Err(format!(
+            "utility {base:?} needs box-shadow, which the renderer does not \
+             apply yet; shadows/rings are deferred"
         ));
     }
     // Family first, so an unsupported family (`bg-[#14121f]`) keeps the
@@ -737,8 +1027,14 @@ fn arbitrary_value_declarations(
              use the named scale"
         ));
     }
-    // `border-[3px]` carries the named scale's width+style+color triple.
+    // `border-[3px]` carries the named scale's width+style+color triple;
+    // `border-[#hex]` colors only (`focus:border-[#2b2540]` is how the
+    // reference UI draws its focused border). The hex literal is emitted
+    // verbatim — the renderer's color parser accepts 3/6/8-digit hex.
     if base == "border" {
+        if let Some(color) = hex_color_literal(value) {
+            return Ok(vec![("border-color", color.to_owned())]);
+        }
         return Ok(default_border(px_value(value)?));
     }
     let px = arbitrary_px(value)?;
@@ -1268,9 +1564,7 @@ mod tests {
     #[test]
     fn deferred_structures_are_diagnosed_not_dropped_silently() {
         let build = compile_utilities(&[
-            "hover:bg-red-500",
             "w-[91%]",
-            "w-1/2",
             "translate-x-1/2",
             "shadow-md",
             "sticky",
@@ -1279,7 +1573,7 @@ mod tests {
             "unknown-class",
         ]);
         assert_eq!(build.rules, 0);
-        assert_eq!(build.diagnostics.len(), 9, "{:?}", build.diagnostics);
+        assert_eq!(build.diagnostics.len(), 7, "{:?}", build.diagnostics);
         let messages: Vec<(&str, &str)> = build
             .diagnostics
             .iter()
@@ -1290,11 +1584,9 @@ mod tests {
                 .iter()
                 .any(|(c, m)| *c == class && m.contains(needle))
         };
-        assert!(has("hover:bg-red-500", "variant"));
         assert!(has("w-[91%]", "arbitrary"));
-        assert!(has("w-1/2", "escaping"));
-        assert!(has("translate-x-1/2", "escaping"));
-        assert!(has("shadow-md", "renderer profile"));
+        assert!(has("translate-x-1/2", "fractional values"));
+        assert!(has("shadow-md", "box-shadow"));
         assert!(has("sticky", "deferred"));
         assert!(has("mx-auto", "margin: auto"));
         assert!(has("underline", "renderer profile"));
@@ -1575,7 +1867,6 @@ mod tests {
             "text-[10px]/50",
             "bg-white/200",
             "bg-white/[1.5]",
-            "w-1/2",
         ]);
         assert_eq!(build.rules, 0, "modifiers only land on colors");
         let message_for = |class: &str| {
@@ -1592,10 +1883,9 @@ mod tests {
         assert!(message_for("border-2/50").contains("only applies to a color utility"));
         assert!(message_for("text-[10px]/50").contains("only applies to a color utility"));
         // Out-of-range modifiers are not modifiers; the `/` keeps the class
-        // on the escaping diagnostic, same as fractional values (`w-1/2`).
+        // on the escaping diagnostic, same as malformed fractions (`w-1/x`).
         assert!(message_for("bg-white/200").contains("escaping"));
         assert!(message_for("bg-white/[1.5]").contains("escaping"));
-        assert!(message_for("w-1/2").contains("escaping"));
     }
 
     #[test]
@@ -1785,8 +2075,10 @@ mod tests {
         // The renderer's stylesheet parser (cssparser) unescapes the
         // identifier after `.`, so an escaped selector must come back as the
         // exact DOM class text: `.bg-white\/10` matches class "bg-white/10".
+        // A variant rule appends the real pseudo-class (`.hover\:…:hover`),
+        // which tokenizes as Colon + Ident("hover") — the M4b shape.
         use cssparser::{Parser as CssTokenizer, Token};
-        let build = compile_utilities(&["bg-white/10", "p-2.5", "h-[48px]"]);
+        let build = compile_utilities(&["bg-white/10", "hover:bg-white/10", "p-2.5", "h-[48px]"]);
         let mut parser = CssTokenizer::new(&build.css);
         let mut classes = Vec::new();
         let mut after_dot = false;
@@ -1801,6 +2093,297 @@ mod tests {
                 Ok(_) => after_dot = false,
             }
         }
-        assert_eq!(classes, ["bg-white/10", "p-2.5", "h-[48px]"]);
+        assert_eq!(
+            classes,
+            ["bg-white/10", "hover:bg-white/10", "p-2.5", "h-[48px]"]
+        );
+    }
+
+    #[test]
+    fn interaction_variants_compile_to_pseudo_class_rules() {
+        let build = compile_utilities(&[
+            "hover:bg-white/10",
+            "hover:bg-white/20",
+            "hover:text-white/85",
+            "active:scale-90",
+            "active:scale-95",
+            "focus:border-[#2b2540]",
+            "hover:animate-spin",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 7);
+        // The selector keeps the full DOM class text (escaped) plus the real
+        // pseudo-class — the shape the renderer's M4b cascade matches.
+        assert!(
+            build
+                .css
+                .contains(".hover\\:bg-white\\/10:hover { background-color: #ffffff1a; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".hover\\:bg-white\\/20:hover { background-color: #ffffff33; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".hover\\:text-white\\/85:hover { color: #ffffffd9; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".active\\:scale-90:active { transform: scale(0.9); }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".active\\:scale-95:active { transform: scale(0.95); }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".focus\\:border-\\[\\#2b2540\\]:focus { border-color: #2b2540; }")
+        );
+        // The keyframes a variant animation references are still emitted.
+        assert!(build.css.contains("@keyframes spin {"));
+    }
+
+    #[test]
+    fn variants_are_limited_to_paint_properties() {
+        // ADR 0011: interaction rules are paint-only; the cascade would
+        // defer layout properties at runtime, so they diagnose at build time.
+        let build =
+            compile_utilities(&["hover:p-4", "focus:border-2", "active:flex", "hover:z-10"]);
+        assert_eq!(build.rules, 0, "layout properties under variants diagnose");
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("hover:p-4").contains("may only change paint properties"));
+        assert!(message_for("focus:border-2").contains("border-width"));
+        assert!(message_for("active:flex").contains("display"));
+        assert!(message_for("hover:z-10").contains("z-index"));
+    }
+
+    #[test]
+    fn unknown_variants_diagnose() {
+        let build = compile_utilities(&[
+            "focus-visible:ring-2",
+            "focus-visible:ring-butter",
+            "disabled:opacity-25",
+            "sm:flex-row",
+            "group-hover:flex",
+            "placeholder:text-white/35",
+            "hover:",
+        ]);
+        assert_eq!(
+            build.rules, 0,
+            "nothing outside the frozen variant set compiles"
+        );
+        for class in [
+            "focus-visible:ring-2",
+            "focus-visible:ring-butter",
+            "disabled:opacity-25",
+            "sm:flex-row",
+            "group-hover:flex",
+            "placeholder:text-white/35",
+        ] {
+            let message = build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default();
+            assert!(
+                message.contains("interaction profile (hover:/focus:/active:"),
+                "{class}: {message}"
+            );
+        }
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == "hover:")
+                .map(|d| d.message.contains("needs a utility after the colon"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn negative_insets_compile() {
+        let build = compile_utilities(&[
+            "-top-5",
+            "-left-4",
+            "-inset-x-2",
+            "-bottom-1.5",
+            "top-2",
+            "-translate-x-4",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 6);
+        assert!(build.css.contains(".-top-5 { top: -20px; }"));
+        assert!(build.css.contains(".-left-4 { left: -16px; }"));
+        assert!(build.css.contains("left: -8px;"));
+        assert!(build.css.contains("right: -8px;"));
+        assert!(build.css.contains(".-bottom-1\\.5 { bottom: -6px; }"));
+        assert!(build.css.contains(".top-2 { top: 8px; }"));
+        assert!(build.css.contains("transform: translateX(-16px);"));
+    }
+
+    #[test]
+    fn negative_inset_and_fraction_misuse_diagnoses() {
+        let build = compile_utilities(&["-top-full", "-left-auto", "-m-4", "-w-8", "-scale-50"]);
+        assert_eq!(build.rules, 0);
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("-top-full").contains("cannot negate top value"));
+        assert!(message_for("-left-auto").contains("cannot negate left value"));
+        assert!(message_for("-m-4").contains("negative utilities"));
+        assert!(message_for("-w-8").contains("negative utilities"));
+        assert!(message_for("-scale-50").contains("negative utilities"));
+    }
+
+    #[test]
+    fn fraction_sizes_and_insets_compile() {
+        let build = compile_utilities(&[
+            "w-1/2",
+            "h-3/4",
+            "left-1/2",
+            "top-1/3",
+            "w-2/3",
+            "bottom-1/6",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 6);
+        assert!(build.css.contains(".w-1\\/2 { width: 50%; }"));
+        assert!(build.css.contains(".h-3\\/4 { height: 75%; }"));
+        assert!(build.css.contains(".left-1\\/2 { left: 50%; }"));
+        assert!(build.css.contains(".top-1\\/3 { top: 33.333333%; }"));
+        assert!(build.css.contains(".w-2\\/3 { width: 66.666667%; }"));
+        assert!(build.css.contains(".bottom-1\\/6 { bottom: 16.666667%; }"));
+    }
+
+    #[test]
+    fn fraction_misuse_diagnoses() {
+        let build = compile_utilities(&["w-1/0", "p-1/2", "w-1/x", "translate-x-1/2"]);
+        assert_eq!(build.rules, 0);
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("w-1/0").contains("denominator greater than 0"));
+        assert!(message_for("p-1/2").contains("only supported on the size"));
+        // A malformed fraction is not a fraction; it keeps the escaping
+        // diagnostic. A digit tail on a color utility (`text-1/2`) is parsed
+        // as an opacity modifier first, so it never reaches the fraction
+        // path — `text-1` diagnoses as an unknown color token.
+        assert!(message_for("w-1/x").contains("escaping"));
+        assert!(message_for("translate-x-1/2").contains("only supported on the size"));
+    }
+
+    #[test]
+    fn arbitrary_border_hex_colors_compile() {
+        let build = compile_utilities(&["border-[#2b2540]", "focus:border-[#2b2540]"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 2);
+        assert!(
+            build
+                .css
+                .contains(".border-\\[\\#2b2540\\] { border-color: #2b2540; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".focus\\:border-\\[\\#2b2540\\]:focus { border-color: #2b2540; }")
+        );
+        // A malformed hex literal keeps the px-width grammar diagnostic.
+        let build = compile_utilities(&["border-[#zzzzzz]"]);
+        assert_eq!(build.rules, 0);
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .all(|d| d.message.contains("<number>px"))
+        );
+    }
+
+    #[test]
+    fn cursor_utilities_compile_and_grab_stays_deferred() {
+        let build = compile_utilities(&["cursor-pointer", "cursor-default", "cursor-auto"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 3);
+        assert!(build.css.contains(".cursor-pointer { cursor: pointer; }"));
+        assert!(build.css.contains(".cursor-default { cursor: default; }"));
+        assert!(build.css.contains(".cursor-auto { cursor: auto; }"));
+
+        let build = compile_utilities(&["cursor-grab", "cursor-grabbing"]);
+        assert_eq!(build.rules, 0);
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            message_for("cursor-grab").contains("auto/default/pointer/text"),
+            "{}",
+            message_for("cursor-grab")
+        );
+        assert!(message_for("cursor-grabbing").contains("grab cursors are deferred"));
+    }
+
+    #[test]
+    fn renderer_absent_properties_stay_diagnosed() {
+        let build = compile_utilities(&[
+            "pointer-events-none",
+            "pointer-events-auto",
+            "select-none",
+            "outline-none",
+            "truncate",
+            "tabular-nums",
+            "shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]",
+            "ring-2",
+        ]);
+        assert_eq!(build.rules, 0, "renderer-absent properties never compile");
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            message_for("pointer-events-none").contains("pointer-events is not applied"),
+            "{}",
+            message_for("pointer-events-none")
+        );
+        assert!(message_for("pointer-events-auto").contains("pointer-events is not applied"));
+        assert!(message_for("select-none").contains("user-select is not applied"));
+        assert!(message_for("outline-none").contains("outline properties are not applied"));
+        assert!(message_for("truncate").contains("text-overflow"));
+        assert!(message_for("tabular-nums").contains("font-variant-numeric"));
+        assert!(
+            message_for("shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]").contains("box-shadow"),
+            "{}",
+            message_for("shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]")
+        );
+        assert!(message_for("ring-2").contains("box-shadow"));
     }
 }
