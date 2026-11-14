@@ -4,18 +4,24 @@
 //! no network.
 //!
 //! v0 scope is exactly the renderer's profile expressed as utilities:
-//! display/flex/grid layout, spacing, sizing, the v3 color palette,
-//! typography, borders/radius, overflow, opacity/scale/translate, and the
-//! transition families (`transition-*`, `duration-*`, `ease-*`, `delay-*`,
-//! ADR 0024). Everything else — variants (`hover:`), arbitrary values
-//! (`w-[91px]`), fractional classes (`w-1/2`), and utilities outside the
-//! renderer profile (`shadow`, positioning) — produces a deterministic
+//! display/flex/grid layout, positioning/inset/z-index, spacing, sizing,
+//! the v3 color palette (with `/NN` and `/[0.NN]` opacity modifiers), the
+//! `<number>px` arbitrary lengths the reference UI needs, typography,
+//! borders/radius, overflow, opacity/scale/translate, and the transition
+//! families (`transition-*`, `duration-*`, `ease-*`, `delay-*`, ADR 0024,
+//! with the named animations' `@keyframes` emitted alongside). Everything
+//! else — variants (`hover:`), fractional classes (`w-1/2`), non-px
+//! arbitrary values (`w-[91%]`), and utilities outside the renderer
+//! profile (`shadow`, `position: sticky`) — produces a deterministic
 //! diagnostic, never a silent drop.
 //!
 //! The output is plain CSS: one rule per class, in first-use order, so the
 //! renderer's normal cascade applies (class specificity beats element
 //! rules; stylesheets loaded after the generated sheet can still override
-//! utilities at equal specificity).
+//! utilities at equal specificity). Class selectors escape every character
+//! outside `[A-Za-z0-9-_]` (`.bg-white\/10`, `.p-2\.5`, `.h-\[48px\]`) so
+//! the generated sheet stays parseable while still matching the DOM class
+//! attribute text-for-text.
 
 use crate::palette;
 
@@ -61,6 +67,7 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
     let mut diagnostics = Vec::new();
     let mut rules = 0usize;
     let mut seen: Vec<&str> = Vec::new();
+    let mut keyframes: Vec<&'static str> = Vec::new();
 
     for class in classes {
         let class = class.trim();
@@ -83,14 +90,38 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
                     .map(|(property, value)| format!("{property}: {value};"))
                     .collect::<Vec<_>>()
                     .join(" ");
-                css.push_str(&format!(".{class} {{ {body} }}\n"));
+                let selector = escape_class_selector(class);
+                css.push_str(&format!(".{selector} {{ {body} }}\n"));
                 rules += 1;
+                // Tailwind emits the `@keyframes` a named animation needs
+                // alongside the utility; mirror that so the build output is
+                // self-contained (the renderer drives the presets natively,
+                // so this is output completeness, not a runtime dependency).
+                if let Some(animation) = class.strip_prefix("animate-") {
+                    if let Some(&(name, _)) = ANIMATION_KEYFRAMES
+                        .iter()
+                        .find(|(known, _)| *known == animation)
+                    {
+                        if !keyframes.contains(&name) {
+                            keyframes.push(name);
+                        }
+                    }
+                }
             }
             Err(message) => diagnostics.push(UtilityDiagnostic {
                 class: class.to_owned(),
                 message,
             }),
         }
+    }
+
+    for name in keyframes {
+        let body = ANIMATION_KEYFRAMES
+            .iter()
+            .find(|(known, _)| *known == name)
+            .map(|(_, body)| *body)
+            .expect("keyframes name comes from the table");
+        css.push_str(&format!("@keyframes {name} {{ {body} }}\n"));
     }
 
     TailwindBuild {
@@ -100,8 +131,49 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
     }
 }
 
+/// Escapes a class name for use in a CSS class selector: every character
+/// outside `[A-Za-z0-9-_]` gets a backslash (`.bg-white\/10`, `.p-2\.5`,
+/// `.h-\[48px\]`). A CSS parser unescapes the identifier, so the rule still
+/// matches the DOM class attribute text-for-text.
+fn escape_class_selector(class: &str) -> String {
+    let mut escaped = String::with_capacity(class.len());
+    for c in class.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            escaped.push(c);
+        } else {
+            escaped.push('\\');
+            escaped.push(c);
+        }
+    }
+    escaped
+}
+
+/// The `@keyframes` the named animation utilities reference (Tailwind v3
+/// definitions, verbatim shapes).
+const ANIMATION_KEYFRAMES: &[(&str, &str)] = &[
+    (
+        "spin",
+        "from { transform: rotate(0deg); } to { transform: rotate(360deg); }",
+    ),
+    ("pulse", "0%, 100% { opacity: 1; } 50% { opacity: 0.5; }"),
+    (
+        "bounce",
+        "0%, 100% { transform: translateY(-25%); \
+         animation-timing-function: cubic-bezier(0.8, 0, 1, 1); } \
+         50% { transform: none; \
+         animation-timing-function: cubic-bezier(0, 0, 0.2, 1); }",
+    ),
+];
+
+/// Why an opacity modifier on a non-color utility is refused, shared by the
+/// named-scale and arbitrary-value dispatch paths.
+const OPACITY_MODIFIER_ONLY_ON_COLOR: &str = "an opacity modifier only applies \
+     to a color utility (bg-<color>/NN, text-<color>/NN, border-<color>/NN)";
+
 /// Characters a class may contain for the v0 pipeline: CSS-escape-free
-/// identifiers the renderer's selector parser handles as authored.
+/// identifiers the renderer's selector parser handles as authored. A `.` is
+/// allowed so the decimal spacing steps (`p-2.5`) compile; `compile_utilities`
+/// escapes it in the generated selector.
 fn is_plain_class(class: &str) -> bool {
     class
         .chars()
@@ -109,7 +181,7 @@ fn is_plain_class(class: &str) -> bool {
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && class
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Maps one utility class to its declarations, or explains why it is
@@ -120,13 +192,6 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         return Err(
             "variant classes (hover:, md:, dark:, …) are not applied in \
                     the v0 static profile"
-                .into(),
-        );
-    }
-    if class.contains('[') {
-        return Err(
-            "arbitrary values (e.g. w-[91px]) are deferred in profile v0; \
-                    use the named scale"
                 .into(),
         );
     }
@@ -145,11 +210,36 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
                 .into(),
         );
     }
+    // Opacity modifiers (`bg-white/10`, `text-white/[0.06]`) are only
+    // meaningful on the color utilities, so a `/` elsewhere (`w-1/2`,
+    // `left-1/2`) keeps reaching the escaping diagnostic below.
+    let (class, alpha) = split_alpha_modifier(class);
+    // Arbitrary values (`w-[48px]`): the bracketed tail replaces the
+    // utility's argument. Malformed brackets keep the deferral diagnostic.
+    let (class, arbitrary) = split_arbitrary_value(class)?;
     if !is_plain_class(class) {
         return Err(format!(
-            "class {class:?} needs CSS escaping (fractions, decimals, or \
-             symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only"
+            "class {class:?} needs CSS escaping (fractions or symbols); \
+             the v0 pipeline compiles plain [A-Za-z0-9-_.] classes only"
         ));
+    }
+
+    // Arbitrary-value utilities dispatch separately: the bracket carries the
+    // argument the named scale would provide. A modifier alongside a bracket
+    // (`text-[10px]/50`) has nothing to land on, so diagnose — never silent.
+    if let Some(value) = arbitrary {
+        if alpha.is_some() {
+            return Err(OPACITY_MODIFIER_ONLY_ON_COLOR.into());
+        }
+        let declarations = arbitrary_value_declarations(class, value)?;
+        return Ok(declarations);
+    }
+
+    // A color utility carrying an opacity modifier resolves here, so the
+    // modifier can only ever land on a color: `text-lg/50` and `border-2/50`
+    // diagnose instead of silently ignoring the `/50`.
+    if let Some(alpha) = alpha {
+        return modified_color(class, alpha);
     }
 
     // Three-level families: the first dash is part of the utility name, so
@@ -183,6 +273,14 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
     }
     if let Some(rest) = class.strip_prefix("translate-y-") {
         return translate_axis('y', rest, negative);
+    }
+    if let Some(rest) = class.strip_prefix("inset-x-") {
+        let value = inset_value(rest)?;
+        return Ok(vec![("left", value.clone()), ("right", value)]);
+    }
+    if let Some(rest) = class.strip_prefix("inset-y-") {
+        let value = inset_value(rest)?;
+        return Ok(vec![("top", value.clone()), ("bottom", value)]);
     }
 
     let (base, arg) = match class.split_once('-') {
@@ -465,23 +563,43 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             )),
         },
 
-        // -- deliberately unsupported but common -----------------------------------
-        ("absolute" | "fixed" | "sticky" | "static" | "relative", _)
-        | ("inset", _)
-        | ("top", _)
-        | ("right", _)
-        | ("bottom", _)
-        | ("left", _) => {
-            Err("positioning is outside the renderer profile v0 (layout is flow/flex/grid)".into())
+        // -- positioning (renderer profile: relative/absolute/static) ----------
+        ("static" | "relative" | "absolute", None) => Ok(vec![("position", class.to_owned())]),
+        ("fixed" | "sticky", None) => Err(format!(
+            "position: {class} is deferred in profile v0; \
+             anchor with a relative/absolute parent instead"
+        )),
+        ("inset", Some(value)) => {
+            let value = inset_value(value)?;
+            Ok(vec![
+                ("top", value.clone()),
+                ("right", value.clone()),
+                ("bottom", value.clone()),
+                ("left", value),
+            ])
         }
-        ("shadow" | "cursor" | "z" | "ring" | "blur", _)
+        ("top", Some(value)) => Ok(vec![("top", inset_value(value)?)]),
+        ("right", Some(value)) => Ok(vec![("right", inset_value(value)?)]),
+        ("bottom", Some(value)) => Ok(vec![("bottom", inset_value(value)?)]),
+        ("left", Some(value)) => Ok(vec![("left", inset_value(value)?)]),
+
+        // -- stacking ----------------------------------------------------------
+        ("z", Some(step)) => match z_index(step) {
+            Some(value) => Ok(vec![("z-index", value)]),
+            None => Err(format!(
+                "unknown z step {step:?} (0/10/20/30/40/50 or auto)"
+            )),
+        },
+
+        // -- deliberately unsupported but common -----------------------------------
+        ("shadow" | "cursor" | "ring" | "blur", _)
         | (
             "container" | "truncate" | "underline" | "italic" | "uppercase" | "lowercase"
             | "capitalize" | "sr-only" | "antialiased",
             None,
         ) => Err(format!(
             "utility {class:?} is outside the renderer profile v0 \
-             (shadows/cursor/z-index/decorations are deferred)"
+             (shadows/cursor/decorations are deferred)"
         )),
         (
             "aspect" | "columns" | "list" | "object" | "align" | "select" | "appearance" | "order"
@@ -494,6 +612,282 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             "class {class:?} is not a known utility in profile v0 \
              (custom CSS still works through stylesheets)"
         )),
+    }
+}
+
+/// Splits a trailing opacity modifier off a color utility class:
+/// `bg-white/10` → (`bg-white`, Some(26)). Only a syntactically valid
+/// modifier is taken; anything else (`bg-white/x`, `left-1/2`) is left in
+/// place so the class reaches its usual diagnostic.
+fn split_alpha_modifier(class: &str) -> (&str, Option<u8>) {
+    let color_utility =
+        class.starts_with("bg-") || class.starts_with("text-") || class.starts_with("border-");
+    if !color_utility {
+        return (class, None);
+    }
+    match class.split_once('/') {
+        Some((base, modifier)) => match parse_alpha_channel(modifier) {
+            Some(alpha) => (base, Some(alpha)),
+            None => (class, None),
+        },
+        None => (class, None),
+    }
+}
+
+/// Parses an opacity modifier into the 0–255 alpha channel: `NN` percent
+/// (0–100, exact integer math so `/90` composes to 230, not a `0.9f32`
+/// wobble) or `[0.NN]` alpha (0.0–1.0), as in `bg-white/25` and
+/// `bg-white/[0.06]`.
+fn parse_alpha_channel(modifier: &str) -> Option<u8> {
+    if let Some(inner) = modifier.strip_prefix('[').and_then(|m| m.strip_suffix(']')) {
+        let alpha: f64 = inner.parse().ok()?;
+        return (0.0..=1.0)
+            .contains(&alpha)
+            .then(|| (alpha * 255.0).round() as u8);
+    }
+    let percent: u16 = modifier.parse().ok()?;
+    if !(0..=100).contains(&percent) {
+        return None;
+    }
+    Some(((percent as u32 * 255 + 50) / 100) as u8)
+}
+
+/// Splits a bracketed arbitrary value off a utility class: `w-[48px]` →
+/// (`w`, Some("48px")). The value is the text between the brackets; the
+/// utility keeps everything before the opening bracket's dash.
+fn split_arbitrary_value(class: &str) -> Result<(&str, Option<&str>), String> {
+    match class.split_once('[') {
+        Some((base, rest)) => {
+            let value = rest.strip_suffix(']').filter(|inner| !inner.contains('['));
+            match value {
+                Some(value) => Ok((base.strip_suffix('-').unwrap_or(base), Some(value))),
+                // Malformed brackets (`bg-[`, `shadow-[0`) keep the deferral
+                // diagnostic — same contract as profile v0's original refusal.
+                None => Err(
+                    "arbitrary values (e.g. w-[91px]) are deferred in profile v0; \
+                     use the named scale"
+                        .into(),
+                ),
+            }
+        }
+        None => Ok((class, None)),
+    }
+}
+
+/// Arbitrary `<number>px` lengths for the utilities the reference UI needs
+/// (`w-[3px]`, `gap-[2.5px]`, `rounded-[26px]`, `text-[12px]`,
+/// `transition-[width]`). Everything else keeps the deferral diagnostic.
+fn arbitrary_value_declarations(
+    base: &str,
+    value: &str,
+) -> Result<Vec<(&'static str, String)>, String> {
+    // `transition-[…]` carries property names, not a length.
+    if base == "transition" {
+        if !value.is_empty()
+            && value.split(',').all(|property| {
+                !property.is_empty() && property.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            })
+        {
+            return Ok(transition_declarations(value));
+        }
+        return Err(format!(
+            "arbitrary transition property {value:?} must be a comma-separated \
+             list of lowercase CSS property names"
+        ));
+    }
+    // Family first, so an unsupported family (`bg-[#14121f]`) keeps the
+    // deferral diagnostic regardless of its value grammar.
+    if !matches!(
+        base,
+        "w" | "h"
+            | "min-w"
+            | "min-h"
+            | "max-w"
+            | "max-h"
+            | "gap"
+            | "gap-x"
+            | "gap-y"
+            | "p"
+            | "px"
+            | "py"
+            | "pt"
+            | "pr"
+            | "pb"
+            | "pl"
+            | "m"
+            | "mx"
+            | "my"
+            | "mt"
+            | "mr"
+            | "mb"
+            | "ml"
+            | "inset"
+            | "inset-x"
+            | "inset-y"
+            | "top"
+            | "right"
+            | "bottom"
+            | "left"
+            | "rounded"
+            | "border"
+            | "text"
+    ) {
+        return Err(format!(
+            "arbitrary {base:?} values are deferred in profile v0; \
+             use the named scale"
+        ));
+    }
+    // `border-[3px]` carries the named scale's width+style+color triple.
+    if base == "border" {
+        return Ok(default_border(px_value(value)?));
+    }
+    let px = arbitrary_px(value)?;
+    Ok(match base {
+        "w" => vec![("width", px)],
+        "h" => vec![("height", px)],
+        "min-w" => vec![("min-width", px)],
+        "min-h" => vec![("min-height", px)],
+        "max-w" => vec![("max-width", px)],
+        "max-h" => vec![("max-height", px)],
+        "gap" => vec![("gap", px)],
+        "gap-x" => vec![("column-gap", px)],
+        "gap-y" => vec![("row-gap", px)],
+        "p" => vec![("padding", px)],
+        "px" => vec![("padding-left", px.clone()), ("padding-right", px)],
+        "py" => vec![("padding-top", px.clone()), ("padding-bottom", px)],
+        "pt" => vec![("padding-top", px)],
+        "pr" => vec![("padding-right", px)],
+        "pb" => vec![("padding-bottom", px)],
+        "pl" => vec![("padding-left", px)],
+        "m" => vec![("margin", px)],
+        "mx" => vec![("margin-left", px.clone()), ("margin-right", px)],
+        "my" => vec![("margin-top", px.clone()), ("margin-bottom", px)],
+        "mt" => vec![("margin-top", px)],
+        "mr" => vec![("margin-right", px)],
+        "mb" => vec![("margin-bottom", px)],
+        "ml" => vec![("margin-left", px)],
+        "inset" => vec![
+            ("top", px.clone()),
+            ("right", px.clone()),
+            ("bottom", px.clone()),
+            ("left", px),
+        ],
+        "inset-x" => vec![("left", px.clone()), ("right", px)],
+        "inset-y" => vec![("top", px.clone()), ("bottom", px)],
+        "top" => vec![("top", px)],
+        "right" => vec![("right", px)],
+        "bottom" => vec![("bottom", px)],
+        "left" => vec![("left", px)],
+        "rounded" => vec![("border-radius", px)],
+        // Tailwind emits font-size only for an arbitrary size (the named
+        // scale owns the line-height pairing).
+        "text" => vec![("font-size", px)],
+        _ => unreachable!("family membership checked above"),
+    })
+}
+
+/// Validates an arbitrary length: `<number>px` (0..=4096; fractions like
+/// `2.5px` allowed — the renderer's lengths are f32). The number is
+/// re-emitted so `w-[03px]` normalizes to `3px`.
+fn arbitrary_px(value: &str) -> Result<String, String> {
+    let number: f32 = value
+        .strip_suffix("px")
+        .and_then(|number| number.parse().ok())
+        .ok_or_else(|| {
+            format!("arbitrary value {value:?} outside the v0 grammar (only <number>px lengths)")
+        })?;
+    if !(0.0..=4096.0).contains(&number) {
+        return Err(format!(
+            "arbitrary value {value:?} outside the v0 range (0..=4096px)"
+        ));
+    }
+    Ok(format!("{number}px"))
+}
+
+/// Parses an arbitrary `<number>px` width for `border-[Npx]` (integral px,
+/// matching the named `border-N` scale that carries width + style + color).
+fn px_value(value: &str) -> Result<u32, String> {
+    let number: f32 = value
+        .strip_suffix("px")
+        .and_then(|number| number.parse().ok())
+        .ok_or_else(|| {
+            format!("arbitrary border width {value:?} outside the v0 grammar (only <number>px)")
+        })?;
+    if !(0.0..=4096.0).contains(&number) || number.fract() != 0.0 {
+        return Err(format!(
+            "arbitrary border width {value:?} must be an integral px width (0..=4096)"
+        ));
+    }
+    Ok(number as u32)
+}
+
+/// Resolves a color utility that carries an opacity modifier
+/// (`bg-white/10` → `background-color: #ffffff1a`). Dispatched before the
+/// named-scale match so the modifier can only ever land on a color: a
+/// modifier on a non-color utility (`text-lg/50`, `border-2/50`) is a usage
+/// error, never a silently ignored `/50`.
+fn modified_color(class: &str, alpha: u8) -> Result<Vec<(&'static str, String)>, String> {
+    let only_color = || Err(OPACITY_MODIFIER_ONLY_ON_COLOR.into());
+    let Some((base, token)) = class.split_once('-') else {
+        // An arbitrary size with a modifier (`text-[10px]/50`): the size
+        // branch would never carry the alpha, so diagnose.
+        return only_color();
+    };
+    let non_color = match base {
+        "text" => is_font_size(token).is_some() || matches!(token, "left" | "center" | "right"),
+        "border" => !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()),
+        _ => false,
+    };
+    if non_color {
+        return only_color();
+    }
+    let unknown = match base {
+        "bg" => format!("unknown bg utility {class:?} (gradients/images are deferred)"),
+        "border" => format!("unknown border utility {class:?}"),
+        _ => format!("unknown text utility {class:?} (size or color?)"),
+    };
+    let hex = color_token(token).ok_or(unknown)?;
+    let property = match base {
+        "bg" => "background-color",
+        "border" => "border-color",
+        _ => "color",
+    };
+    Ok(vec![(property, compose_alpha(hex, alpha))])
+}
+
+/// Composes an alpha channel (0–255) into a 6-digit hex color, producing
+/// the `#RRGGBBAA` form the renderer's color parser accepts.
+fn compose_alpha(hex: &str, alpha: u8) -> String {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    let channel = |lo: usize| u8::from_str_radix(&hex[lo..lo + 2], 16).unwrap_or(0);
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        channel(0),
+        channel(2),
+        channel(4),
+        alpha
+    )
+}
+
+/// `inset-*`/`top-*`/… values: the spacing scale plus `auto`/`full`
+/// (percentage-of-containing-block resolves at layout time, like `h-full`).
+fn inset_value(token: &str) -> Result<String, String> {
+    match token {
+        "auto" => Ok("auto".into()),
+        "full" => Ok("100%".into()),
+        _ => spacing_px(token, "inset"),
+    }
+}
+
+/// The `z-<step>` stacking scale (Tailwind v3) + `auto`.
+fn z_index(token: &str) -> Option<String> {
+    match token {
+        "auto" => Some("auto".into()),
+        _ => {
+            const STEPS: [u16; 6] = [0, 10, 20, 30, 40, 50];
+            let step: u16 = token.parse().ok()?;
+            STEPS.contains(&step).then(|| step.to_string())
+        }
     }
 }
 
@@ -590,8 +984,9 @@ fn default_border(width: u32) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The Tailwind spacing scale: integer units are 4px per step (0.25rem);
-/// `px` is 1px. Negative margins and fractional steps are v0-deferred.
+/// The Tailwind spacing scale: units are 4px per step (0.25rem), with the
+/// named decimal steps (`0.5`, `1.5`, `2.5`, `3.5`) resolving to integral
+/// pixels; `px` is 1px. Negative margins are v0-deferred.
 fn spacing_px(token: &str, utility: &str) -> Result<String, String> {
     match token {
         "0" => Ok("0px".into()),
@@ -604,9 +999,10 @@ fn spacing_px(token: &str, utility: &str) -> Result<String, String> {
             let units: f32 = token
                 .parse()
                 .map_err(|_| format!("unknown {utility} scale {token:?}"))?;
-            if !(0.0..=96.0).contains(&units) || units.fract() != 0.0 {
+            if !(0.0..=96.0).contains(&units) || (units * 4.0).fract() != 0.0 {
                 return Err(format!(
-                    "{utility} scale {token:?} outside the v0 range (integer 0..=96)"
+                    "{utility} scale {token:?} outside the v0 range (steps of \
+                     0.25 up to 96)"
                 ));
             }
             Ok(format!("{}px", units * 4.0))
@@ -873,11 +1269,11 @@ mod tests {
     fn deferred_structures_are_diagnosed_not_dropped_silently() {
         let build = compile_utilities(&[
             "hover:bg-red-500",
-            "w-[91px]",
+            "w-[91%]",
             "w-1/2",
-            "p-2.5",
+            "translate-x-1/2",
             "shadow-md",
-            "absolute",
+            "sticky",
             "mx-auto",
             "underline",
             "unknown-class",
@@ -895,11 +1291,11 @@ mod tests {
                 .any(|(c, m)| *c == class && m.contains(needle))
         };
         assert!(has("hover:bg-red-500", "variant"));
-        assert!(has("w-[91px]", "arbitrary"));
+        assert!(has("w-[91%]", "arbitrary"));
         assert!(has("w-1/2", "escaping"));
-        assert!(has("p-2.5", "escaping"));
+        assert!(has("translate-x-1/2", "escaping"));
         assert!(has("shadow-md", "renderer profile"));
-        assert!(has("absolute", "positioning"));
+        assert!(has("sticky", "deferred"));
         assert!(has("mx-auto", "margin: auto"));
         assert!(has("underline", "renderer profile"));
         assert!(has("unknown-class", "not a known utility"));
@@ -1094,5 +1490,317 @@ mod tests {
         );
         assert!(build.css.contains("animation: bounce 1s infinite;"));
         assert!(build.css.contains("animation: none;"));
+    }
+
+    #[test]
+    fn color_opacity_modifiers_compose_alpha() {
+        let build = compile_utilities(&[
+            "bg-white/10",
+            "bg-white/25",
+            "bg-white/80",
+            "bg-white/90",
+            "bg-black/55",
+            "bg-black/60",
+            "bg-black/80",
+            "text-white/35",
+            "text-white/90",
+            "border-white/20",
+            "bg-white/[0.06]",
+            "bg-rose-600/50",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 12);
+        // Alpha channels round exactly: /10 → 26 (0x1a), /90 → 230 (0xe6) —
+        // the 8-digit hex shape the renderer's color parser accepts.
+        assert!(
+            build
+                .css
+                .contains(".bg-white\\/10 { background-color: #ffffff1a; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-white\\/25 { background-color: #ffffff40; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-white\\/80 { background-color: #ffffffcc; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-white\\/90 { background-color: #ffffffe6; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-black\\/55 { background-color: #0000008c; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-black\\/60 { background-color: #00000099; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-black\\/80 { background-color: #000000cc; }")
+        );
+        assert!(build.css.contains(".text-white\\/35 { color: #ffffff59; }"));
+        assert!(build.css.contains(".text-white\\/90 { color: #ffffffe6; }"));
+        assert!(
+            build
+                .css
+                .contains(".border-white\\/20 { border-color: #ffffff33; }")
+        );
+        // Bracketed alpha ([0.0–1.0]) composes the same way.
+        assert!(
+            build
+                .css
+                .contains(".bg-white\\/\\[0\\.06\\] { background-color: #ffffff0f; }")
+        );
+        assert!(
+            build
+                .css
+                .contains(".bg-rose-600\\/50 { background-color: #e11d4880; }")
+        );
+    }
+
+    #[test]
+    fn opacity_modifier_misuse_diagnoses() {
+        let build = compile_utilities(&[
+            "text-lg/50",
+            "border-2/50",
+            "text-[10px]/50",
+            "bg-white/200",
+            "bg-white/[1.5]",
+            "w-1/2",
+        ]);
+        assert_eq!(build.rules, 0, "modifiers only land on colors");
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        // A modifier on a non-color utility is a usage error, not a silent
+        // drop of the modifier.
+        assert!(message_for("text-lg/50").contains("only applies to a color utility"));
+        assert!(message_for("border-2/50").contains("only applies to a color utility"));
+        assert!(message_for("text-[10px]/50").contains("only applies to a color utility"));
+        // Out-of-range modifiers are not modifiers; the `/` keeps the class
+        // on the escaping diagnostic, same as fractional values (`w-1/2`).
+        assert!(message_for("bg-white/200").contains("escaping"));
+        assert!(message_for("bg-white/[1.5]").contains("escaping"));
+        assert!(message_for("w-1/2").contains("escaping"));
+    }
+
+    #[test]
+    fn positioning_and_stacking_compile() {
+        let build = compile_utilities(&[
+            "relative",
+            "absolute",
+            "inset-0",
+            "inset-x-0",
+            "top-0",
+            "left-0",
+            "right-0",
+            "bottom-0",
+            "bottom-full",
+            "bottom-1.5",
+            "bottom-2",
+            "bottom-auto",
+            "z-10",
+            "z-20",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 14);
+        assert!(build.css.contains(".relative { position: relative; }"));
+        assert!(build.css.contains(".absolute { position: absolute; }"));
+        assert!(build.css.contains(".inset-0 {"));
+        assert!(build.css.contains("top: 0px;"));
+        assert!(build.css.contains("right: 0px;"));
+        assert!(build.css.contains("bottom: 0px;"));
+        assert!(build.css.contains("left: 0px;"));
+        assert!(build.css.contains(".bottom-full { bottom: 100%; }"));
+        assert!(build.css.contains(".bottom-1\\.5 { bottom: 6px; }"));
+        assert!(build.css.contains(".bottom-2 { bottom: 8px; }"));
+        assert!(build.css.contains(".bottom-auto { bottom: auto; }"));
+        assert!(build.css.contains(".z-10 { z-index: 10; }"));
+        assert!(build.css.contains(".z-20 { z-index: 20; }"));
+    }
+
+    #[test]
+    fn deferred_position_values_still_diagnose() {
+        let build = compile_utilities(&["fixed", "sticky", "z-15"]);
+        assert_eq!(build.rules, 0);
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("fixed").contains("position: fixed is deferred"));
+        assert!(message_for("sticky").contains("position: sticky is deferred"));
+        assert!(message_for("z-15").contains("unknown z step"));
+    }
+
+    #[test]
+    fn decimal_spacing_steps_compile() {
+        let build = compile_utilities(&[
+            "p-2.5",
+            "gap-1.5",
+            "mt-0.5",
+            "w-3.5",
+            "h-1.5",
+            "px-2.5",
+            "gap-y-0.5",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains("padding: 10px"));
+        assert!(build.css.contains("gap: 6px"));
+        assert!(build.css.contains("margin-top: 2px"));
+        assert!(build.css.contains("width: 14px"));
+        assert!(build.css.contains("height: 6px"));
+        assert!(build.css.contains("padding-left: 10px"));
+        assert!(build.css.contains("row-gap: 2px"));
+    }
+
+    #[test]
+    fn arbitrary_px_lengths_compile() {
+        let build = compile_utilities(&[
+            "h-[48px]",
+            "w-[3px]",
+            "w-[86px]",
+            "gap-[2.5px]",
+            "gap-[3px]",
+            "rounded-[26px]",
+            "text-[10px]",
+            "text-[11.5px]",
+            "text-[12px]",
+            "min-w-0",
+            "min-h-0",
+            "top-[2px]",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 12);
+        assert!(build.css.contains(".h-\\[48px\\] { height: 48px; }"));
+        assert!(build.css.contains(".w-\\[3px\\] { width: 3px; }"));
+        assert!(build.css.contains(".w-\\[86px\\] { width: 86px; }"));
+        assert!(build.css.contains(".gap-\\[2\\.5px\\] { gap: 2.5px; }"));
+        assert!(build.css.contains(".gap-\\[3px\\] { gap: 3px; }"));
+        assert!(
+            build
+                .css
+                .contains(".rounded-\\[26px\\] { border-radius: 26px; }")
+        );
+        // Arbitrary font sizes set font-size only (the named scale owns the
+        // line-height pairing, matching Tailwind).
+        assert!(build.css.contains(".text-\\[10px\\] { font-size: 10px; }"));
+        assert!(
+            build
+                .css
+                .contains(".text-\\[11\\.5px\\] { font-size: 11.5px; }")
+        );
+        assert!(build.css.contains(".text-\\[12px\\] { font-size: 12px; }"));
+        assert!(build.css.contains(".min-w-0 { min-width: 0px; }"));
+        assert!(build.css.contains(".min-h-0 { min-height: 0px; }"));
+        assert!(build.css.contains(".top-\\[2px\\] { top: 2px; }"));
+    }
+
+    #[test]
+    fn non_px_arbitrary_values_still_diagnose() {
+        let build = compile_utilities(&["w-[91%]", "h-[2em]", "bg-[#14121f]", "w-[calc(1px+2px)]"]);
+        assert_eq!(build.rules, 0);
+        let message_for = |class: &str| {
+            build
+                .diagnostics
+                .iter()
+                .find(|d| d.class == class)
+                .map(|d| d.message.clone())
+                .unwrap_or_default()
+        };
+        assert!(message_for("w-[91%]").contains("<number>px"));
+        assert!(message_for("h-[2em]").contains("<number>px"));
+        assert!(message_for("bg-[#14121f]").contains("arbitrary \"bg\" values are deferred"));
+        assert!(message_for("w-[calc(1px+2px)]").contains("<number>px"));
+    }
+
+    #[test]
+    fn transition_and_duration_steps_compile() {
+        let build = compile_utilities(&[
+            "transition",
+            "transition-colors",
+            "transition-transform",
+            "transition-[width]",
+            "duration-500",
+            "duration-1000",
+            "ease-linear",
+            "ease-out",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert!(build.css.contains(".transition {"));
+        assert!(build.css.contains(".transition-colors {"));
+        assert!(build.css.contains(".transition-transform {"));
+        assert!(
+            build
+                .css
+                .contains(".transition-\\[width\\] { transition-property: width;")
+        );
+        assert!(build.css.contains("transition-duration: 500ms;"));
+        assert!(build.css.contains("transition-duration: 1000ms;"));
+        assert!(build.css.contains("transition-timing-function: linear;"));
+        assert!(
+            build
+                .css
+                .contains("transition-timing-function: cubic-bezier(0, 0, 0.2, 1);")
+        );
+    }
+
+    #[test]
+    fn keyframes_are_emitted_with_named_animations() {
+        let build = compile_utilities(&["animate-spin", "animate-pulse", "animate-bounce"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 3, "keyframes are not utility rules");
+        // The keyframes follow the utility rules, once per named animation.
+        let spin_rule = build.css.find(".animate-spin {").expect("spin rule");
+        let keyframes = build.css.find("@keyframes spin {").expect("spin keyframes");
+        assert!(spin_rule < keyframes);
+        assert!(build.css.contains("to { transform: rotate(360deg); }"));
+        assert!(build.css.contains("@keyframes pulse {"));
+        assert!(build.css.contains("50% { opacity: 0.5; }"));
+        assert!(build.css.contains("@keyframes bounce {"));
+        // Unrelated builds do not carry unused keyframes.
+        let plain = compile_utilities(&["flex"]);
+        assert!(!plain.css.contains("@keyframes"));
+    }
+
+    #[test]
+    fn escaped_class_selectors_round_trip_through_a_css_parser() {
+        // The renderer's stylesheet parser (cssparser) unescapes the
+        // identifier after `.`, so an escaped selector must come back as the
+        // exact DOM class text: `.bg-white\/10` matches class "bg-white/10".
+        use cssparser::{Parser as CssTokenizer, Token};
+        let build = compile_utilities(&["bg-white/10", "p-2.5", "h-[48px]"]);
+        let mut parser = CssTokenizer::new(&build.css);
+        let mut classes = Vec::new();
+        let mut after_dot = false;
+        loop {
+            match parser.next_including_whitespace() {
+                Err(_) => break,
+                Ok(Token::Delim('.')) => after_dot = true,
+                Ok(Token::Ident(name)) if after_dot => {
+                    classes.push(name.to_string());
+                    after_dot = false;
+                }
+                Ok(_) => after_dot = false,
+            }
+        }
+        assert_eq!(classes, ["bg-white/10", "p-2.5", "h-[48px]"]);
     }
 }
