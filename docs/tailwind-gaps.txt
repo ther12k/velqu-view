@@ -1,0 +1,277 @@
+tokens: 389  compiled: 113  diagnostics: 276
+UNSUPPORTED	/	class "/" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	]	class "]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	0	class "0" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	0.6	class "0.6" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	0.7	class "0.7" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	0.8	class "0.8" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	1	class "1" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	-10px	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	10px	class "10px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	-12px	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	14121f]	class "14121f]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	15	class "15" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	-16px	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	16px	class "16px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	188px]	class "188px]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	20	class "20" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	22px	class "22px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	24px	class "24px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	2550]	class "2550]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	2b2540]	class "2b2540]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	3	class "3" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	3]	class "3]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	31	class "31" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	36px	class "36px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	37	class "37" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	38	class "38" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	4	class "4" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	4]	class "4]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	5	class "5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	50px	class "50px" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	6	class "6" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	60	class "60" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	7	class "7" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	8]	class "8]" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	80	class "80" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	8]/20	class "8]/20" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	8]/30	class "8]/30" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	86	class "86" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	9	class "9" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	absolute	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	active	class "active" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	active:cursor-grabbing	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	active:scale-90	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	active:scale-95	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	adio	class "adio" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	ame	class "ame" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	a.mute	class "a.mute" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	anim-rain	class "anim-rain" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	a.primary	class "a.primary" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	arning	class "arning" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	bg-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-black/55	class "bg-black/55" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-black/60	class "bg-black/60" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-black/80	class "bg-black/80" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-butter	unknown bg utility "bg-butter" (gradients/images are deferred)
+UNSUPPORTED	bg-gradient-to-br	unknown bg utility "bg-gradient-to-br" (gradients/images are deferred)
+UNSUPPORTED	bg-notch	unknown bg utility "bg-notch" (gradients/images are deferred)
+UNSUPPORTED	bg-notch-2	unknown bg utility "bg-notch-2" (gradients/images are deferred)
+UNSUPPORTED	bg-white/[0.04]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-white/[0.05]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-white/[0.06]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-white/[0.07]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-white/[0.08]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	bg-white/10	class "bg-white/10" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-white/12	class "bg-white/12" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-white/15	class "bg-white/15" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-white/25	class "bg-white/25" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-white/80	class "bg-white/80" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bg-white/90	class "bg-white/90" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	border-[10px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	border-[3px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	border-dashed	border-style is outside the renderer profile (solid/none only)
+UNSUPPORTED	border-notch	unknown border utility "border-notch"
+UNSUPPORTED	border-t	unknown border utility "border-t"
+UNSUPPORTED	border-t-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	border-t-butter	unknown border utility "border-t-butter"
+UNSUPPORTED	border-t-transparent	unknown border utility "border-t-transparent"
+UNSUPPORTED	border-white/10	class "border-white/10" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	border-white/15	class "border-white/15" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	border-white/20	class "border-white/20" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	-bottom-1	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	bottom-1.5	class "bottom-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	bottom-2	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	-bottom-6	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	bottom-full	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	chip	class "chip" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	chunky	class "chunky" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	class	class "class" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	cls	class "cls" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	content-start	utility family "content" is outside profile v0
+UNSUPPORTED	cursor-grab	utility "cursor-grab" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	cursor-pointer	utility "cursor-pointer" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	d	class "d" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	.dark	class ".dark" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	d.connected	class "d.connected" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	disabled:opacity-25	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	disabled:opacity-60	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	.dnd	class ".dnd" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	fill-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	fill-white	utility family "fill" is outside profile v0
+UNSUPPORTED	focus:border-[	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	focus-visible:ring-2	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	focus-visible:ring-butter	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	font-display	unknown font utility "font-display" (font families are deferred)
+UNSUPPORTED	font-mono	unknown font utility "font-mono" (font families are deferred)
+UNSUPPORTED	from-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	gap-0.5	class "gap-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	gap-1.5	class "gap-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	gap-2.5	class "gap-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	gap-[2.5px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	gap-[2px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	gap-3.5	class "gap-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	gap-[3px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	gap-y-0.5	class "gap-y-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	grid-cols-[1fr	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	group	class "group" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	group-hover:flex	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	h-[100px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	h-[104px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	h-[106px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	h-[14px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	h-1.5	class "h-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	h-[18px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	h-3.5	class "h-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	h-[48px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	has	class "has" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	hint-bounce	class "hint-bounce" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	hover:bg-[	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:bg-white/[0.11]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:bg-white/[0.16]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:bg-white/10	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:bg-white/20	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:scale-105	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:text-[	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:text-white	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	hover:text-white/85	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	i	class "i" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	inset-0	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	inset-1	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	inset-2	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	inset-x-0	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	is	class "is" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	l.cur	class "l.cur" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	left-0	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	left-1/2	class "left-1/2" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	left-1.5	class "left-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	left-2	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	-left-6	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	live	class "live" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	m	class "m" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	mb-1.5	class "mb-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	min-h-[36px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	min-h-[72px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	min-w-[130px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	ml-0.5	class "ml-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	ml-auto	margin: auto is deferred in profile v0 (ml-auto); center with flex/grid containers
+UNSUPPORTED	mode	class "mode" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	-mr-1	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	mt-0.5	class "mt-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	mt-1.5	class "mt-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	mt-2.5	class "mt-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	mt-3.5	class "mt-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	mt-auto	margin: auto is deferred in profile v0 (mt-auto); center with flex/grid containers
+UNSUPPORTED	.mute	class ".mute" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	n.connected	class "n.connected" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	net	class "net" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	net.bt	class "net.bt" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	no-scrollbar	class "no-scrollbar" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	object-cover	utility family "object" is outside profile v0
+UNSUPPORTED	oday	class "oday" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	on	class "on" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	outline-none	utility family "outline" is outside profile v0
+UNSUPPORTED	owered	class "owered" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	p-2.5	class "p-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	pb-1.5	class "pb-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	ping-ring	class "ping-ring" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pinned	class "pinned" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pl-2.5	class "pl-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	placeholder:text-white/35	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	playing	class "playing" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pointer-events-auto	class "pointer-events-auto" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pointer-events-none	class "pointer-events-none" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pop-in	class "pop-in" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	pr-0.5	class "pr-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	pr-3.5	class "pr-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	pt-0.5	class "pt-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	px-0.5	class "px-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	px-1.5	class "px-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	px-2.5	class "px-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	px-3.5	class "px-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	py-0.5	class "py-0.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	py-1.5	class "py-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	py-2.5	class "py-2.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	relative	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	rgba	class "rgba" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	right-0	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	-right-1	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	-right-5	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	rounded-[16px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	rounded-[22px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	rounded-[26px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	select-none	utility family "select" is outside profile v0
+UNSUPPORTED	sessions	class "sessions" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	shadow	utility "shadow" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	shadow-[0	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	sm:flex-row	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:gap-4	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:gap-5	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:h-[126px]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:h-[136px]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:text-[28px]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:w-[136px]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	sm:w-[168px]	variant classes (hover:, md:, dark:, …) are not applied in the v0 static profile
+UNSUPPORTED	s.on	class "s.on" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	space-y-1	utility family "space" is outside profile v0
+UNSUPPORTED	space-y-1.5	class "space-y-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	space-y-2	utility family "space" is outside profile v0
+UNSUPPORTED	sys.st	class "sys.st" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	tabular-nums	class "tabular-nums" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	t.done	class "t.done" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[10px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[11.5px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[11px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[12px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[13px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[15.5px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[17px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[22px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-[9px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	text-butter	unknown text utility "text-butter" (size or color?)
+UNSUPPORTED	text-mint	unknown text utility "text-mint" (size or color?)
+UNSUPPORTED	text-navy	unknown text utility "text-navy" (size or color?)
+UNSUPPORTED	text-pink	unknown text utility "text-pink" (size or color?)
+UNSUPPORTED	text-white/30	class "text-white/30" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/35	class "text-white/35" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/40	class "text-white/40" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/45	class "text-white/45" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/50	class "text-white/50" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/55	class "text-white/55" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/60	class "text-white/60" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/70	class "text-white/70" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/80	class "text-white/80" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/85	class "text-white/85" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	text-white/90	class "text-white/90" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	thin-scroll	class "thin-scroll" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	to-[	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	top-0	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	top-1/2	class "top-1/2" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	top-2	positioning is outside the renderer profile v0 (layout is flow/flex/grid)
+UNSUPPORTED	top-[2px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	-top-5	negative utilities are only supported for translate-* and rotate-* in profile v0
+UNSUPPORTED	tracking-[0.15em]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	tracking-[0.18em]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	tracking-[0.2em]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	transition-[width]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	-translate-x-1/2	class "translate-x-1/2" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	-translate-y-1/2	class "translate-y-1/2" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	truncate	utility "truncate" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	uppercase	utility "uppercase" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	w-[104px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[106px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[124px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[14px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-1.5	class "w-1.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	w-[18px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[2.5px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[2px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-3.5	class "w-3.5" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	w-[3px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[72px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	w-[86px]	arbitrary values (e.g. w-[91px]) are deferred in profile v0; use the named scale
+UNSUPPORTED	wave-bar	class "wave-bar" is not a known utility in profile v0 (custom CSS still works through stylesheets)
+UNSUPPORTED	.wifi	class ".wifi" needs CSS escaping (fractions, decimals, or symbols); the v0 pipeline compiles plain [A-Za-z0-9-_] classes only
+UNSUPPORTED	z-10	utility "z-10" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
+UNSUPPORTED	z-20	utility "z-20" is outside the renderer profile v0 (shadows/cursor/z-index/decorations are deferred)
