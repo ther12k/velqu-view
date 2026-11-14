@@ -28,6 +28,9 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0022](0022-m6c-file-watching.md) | M6c: file watching as host-side reconciliation — notifications say "may be stale", contents decide; observed/attempted/published snapshots; both backends, one semantics | accepted |
 | [0023](0023-m7-reference-dashboard.md) | M7: reference dashboard as conformance fixture; reserved `vv-` author-hook namespace (skipped, not diagnosed) | accepted |
 | [0024](0024-m8-transition-engine.md) | M8: the transition engine — cascade overrides on a virtual clock, dual-tier invalidation, paint-time opacity/2D transforms, Alpine-style `vx-transition` | accepted |
+| [0025](0025-host-write-api.md) | Host-initiated state writes — the data-in seam (`write_state` reactive turns) | accepted |
+| [0026](0026-coverage-rasterization.md) | Coverage rasterization — the painter anti-aliases at f32 (fixed grids, exact spans, SDF bands); supersedes ADR 0007's snap clause | accepted |
+| [0027](0027-physical-springs.md) | Physical springs — momentum-preserving transitions on the virtual clock (`spring(k, d[, m])`, box-shadow joins the animatable set) | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how
