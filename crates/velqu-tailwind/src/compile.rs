@@ -10,19 +10,22 @@
 //! borders/radius, overflow, opacity/scale/translate, and the transition
 //! families (`transition-*`, `duration-*`, `ease-*`, `delay-*`, ADR 0024,
 //! with the named animations' `@keyframes` emitted alongside). The
-//! interaction variants (`hover:`, `focus:`, `active:`) compile to
-//! `.class:hover`-style pseudo-class rules restricted to the renderer's
-//! paint-only interaction set (ADR 0011); fractional sizes and insets
-//! (`w-1/2`, `left-1/2`) resolve to percentages; negative insets
-//! (`-top-5`) negate the spacing scale; `cursor-pointer` maps onto the
-//! renderer's cursor set; and `border-[#hex]` arbitrary colors emit
-//! `border-color`. Everything else — other variants (`focus-visible:`,
-//! `disabled:`, `sm:`), non-px arbitrary values (`w-[91%]`),
-//! box-shadow utilities (the renderer has no shadow property yet), and
-//! utilities outside the renderer profile (`position: sticky`,
-//! `pointer-events-*`, `select-none`, `truncate`) — produces a
-//! deterministic diagnostic, never a silent drop
-//! (docs/tailwind-batch2-notes.md records the renderer-side limits).
+//! interaction variants (`hover:`, `focus:`, `active:`, and batch 3's
+//! `focus-visible:`) compile to `.class:hover`-style pseudo-class rules
+//! restricted to the renderer's paint-only interaction set (ADR 0011);
+//! fractional sizes and insets (`w-1/2`, `left-1/2`) resolve to
+//! percentages; negative insets (`-top-5`) and margins (`-mr-1`, batch 3)
+//! negate the spacing scale; `cursor-*` maps onto the renderer's cursor
+//! set (grab pair included in batch 3); and `border-[#hex]` arbitrary
+//! colors emit `border-color`. Batch 3 also unlocks the outer box-shadow
+//! family (`shadow-*` presets and `shadow-[…]` arbitrary values against
+//! the renderer's shadow parser), `select-none`, and `truncate`.
+//! Everything else — other variants (`disabled:`, `sm:`), non-px
+//! arbitrary values (`w-[91%]`), rings/filters (CSS-variable composition
+//! and filters), and utilities outside the renderer profile
+//! (`position: sticky`, `pointer-events-*`, `shadow-inner`,
+//! `tabular-nums`) — produces a deterministic diagnostic, never a silent
+//! drop (docs/tailwind-batch2-notes.md records the renderer-side limits).
 //!
 //! The output is plain CSS: one rule per class, in first-use order, so the
 //! renderer's normal cascade applies (class specificity beats element
@@ -158,12 +161,17 @@ fn escape_class_selector(class: &str) -> String {
 type CompiledClass = (String, Vec<(&'static str, String)>);
 
 /// The interaction variants the renderer's M4b profile matches (ADR 0011,
-/// frozen set): Tailwind variant name → emitted pseudo-class. Anything
-/// else after the first colon (`focus-visible:`, `disabled:`, `sm:`,
-/// `group-hover:`) is diagnosed — the renderer's selector parser skips
-/// rules whose pseudo-classes fall outside this set.
-const VARIANT_PSEUDO_CLASSES: [(&str, &str); 3] =
-    [("hover", "hover"), ("focus", "focus"), ("active", "active")];
+/// frozen set): Tailwind variant name → emitted pseudo-class. Batch 3 adds
+/// `focus-visible` (the renderer's interaction state now distinguishes
+/// keyboard-origin focus). Anything else after the first colon
+/// (`disabled:`, `sm:`, `group-hover:`) is diagnosed — the renderer's
+/// selector parser skips rules whose pseudo-classes fall outside this set.
+const VARIANT_PSEUDO_CLASSES: [(&str, &str); 4] = [
+    ("hover", "hover"),
+    ("focus", "focus"),
+    ("active", "active"),
+    ("focus-visible", "focus-visible"),
+];
 
 /// Compiles one class (bare utility or `variant:utility`) into the escaped
 /// selector text that follows the leading `.` plus its declarations.
@@ -189,7 +197,7 @@ fn variant_declarations(class: &str, variant: &str, inner: &str) -> Result<Compi
     else {
         return Err(format!(
             "variant {variant}: is outside the renderer's interaction profile \
-             (hover:/focus:/active: per ADR 0011); focus-visible:, disabled:, \
+             (hover:/focus:/active:/focus-visible: per ADR 0011); disabled:, \
              responsive, and group-* variants are not applied in profile v0"
         ));
     };
@@ -278,8 +286,8 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         return Err("the !important modifier is not part of profile v0".into());
     }
     // Negative utilities (ADR 0024): a leading dash is a sign, not part of
-    // the identifier. `translate-*`, `rotate-*`, and the inset families
-    // accept one in profile v0.
+    // the identifier. `translate-*`, `rotate-*`, the inset families, and
+    // (batch 3) the margin families accept one in profile v0.
     let (negative, class) = match class.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, class),
@@ -289,11 +297,14 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             || class.starts_with("rotate-")
             || NEGATABLE_INSETS
                 .iter()
+                .any(|prefix| class.starts_with(prefix))
+            || NEGATABLE_MARGINS
+                .iter()
                 .any(|prefix| class.starts_with(prefix)))
     {
         return Err(
             "negative utilities are only supported for translate-*, rotate-*, \
-             and inset-* in profile v0"
+             inset-*, and margin-* in profile v0"
                 .into(),
         );
     }
@@ -495,19 +506,34 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         ("pr", Some(value)) => Ok(vec![("padding-right", spacing_px(value, "pr")?)]),
         ("pb", Some(value)) => Ok(vec![("padding-bottom", spacing_px(value, "pb")?)]),
         ("pl", Some(value)) => Ok(vec![("padding-left", spacing_px(value, "pl")?)]),
-        ("m", Some(value)) => Ok(vec![("margin", spacing_px(value, "m")?)]),
-        ("mx", Some(value)) => Ok(vec![
-            ("margin-left", spacing_px(value, "mx")?),
-            ("margin-right", spacing_px(value, "mx")?),
-        ]),
-        ("my", Some(value)) => Ok(vec![
-            ("margin-top", spacing_px(value, "my")?),
-            ("margin-bottom", spacing_px(value, "my")?),
-        ]),
-        ("mt", Some(value)) => Ok(vec![("margin-top", spacing_px(value, "mt")?)]),
-        ("mr", Some(value)) => Ok(vec![("margin-right", spacing_px(value, "mr")?)]),
-        ("mb", Some(value)) => Ok(vec![("margin-bottom", spacing_px(value, "mb")?)]),
-        ("ml", Some(value)) => Ok(vec![("margin-left", spacing_px(value, "ml")?)]),
+        ("m", Some(value)) => Ok(vec![(
+            "margin",
+            negate_inset(spacing_px(value, "m")?, negative, "m")?,
+        )]),
+        ("mx", Some(value)) => {
+            let px = negate_inset(spacing_px(value, "mx")?, negative, "mx")?;
+            Ok(vec![("margin-left", px.clone()), ("margin-right", px)])
+        }
+        ("my", Some(value)) => {
+            let px = negate_inset(spacing_px(value, "my")?, negative, "my")?;
+            Ok(vec![("margin-top", px.clone()), ("margin-bottom", px)])
+        }
+        ("mt", Some(value)) => Ok(vec![(
+            "margin-top",
+            negate_inset(spacing_px(value, "mt")?, negative, "mt")?,
+        )]),
+        ("mr", Some(value)) => Ok(vec![(
+            "margin-right",
+            negate_inset(spacing_px(value, "mr")?, negative, "mr")?,
+        )]),
+        ("mb", Some(value)) => Ok(vec![(
+            "margin-bottom",
+            negate_inset(spacing_px(value, "mb")?, negative, "mb")?,
+        )]),
+        ("ml", Some(value)) => Ok(vec![(
+            "margin-left",
+            negate_inset(spacing_px(value, "ml")?, negative, "ml")?,
+        )]),
         ("w", Some(value)) => Ok(vec![("width", size_value(value)?)]),
         ("h", Some(value)) => Ok(vec![("height", size_value(value)?)]),
 
@@ -713,26 +739,26 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             )),
         },
 
-        // -- cursor (renderer set: auto/default/pointer/text) ------------------
+        // -- cursor (renderer set: auto/default/pointer/text/grab/grabbing) --
         ("cursor", Some(name)) => match name {
-            "auto" | "default" | "pointer" | "text" => Ok(vec![("cursor", name.to_owned())]),
-            "grab" | "grabbing" => Err(format!(
-                "cursor: {name} is outside the renderer's cursor set \
-                 (auto/default/pointer/text); grab cursors are deferred"
-            )),
+            "auto" | "default" | "pointer" | "text" | "grab" | "grabbing" => {
+                Ok(vec![("cursor", name.to_owned())])
+            }
             _ => Err(format!(
-                "unknown cursor utility {class:?} (auto/default/pointer/text)"
+                "unknown cursor utility {class:?} \
+                 (auto/default/pointer/text/grab/grabbing)"
             )),
         },
 
-        // -- deliberately unsupported but common -----------------------------------
-        // box-shadow: the profile manifest commits to it, but the renderer
-        // has no shadow property or painter yet — deferred with a named
-        // diagnostic (docs/tailwind-batch2-notes.md records the limits,
-        // including the rgba()-to-8-digit-hex plan for when it lands).
-        ("shadow" | "ring" | "blur", _) => Err(format!(
-            "utility {base:?} needs box-shadow, which the renderer does not \
-             apply yet; shadows/rings are deferred"
+        // -- shadows (batch 3: the renderer parses and paints outer
+        //    box-shadow layers; rings still defer — Tailwind composes them
+        //    from CSS variables, and `blur-*` is a filter, not a shadow) ----
+        ("shadow", Some(arg)) => shadow_utility(arg),
+        ("shadow", None) => Ok(vec![("box-shadow", shadow_preset("DEFAULT")?)]),
+        ("ring" | "blur", _) => Err(format!(
+            "utility {base:?} is deferred: rings compose from CSS variables \
+             and blur is a filter (the renderer's box-shadow covers \
+             shadow-*/shadow-[…] only)"
         )),
         (
             "container" | "underline" | "italic" | "uppercase" | "lowercase" | "capitalize"
@@ -742,22 +768,26 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             "utility {class:?} is outside the renderer profile v0 \
              (decorations are deferred)"
         )),
-        ("truncate", None) => Err(
-            "truncate needs text-overflow: ellipsis, which the renderer does \
-             not apply yet; overflow-hidden + whitespace-nowrap clip without \
-             the ellipsis"
-                .into(),
-        ),
+        // Batch 3: single-line ellipsis — the renderer truncates an
+        // overflowing nowrap line and appends `…`.
+        ("truncate", None) => Ok(vec![
+            ("overflow", "hidden".into()),
+            ("text-overflow", "ellipsis".into()),
+            ("white-space", "nowrap".into()),
+        ]),
         ("tabular", Some("nums")) => {
             Err("font-variant-numeric is not applied by the renderer yet; \
              tabular-nums is deferred"
                 .into())
         }
-        ("select", Some("none")) => Err(
-            "user-select is not applied by the renderer yet; select-none is \
-             deferred"
-                .into(),
-        ),
+        // Batch 3: the renderer honors `user-select: none` in its
+        // selection path (selection gestures, not editing or the caret).
+        ("select", Some("none")) => Ok(vec![("user-select", "none".into())]),
+        ("select", Some("text" | "auto")) => Ok(vec![("user-select", "text".into())]),
+        ("select", Some(other)) => Err(format!(
+            "unknown select utility select-{other:?} (none/text/auto; \
+             select-all is deferred)"
+        )),
         ("outline", Some("none")) => {
             Err("outline properties are not applied by the renderer yet; \
              outline-none is deferred"
@@ -866,6 +896,11 @@ fn split_fraction(class: &str) -> (&str, Option<&str>) {
 /// `-left-4`). `inset-x-*`/`inset-y-*` start with `inset-`, so one entry
 /// covers them.
 const NEGATABLE_INSETS: [&str; 5] = ["top-", "right-", "bottom-", "left-", "inset-"];
+
+/// The margin utility prefixes that accept a leading `-` (batch 3:
+/// `-mr-1`, `-mt-2`). The renderer's length parser takes negative px
+/// margins natively, so this is a compiler gate, not a renderer gap.
+const NEGATABLE_MARGINS: [&str; 7] = ["m-", "mx-", "my-", "mt-", "mr-", "mb-", "ml-"];
 
 /// Negates a spacing-scale inset length for the negative inset utilities
 /// (`-top-5` → -20px). `auto`/`full` have no negative form and diagnose.
@@ -976,13 +1011,18 @@ fn arbitrary_value_declarations(
              list of lowercase CSS property names"
         ));
     }
-    // `shadow-[…]`/`ring-[…]` need box-shadow, which the renderer has no
-    // property or painter for yet — the same named deferral as the
-    // named-scale forms (`shadow-md`).
-    if matches!(base, "shadow" | "ring" | "blur") {
+    // `shadow-[…]` (batch 3): underscores become spaces and the value is
+    // validated against the renderer's box-shadow grammar, then emitted
+    // verbatim (the renderer parses `#hex` and `rgb()/rgba()` colors in
+    // both comma and space forms). `ring-[…]` keeps its deferral.
+    if base == "shadow" {
+        return arbitrary_shadow(value);
+    }
+    if matches!(base, "ring" | "blur") {
         return Err(format!(
-            "utility {base:?} needs box-shadow, which the renderer does not \
-             apply yet; shadows/rings are deferred"
+            "utility {base:?} is deferred: rings compose from CSS variables \
+             and blur is a filter (the renderer's box-shadow covers \
+             shadow-*/shadow-[…] only)"
         ));
     }
     // Family first, so an unsupported family (`bg-[#14121f]`) keeps the
@@ -1280,9 +1320,162 @@ fn default_border(width: u32) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// The Tailwind v3 `shadow-*` presets, verbatim shapes (batch 3: the
+/// renderer's box-shadow parser accepts the space-separated
+/// `rgb(r g b / a)` color form these use).
+const SHADOW_PRESETS: &[(&str, &str)] = &[
+    ("sm", "0 1px 2px 0 rgb(0 0 0 / 0.05)"),
+    (
+        "DEFAULT",
+        "0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)",
+    ),
+    (
+        "md",
+        "0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)",
+    ),
+    (
+        "lg",
+        "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)",
+    ),
+    (
+        "xl",
+        "0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)",
+    ),
+    ("2xl", "0 25px 50px -12px rgb(0 0 0 / 0.25)"),
+];
+
+/// `shadow-<name>`: a preset, `none` to clear, or `inner` (deferred — the
+/// renderer paints outer shadows only).
+fn shadow_utility(name: &str) -> Result<Vec<(&'static str, String)>, String> {
+    match name {
+        "none" => Ok(vec![("box-shadow", "none".into())]),
+        "inner" => Err(
+            "shadow-inner is deferred: the renderer paints outer box-shadows \
+             only (no inset shadows)"
+                .into(),
+        ),
+        other => match shadow_preset(other) {
+            Ok(value) => Ok(vec![("box-shadow", value)]),
+            Err(message) => Err(message),
+        },
+    }
+}
+
+/// Looks up one `shadow-*` preset value.
+fn shadow_preset(name: &str) -> Result<String, String> {
+    SHADOW_PRESETS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, value)| (*value).to_owned())
+        .ok_or_else(|| {
+            format!(
+                "unknown shadow scale {name:?} (sm/DEFAULT/md/lg/xl/2xl/none; \
+                 inner is deferred)"
+            )
+        })
+}
+
+/// `shadow-[…]` (batch 3): underscores become spaces, then the value is
+/// validated against the renderer's box-shadow grammar and emitted
+/// verbatim (`shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]` →
+/// `box-shadow: 0 10px 24px -10px rgba(31,37,80,0.8)`).
+fn arbitrary_shadow(value: &str) -> Result<Vec<(&'static str, String)>, String> {
+    let value = value.replace('_', " ");
+    if value == "none" {
+        return Ok(vec![("box-shadow", "none".into())]);
+    }
+    let mut layers = 0usize;
+    for layer in paren_aware_split(value.trim(), ',') {
+        layers += 1;
+        validate_shadow_layer(layer.trim())?;
+    }
+    if layers == 0 {
+        return Err("arbitrary shadow value is empty".into());
+    }
+    Ok(vec![("box-shadow", value)])
+}
+
+/// Splits `value` on `sep`, ignoring separators nested in parentheses (so
+/// `rgba(31, 37, 80, 0.8)` survives a comma split and `rgb(255 255 255/0.2)`
+/// survives tokenization) — the same shape as the renderer's tokenizer.
+fn paren_aware_split(value: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (i, ch) in value.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                parts.push(value[start..i].trim());
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+    parts.into_iter().filter(|part| !part.is_empty()).collect()
+}
+
+/// Validates one comma-separated arbitrary shadow layer against the
+/// renderer's grammar: `<offset-x> <offset-y> [<blur> [<spread>]]` px
+/// lengths plus an optional color (`#hex` or an `rgb()`/`rgba()` function).
+/// `inset` layers diagnose (renderer defers inset shadows).
+fn validate_shadow_layer(layer: &str) -> Result<(), String> {
+    let mut lengths = 0usize;
+    let mut colors = 0usize;
+    for token in paren_aware_split(layer, ' ') {
+        if token == "inset" {
+            return Err("inset shadows are deferred: the renderer paints outer \
+                 box-shadows only"
+                .into());
+        }
+        if let Some(hex) = token.strip_prefix('#') {
+            let digits = (hex.len() == 3 || hex.len() == 6 || hex.len() == 8)
+                && hex.chars().all(|c| c.is_ascii_hexdigit());
+            if !digits {
+                return Err(format!("invalid shadow color {token:?} (use #hex)"));
+            }
+            colors += 1;
+            continue;
+        }
+        if token.contains('(') {
+            if !(token.starts_with("rgb(") || token.starts_with("rgba(")) || !token.ends_with(')') {
+                return Err(format!(
+                    "invalid shadow color {token:?} (use #hex or rgb()/rgba())"
+                ));
+            }
+            colors += 1;
+            continue;
+        }
+        // A length: `<number>px` or a bare number (the renderer's length
+        // parser takes unitless as px). Negatives are offset/spread signs.
+        let number = token.strip_suffix("px").unwrap_or(token);
+        let parsed: f32 = number
+            .parse()
+            .map_err(|_| format!("invalid shadow component {token:?} (lengths are px)"))?;
+        if !parsed.is_finite() || parsed.abs() > 4096.0 {
+            return Err(format!(
+                "shadow length {token:?} outside the supported range"
+            ));
+        }
+        lengths += 1;
+    }
+    if colors > 1 {
+        return Err("a box-shadow layer takes at most one color".into());
+    }
+    if !(2..=4).contains(&lengths) {
+        return Err(format!(
+            "a shadow layer needs <offset-x> <offset-y> [<blur> [<spread>]] \
+             px lengths, got {lengths}"
+        ));
+    }
+    Ok(())
+}
+
 /// The Tailwind spacing scale: units are 4px per step (0.25rem), with the
 /// named decimal steps (`0.5`, `1.5`, `2.5`, `3.5`) resolving to integral
-/// pixels; `px` is 1px. Negative margins are v0-deferred.
+/// pixels; `px` is 1px. Margins negate through the same scale (batch 3).
 fn spacing_px(token: &str, utility: &str) -> Result<String, String> {
     match token {
         "0" => Ok("0px".into()),
@@ -1566,7 +1759,7 @@ mod tests {
         let build = compile_utilities(&[
             "w-[91%]",
             "translate-x-1/2",
-            "shadow-md",
+            "shadow-inner",
             "sticky",
             "mx-auto",
             "underline",
@@ -1586,7 +1779,7 @@ mod tests {
         };
         assert!(has("w-[91%]", "arbitrary"));
         assert!(has("translate-x-1/2", "fractional values"));
-        assert!(has("shadow-md", "box-shadow"));
+        assert!(has("shadow-inner", "inset"));
         assert!(has("sticky", "deferred"));
         assert!(has("mx-auto", "margin: auto"));
         assert!(has("underline", "renderer profile"));
@@ -2172,8 +2365,6 @@ mod tests {
     #[test]
     fn unknown_variants_diagnose() {
         let build = compile_utilities(&[
-            "focus-visible:ring-2",
-            "focus-visible:ring-butter",
             "disabled:opacity-25",
             "sm:flex-row",
             "group-hover:flex",
@@ -2185,8 +2376,6 @@ mod tests {
             "nothing outside the frozen variant set compiles"
         );
         for class in [
-            "focus-visible:ring-2",
-            "focus-visible:ring-butter",
             "disabled:opacity-25",
             "sm:flex-row",
             "group-hover:flex",
@@ -2214,6 +2403,34 @@ mod tests {
     }
 
     #[test]
+    fn focus_visible_variant_compiles_to_the_pseudo_class() {
+        // Batch 3: the renderer's interaction state distinguishes
+        // keyboard-origin focus, so `focus-visible:` joins the frozen
+        // variant set. Shadow changes are paint-only (batch 3's grown
+        // INTERACTION_PAINT_PROPERTIES), so the rule is allowed.
+        let build = compile_utilities(&["focus-visible:bg-white/10", "focus-visible:shadow-md"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 2);
+        assert!(build.css.contains(
+            ".focus-visible\\:bg-white\\/10:focus-visible { background-color: #ffffff1a; }"
+        ));
+        assert!(
+            build
+                .css
+                .contains(".focus-visible\\:shadow-md:focus-visible { box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1); }")
+        );
+        // A layout property under the variant still refuses (ADR 0011).
+        let build = compile_utilities(&["focus-visible:p-4"]);
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .any(|d| d.class == "focus-visible:p-4"
+                    && d.message.contains("may only change paint properties"))
+        );
+    }
+
+    #[test]
     fn negative_insets_compile() {
         let build = compile_utilities(&[
             "-top-5",
@@ -2236,7 +2453,7 @@ mod tests {
 
     #[test]
     fn negative_inset_and_fraction_misuse_diagnoses() {
-        let build = compile_utilities(&["-top-full", "-left-auto", "-m-4", "-w-8", "-scale-50"]);
+        let build = compile_utilities(&["-top-full", "-left-auto", "-p-4", "-w-8", "-scale-50"]);
         assert_eq!(build.rules, 0);
         let message_for = |class: &str| {
             build
@@ -2248,9 +2465,30 @@ mod tests {
         };
         assert!(message_for("-top-full").contains("cannot negate top value"));
         assert!(message_for("-left-auto").contains("cannot negate left value"));
-        assert!(message_for("-m-4").contains("negative utilities"));
+        assert!(message_for("-p-4").contains("negative utilities"));
         assert!(message_for("-w-8").contains("negative utilities"));
         assert!(message_for("-scale-50").contains("negative utilities"));
+    }
+
+    #[test]
+    fn negative_margins_compile() {
+        // Batch 3: the margin families join the negatable set; the
+        // renderer's length parser takes negative px margins natively.
+        let build = compile_utilities(&[
+            "-m-4", "-mx-2", "-my-1", "-mt-2", "-mr-1", "-mb-0.5", "-ml-px", "m-4",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 8);
+        assert!(build.css.contains(".-m-4 { margin: -16px; }"));
+        assert!(build.css.contains("margin-left: -8px;"));
+        assert!(build.css.contains("margin-right: -8px;"));
+        assert!(build.css.contains("margin-top: -4px;"));
+        assert!(build.css.contains("margin-bottom: -4px;"));
+        assert!(build.css.contains(".-mt-2 { margin-top: -8px; }"));
+        assert!(build.css.contains(".-mr-1 { margin-right: -4px; }"));
+        assert!(build.css.contains(".-mb-0\\.5 { margin-bottom: -2px; }"));
+        assert!(build.css.contains(".-ml-px { margin-left: -1px; }"));
+        assert!(build.css.contains(".m-4 { margin: 16px; }"));
     }
 
     #[test]
@@ -2322,15 +2560,127 @@ mod tests {
     }
 
     #[test]
-    fn cursor_utilities_compile_and_grab_stays_deferred() {
-        let build = compile_utilities(&["cursor-pointer", "cursor-default", "cursor-auto"]);
+    fn cursor_utilities_compile_including_the_grab_pair() {
+        let build = compile_utilities(&[
+            "cursor-pointer",
+            "cursor-default",
+            "cursor-auto",
+            "cursor-text",
+            // Batch 3: the drag pair maps onto the shell's cursor icons.
+            "cursor-grab",
+            "cursor-grabbing",
+        ]);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 3);
+        assert_eq!(build.rules, 6);
         assert!(build.css.contains(".cursor-pointer { cursor: pointer; }"));
         assert!(build.css.contains(".cursor-default { cursor: default; }"));
         assert!(build.css.contains(".cursor-auto { cursor: auto; }"));
+        assert!(build.css.contains(".cursor-text { cursor: text; }"));
+        assert!(build.css.contains(".cursor-grab { cursor: grab; }"));
+        assert!(build.css.contains(".cursor-grabbing { cursor: grabbing; }"));
 
-        let build = compile_utilities(&["cursor-grab", "cursor-grabbing"]);
+        let build = compile_utilities(&["cursor-ewe"]);
+        assert_eq!(build.rules, 0);
+        assert!(
+            build.diagnostics[0]
+                .message
+                .contains("unknown cursor utility")
+        );
+    }
+
+    #[test]
+    fn shadows_compile_and_rings_blur_stay_deferred() {
+        let build = compile_utilities(&[
+            "shadow-sm",
+            "shadow",
+            "shadow-md",
+            "shadow-lg",
+            "shadow-xl",
+            "shadow-2xl",
+            "shadow-none",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 7);
+        assert!(
+            build
+                .css
+                .contains(".shadow-sm { box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05); }")
+        );
+        // Bare `shadow` is Tailwind's DEFAULT preset.
+        assert!(build.css.contains(
+            ".shadow { box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1); }"
+        ));
+        assert!(
+            build
+                .css
+                .contains(".shadow-md { box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1); }")
+        );
+        assert!(build.css.contains(".shadow-none { box-shadow: none; }"));
+        // Presets emit the renderer-parseable space-separated rgb form.
+        let build = compile_utilities(&["shadow-3xl", "shadow-inner"]);
+        assert_eq!(build.rules, 0);
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .any(|d| d.class == "shadow-3xl" && d.message.contains("unknown shadow scale"))
+        );
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .any(|d| d.class == "shadow-inner" && d.message.contains("inset"))
+        );
+        // Rings and blur keep their named deferrals (CSS-variable
+        // composition and filters, not box-shadow). (`ring-white/20`
+        // carries a `/`, which never leaves the escaping diagnostic —
+        // ring colors would need CSS-variable composition anyway.)
+        let build = compile_utilities(&["ring-2", "blur-sm"]);
+        assert_eq!(build.rules, 0);
+        assert!(
+            build
+                .diagnostics
+                .iter()
+                .all(|d| d.message.contains("rings compose from CSS variables"))
+        );
+    }
+
+    #[test]
+    fn arbitrary_shadows_compile_with_underscore_values() {
+        let build = compile_utilities(&[
+            "shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]",
+            "shadow-[0_1px_2px_#0000000d]",
+            "shadow-[0_0_0_1px_rgb(255_255_255/0.2)]",
+            "shadow-[none]",
+        ]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 4);
+        assert!(
+            build
+                .css
+                .contains(".shadow-\\[0_10px_24px_-10px_rgba\\(31\\,37\\,80\\,0\\.8\\)\\] { box-shadow: 0 10px 24px -10px rgba(31,37,80,0.8); }")
+        );
+        assert!(build.css.contains("box-shadow: 0 1px 2px #0000000d;"));
+        assert!(
+            build
+                .css
+                .contains("box-shadow: 0 0 0 1px rgb(255 255 255/0.2);")
+        );
+        assert!(
+            build
+                .css
+                .contains(".shadow-\\[none\\] { box-shadow: none; }")
+        );
+    }
+
+    #[test]
+    fn malformed_arbitrary_shadows_diagnose() {
+        let build = compile_utilities(&[
+            "shadow-[inset_0_1px_2px_black]",
+            "shadow-[5px]",
+            "shadow-[0_1px_2px_oklch(0.7_0.1_250)]",
+            "shadow-[0_1px_2px_#zz]",
+        ]);
         assert_eq!(build.rules, 0);
         let message_for = |class: &str| {
             build
@@ -2340,12 +2690,24 @@ mod tests {
                 .map(|d| d.message.clone())
                 .unwrap_or_default()
         };
-        assert!(
-            message_for("cursor-grab").contains("auto/default/pointer/text"),
-            "{}",
-            message_for("cursor-grab")
-        );
-        assert!(message_for("cursor-grabbing").contains("grab cursors are deferred"));
+        assert!(message_for("shadow-[inset_0_1px_2px_black]").contains("inset"));
+        assert!(message_for("shadow-[5px]").contains("offset-x"));
+        assert!(message_for("shadow-[0_1px_2px_oklch(0.7_0.1_250)]").contains("rgb()"));
+        assert!(message_for("shadow-[0_1px_2px_#zz]").contains("#hex"));
+    }
+
+    #[test]
+    fn select_none_and_truncate_compile() {
+        // Batch 3: the renderer honors `user-select: none` and single-line
+        // ellipsis, so both utilities compile to plain CSS.
+        let build = compile_utilities(&["select-none", "select-text", "truncate"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 3);
+        assert!(build.css.contains(".select-none { user-select: none; }"));
+        assert!(build.css.contains(".select-text { user-select: text; }"));
+        assert!(build.css.contains(
+            ".truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }"
+        ));
     }
 
     #[test]
@@ -2353,12 +2715,10 @@ mod tests {
         let build = compile_utilities(&[
             "pointer-events-none",
             "pointer-events-auto",
-            "select-none",
             "outline-none",
-            "truncate",
             "tabular-nums",
-            "shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]",
             "ring-2",
+            "select-all",
         ]);
         assert_eq!(build.rules, 0, "renderer-absent properties never compile");
         let message_for = |class: &str| {
@@ -2375,15 +2735,13 @@ mod tests {
             message_for("pointer-events-none")
         );
         assert!(message_for("pointer-events-auto").contains("pointer-events is not applied"));
-        assert!(message_for("select-none").contains("user-select is not applied"));
         assert!(message_for("outline-none").contains("outline properties are not applied"));
-        assert!(message_for("truncate").contains("text-overflow"));
         assert!(message_for("tabular-nums").contains("font-variant-numeric"));
         assert!(
-            message_for("shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]").contains("box-shadow"),
+            message_for("ring-2").contains("rings compose from CSS variables"),
             "{}",
-            message_for("shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]")
+            message_for("ring-2")
         );
-        assert!(message_for("ring-2").contains("box-shadow"));
+        assert!(message_for("select-all").contains("unknown select utility"));
     }
 }

@@ -725,7 +725,13 @@ fn longest_word(box_node: &BoxNode, fonts: &mut FontStore, scale: f32) -> f32 {
         .iter()
         .map(|word| {
             let px = word_px(word, scale);
-            text_run_width(fonts, &word.text, px, word.style.font_weight, word.style.font_family.as_deref())
+            text_run_width(
+                fonts,
+                &word.text,
+                px,
+                word.style.font_weight,
+                word.style.font_family.as_deref(),
+            )
         })
         .fold(0.0, f32::max)
 }
@@ -743,7 +749,14 @@ fn unwrapped_width(box_node: &BoxNode, fonts: &mut FontStore, scale: f32) -> f32
             // break_lines' placement.
             text_run_width(fonts, " ", last_px, 400, None)
         };
-        width += space + text_run_width(fonts, &word.text, px, word.style.font_weight, word.style.font_family.as_deref());
+        width += space
+            + text_run_width(
+                fonts,
+                &word.text,
+                px,
+                word.style.font_weight,
+                word.style.font_family.as_deref(),
+            );
         last_px = px;
         first = false;
     }
@@ -882,6 +895,21 @@ fn layout_inline_content(node: &mut BoxNode, fonts: &mut FontStore, scale: f32) 
             fonts,
             scale,
         );
+        // `text-overflow: ellipsis` (batch 3): a single `white-space:
+        // nowrap` line that overflows its box truncates with an appended
+        // `…`. Wrapping text keeps the plain clip behavior; multi-line
+        // ellipsis is outside the profile.
+        if node.style.text_overflow == crate::style::TextOverflow::Ellipsis
+            && node.style.white_space == crate::style::WhiteSpace::Nowrap
+        {
+            let available = node
+                .text_origin
+                .map(|origin| origin.width)
+                .unwrap_or(node.content.w);
+            if let Some(line) = lines.first_mut() {
+                apply_line_ellipsis(line, available, fonts);
+            }
+        }
         // Alignment still measures against the containing width (content
         // width under nowrap), so centered/right nowrap text behaves.
         let align_width = wrap_width.unwrap_or(node.content.w);
@@ -907,6 +935,51 @@ fn layout_inline_content(node: &mut BoxNode, fonts: &mut FontStore, scale: f32) 
     }
 }
 
+/// The truncation mark `text-overflow: ellipsis` appends (U+2026).
+const ELLIPSIS: &str = "\u{2026}";
+
+/// Truncates one overflowing line with a trailing `…` (batch 3): whole
+/// trailing runs drop first; the surviving run trims per character (one
+/// char always remains); the ellipsis appends in that run's style at the
+/// cut point. Runs keep the line's relative geometry, so painting, facts,
+/// and the alignment pass need no further work.
+fn apply_line_ellipsis(line: &mut LaidLine, max_width: f32, fonts: &mut FontStore) {
+    if line_width(line) <= max_width {
+        return;
+    }
+    let Some(last) = line.runs.last() else {
+        return;
+    };
+    let ellipsis_face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
+    let ellipsis_width = crate::text::measure_run(fonts, ellipsis_face, ELLIPSIS, last.px);
+    if ellipsis_width >= max_width {
+        // No room to show anything: leave the plain clip behavior.
+        return;
+    }
+    while line.runs.len() > 1 && line_width(line) + ellipsis_width > max_width {
+        line.runs.pop();
+    }
+    let Some(last) = line.runs.last_mut() else {
+        return;
+    };
+    let face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
+    // The trailing run may still overflow: trim it character by character
+    // from the end (one char always survives).
+    loop {
+        let overrun = last.x + last.width + ellipsis_width > max_width;
+        if !overrun || last.text.chars().count() <= 1 {
+            break;
+        }
+        last.text.pop(); // char-boundary-safe trailing pop
+        last.width = crate::text::measure_run(fonts, face, &last.text, last.px);
+    }
+    let mut mark = last.clone();
+    mark.text = ELLIPSIS.to_owned();
+    mark.width = ellipsis_width;
+    mark.x = last.x + last.width;
+    line.runs.push(mark);
+}
+
 /// Shared line breaking: words → unaligned laid lines (device px).
 pub(crate) fn break_lines(
     words: &[crate::layout::Word],
@@ -926,7 +999,8 @@ pub(crate) fn break_lines(
             0.0
         } else {
             let last = current.runs.last().expect("checked non-empty");
-            let last_face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
+            let last_face =
+                fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
             crate::text::measure_run(fonts, last_face, " ", last.px)
         };
         if !current.runs.is_empty()

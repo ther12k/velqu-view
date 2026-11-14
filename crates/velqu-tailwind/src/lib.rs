@@ -464,7 +464,7 @@ pub fn classify_declaration(property: &str, value: &str) -> Classification {
 /// pointer move can never invalidate layout. The renderer's cascade
 /// defers everything else inside stateful rules with a diagnostic; the
 /// checker reports the same verdict.
-pub const INTERACTION_PAINT_PROPERTIES: [&str; 11] = [
+pub const INTERACTION_PAINT_PROPERTIES: [&str; 12] = [
     "background-color",
     "background",
     "color",
@@ -472,6 +472,9 @@ pub const INTERACTION_PAINT_PROPERTIES: [&str; 11] = [
     "border-style",
     "border-radius",
     "cursor",
+    // Batch 3: the renderer parses and paints `box-shadow` (outer layers,
+    // single/multi); a shadow change is a presentation repaint only.
+    "box-shadow",
     // Transition-engine paint properties (ADR 0024): opacity, 2D
     // transforms, origin, and animation repaint without layout.
     "opacity",

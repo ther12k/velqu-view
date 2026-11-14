@@ -38,8 +38,11 @@ pub(crate) enum Simple {
 }
 
 /// The interaction selectors M4b matches (the frozen set; everything else
-/// after `:` is diagnosed and the rule skipped).
-pub(crate) const INTERACTION_PSEUDO_CLASSES: [&str; 3] = ["hover", "focus", "active"];
+/// after `:` is diagnosed and the rule skipped). Batch 3 grows the set
+/// with `focus-visible` (keyboard-origin focus, ADR 0011's recorded
+/// origin) — still interaction state, still paint-only per its rules.
+pub(crate) const INTERACTION_PSEUDO_CLASSES: [&str; 4] =
+    ["hover", "focus", "active", "focus-visible"];
 
 impl Simple {
     /// Does this simple selector carry interaction state (ADR 0011)?
@@ -146,7 +149,7 @@ impl fmt::Display for CssDiagnostic {
             CssDiagnostic::UnsupportedPseudoClass { line, name } => {
                 write!(
                     f,
-                    "line {line}: pseudo-class :{name} is outside the M4b interaction profile (hover, focus, active); rule skipped"
+                    "line {line}: pseudo-class :{name} is outside the M4b interaction profile (hover, focus, active, focus-visible); rule skipped"
                 )
             }
         }

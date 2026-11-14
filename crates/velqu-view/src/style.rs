@@ -287,7 +287,9 @@ impl Sides<Length> {
 }
 
 /// The CSS `cursor` property's v0 values (M4b, ADR 0011). Inherited and
-/// presentation-only: a cursor change never lays out or repaints.
+/// presentation-only: a cursor change never lays out or repaints. Batch 3
+/// adds the drag pair (`grab`/`grabbing`) the shell maps onto the platform
+/// grab icons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CursorStyle {
     /// UA default (the shell maps this to the platform arrow).
@@ -299,6 +301,40 @@ pub enum CursorStyle {
     Pointer,
     /// An I-beam, over selectable text.
     Text,
+    /// An open hand, over draggable things.
+    Grab,
+    /// A closed hand, while dragging.
+    Grabbing,
+}
+
+/// One outer `box-shadow` layer (batch 3). Lengths are authored px; the
+/// display-list emission scales them into device px. Inset shadows and
+/// multiple layers land later; layers parse today because Tailwind's
+/// `shadow-md`-family presets are comma-separated pairs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BoxShadow {
+    /// Horizontal offset (positive = right).
+    pub offset_x: f32,
+    /// Vertical offset (positive = down).
+    pub offset_y: f32,
+    /// Blur feather radius (non-negative).
+    pub blur: f32,
+    /// Spread: the shadow shape grows (`> 0`) or shrinks (`< 0`).
+    pub spread: f32,
+    /// Shadow color (usually semi-transparent).
+    pub color: Color,
+}
+
+/// `text-overflow` (batch 3): `clip` (default) or `ellipsis`, applied to a
+/// single `white-space: nowrap` line that overflows its box. Multi-line
+/// ellipsis is outside the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TextOverflow {
+    /// Clip overflow at the box edge (the pre-existing behavior).
+    #[default]
+    Clip,
+    /// Truncate an overflowing nowrap line and append `…`.
+    Ellipsis,
 }
 
 /// A 2D transform: independent axis scales, rotation, plus a translation,
@@ -502,6 +538,15 @@ pub(crate) struct ComputedStyle {
     pub transition_easing: Easing,
     /// ADR 0024: preset looping animation (not inherited).
     pub animation: AnimationKind,
+    /// Batch 3: outer `box-shadow` layers, in declaration order (paint-only,
+    /// not inherited; the first layer paints on top per CSS).
+    pub box_shadows: Vec<BoxShadow>,
+    /// Batch 3: `text-overflow: ellipsis` for an overflowing single
+    /// `white-space: nowrap` line (not inherited).
+    pub text_overflow: TextOverflow,
+    /// Batch 3: `user-select: none` — inherited; a `none` subtree never
+    /// builds a text selection (caret placement and editing still work).
+    pub user_select_none: bool,
 }
 
 impl ComputedStyle {
@@ -558,6 +603,9 @@ impl ComputedStyle {
             transition_delay: Duration::ZERO,
             transition_easing: Easing::DEFAULT,
             animation: AnimationKind::None,
+            box_shadows: Vec::new(),
+            text_overflow: TextOverflow::Clip,
+            user_select_none: false,
         }
     }
 
@@ -808,6 +856,10 @@ impl ComputedStyle {
         self.text_align = parent.text_align;
         self.white_space = parent.white_space;
         self.cursor = parent.cursor;
+        // `user-select: none` covers the subtree (CSS `auto` resolves
+        // parent-wise; modeling it as inherited matches the effective
+        // behavior for the none/auto pair the profile supports).
+        self.user_select_none = parent.user_select_none;
         self.background_color = Color::TRANSPARENT; // backgrounds do not inherit
     }
 }
@@ -930,6 +982,11 @@ pub(crate) struct InteractionState {
     pub active_path: Vec<NodeId>,
     /// The focused element (exact match only).
     pub focus: Option<NodeId>,
+    /// Batch 3: the focus arrived through keyboard navigation, so
+    /// `:focus-visible` matches the focused element exactly. Pointer- and
+    /// programmatic-set focus never matches (the conservative slice of the
+    /// CSS keyboard heuristic; ADR 0011 already recorded the origin).
+    pub focus_visible: bool,
 }
 
 impl InteractionState {
@@ -1026,6 +1083,7 @@ fn compound_matches(
                     "hover" => state.hover_path.contains(&node),
                     "active" => state.active_path.contains(&node),
                     "focus" => state.focus == Some(node),
+                    "focus-visible" => state.focus == Some(node) && state.focus_visible,
                     _ => false,
                 };
                 if !matched {
@@ -1197,7 +1255,26 @@ fn apply_declaration(
             "default" => style.cursor = CursorStyle::Default,
             "pointer" => style.cursor = CursorStyle::Pointer,
             "text" => style.cursor = CursorStyle::Text,
+            "grab" => style.cursor = CursorStyle::Grab,
+            "grabbing" => style.cursor = CursorStyle::Grabbing,
             _ => diagnostics.push(unsupported("cursor value")),
+        },
+        "box-shadow" => match parse_box_shadows(&declaration.value, style.color) {
+            Ok(layers) => style.box_shadows = layers,
+            Err(message) => diagnostics.push(skip(format!(
+                "unsupported box-shadow value {:?}: {}",
+                declaration.value, message
+            ))),
+        },
+        "text-overflow" => match declaration.value.trim() {
+            "clip" => style.text_overflow = TextOverflow::Clip,
+            "ellipsis" => style.text_overflow = TextOverflow::Ellipsis,
+            _ => diagnostics.push(unsupported("text-overflow value")),
+        },
+        "user-select" => match declaration.value.trim() {
+            "none" => style.user_select_none = true,
+            "auto" | "text" => style.user_select_none = false,
+            _ => diagnostics.push(unsupported("user-select value")),
         },
         "background-color" | "background" => match parse_color(&declaration.value) {
             Some(c) => style.background_color = c,
@@ -2150,7 +2227,11 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
     }
 }
 
-/// Named colors + `#rgb`/`#rrggbb` + `rgb(r, g, b)` (sRGB only in M2a).
+/// Named colors + `#rgb`/`#rrggbb`/`#rrggbbaa` + `rgb()`/`rgba()` (sRGB
+/// only). The function form accepts the legacy comma shape — `rgb(15, 23,
+/// 42)`, `rgba(15, 23, 42, 0.35)`, and `rgb(15, 23, 42, 0.35)` — and the
+/// CSS Color 4 space shape Tailwind v3 emits — `rgb(0 0 0 / 0.1)`. Alpha
+/// is a 0–1 number; percentage channels are outside the profile.
 pub(crate) fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim();
     if let Ok(color) = Color::from_hex(value) {
@@ -2165,18 +2246,14 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
             }
         }
     }
-    if let Some(inner) = value
-        .strip_prefix("rgb(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        let channels: Vec<&str> = inner.split(',').map(str::trim).collect();
-        if channels.len() == 3 {
-            let (r, g, b) = (
-                channels[0].parse().ok()?,
-                channels[1].parse().ok()?,
-                channels[2].parse().ok()?,
-            );
-            return Some(Color::from_rgb8(r, g, b));
+    for prefix in ["rgb(", "rgba("] {
+        if let Some(inner) = value
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            if let Some(color) = parse_rgb_channels(inner) {
+                return Some(color);
+            }
         }
     }
     Some(match value {
@@ -2193,7 +2270,127 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
     })
 }
 
+/// Parses the inside of an `rgb()`/`rgba()` function: three channels in
+/// 0–255 (comma- or space-separated) plus an optional alpha in 0–1 — either
+/// a legacy 4th comma channel or the Color-4 `/ alpha` tail. Returns `None`
+/// for anything else; the caller treats that as an unsupported color.
+fn parse_rgb_channels(inner: &str) -> Option<Color> {
+    // Legacy comma form: `r, g, b` or `r, g, b, a`.
+    if inner.contains(',') {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        return match parts.as_slice() {
+            [r, g, b] => channel_color(r, g, b, None),
+            [r, g, b, a] => channel_color(r, g, b, Some(a)),
+            _ => None,
+        };
+    }
+    // Color-4 space form, optionally with `/ alpha`.
+    let (main, alpha) = match inner.split_once('/') {
+        Some((main, rest)) => (main.trim(), Some(rest.trim())),
+        None => (inner.trim(), None),
+    };
+    let channels: Vec<&str> = main.split_ascii_whitespace().collect();
+    let [r, g, b] = channels.as_slice() else {
+        return None;
+    };
+    channel_color(r, g, b, alpha)
+}
 
+/// Builds a color from three channel strings and an optional alpha string.
+fn channel_color(r: &str, g: &str, b: &str, a: Option<&str>) -> Option<Color> {
+    let channel = |text: &str| -> Option<u8> {
+        let value: f32 = text.parse().ok()?;
+        (value.is_finite() && (0.0..=255.0).contains(&value)).then(|| value.round() as u8)
+    };
+    let color = Color::from_rgb8(channel(r)?, channel(g)?, channel(b)?);
+    match a {
+        None => Some(color),
+        Some(a) => {
+            let alpha: f32 = a.trim().parse().ok()?;
+            (alpha.is_finite() && (0.0..=1.0).contains(&alpha)).then(|| {
+                Color::from_rgba8(color.r, color.g, color.b, (alpha * 255.0).round() as u8)
+            })
+        }
+    }
+}
+
+/// Parses a `box-shadow` value into outer layers (batch 3): comma-separated
+/// `<offset-x> <offset-y> <blur>? <spread>? <color>?` per layer, `none` to
+/// clear. `inset` is deferred and diagnoses; a missing color resolves
+/// against `current_color` (CSS `currentColor` default). Lengths are px.
+pub(crate) fn parse_box_shadows(
+    value: &str,
+    current_color: Color,
+) -> Result<Vec<BoxShadow>, String> {
+    let value = value.trim();
+    if value == "none" || value.is_empty() {
+        return Ok(Vec::new());
+    }
+    split_top_level(value, ',')
+        .iter()
+        .map(|layer| parse_box_shadow_layer(layer, current_color))
+        .collect()
+}
+
+/// Parses one comma-separated box-shadow layer.
+fn parse_box_shadow_layer(layer: &str, current_color: Color) -> Result<BoxShadow, String> {
+    let mut lengths: Vec<f32> = Vec::new();
+    let mut color = None;
+    for token in top_level_tokens(layer) {
+        if token == "inset" {
+            return Err("inset shadows are deferred in the renderer profile \
+                 (outer shadows only)"
+                .into());
+        }
+        if let Some(parsed) = parse_color(token) {
+            if color.is_some() {
+                return Err("a box-shadow layer takes at most one color".into());
+            }
+            color = Some(parsed);
+            continue;
+        }
+        match parse_length(token) {
+            Some(Length::Px(v)) => lengths.push(v),
+            _ => return Err(format!("unsupported box-shadow component {token:?}")),
+        }
+    }
+    // The color may sit before the lengths in the grammar, so lengths are
+    // the first 2–4 numeric tokens in order regardless of color position.
+    match lengths.as_slice() {
+        [x, y] => Ok(BoxShadow {
+            offset_x: *x,
+            offset_y: *y,
+            blur: 0.0,
+            spread: 0.0,
+            color: color.unwrap_or(current_color),
+        }),
+        [x, y, blur] => Ok(BoxShadow {
+            offset_x: *x,
+            offset_y: *y,
+            blur: non_negative_blur(*blur)?,
+            spread: 0.0,
+            color: color.unwrap_or(current_color),
+        }),
+        [x, y, blur, spread] => Ok(BoxShadow {
+            offset_x: *x,
+            offset_y: *y,
+            blur: non_negative_blur(*blur)?,
+            spread: *spread,
+            color: color.unwrap_or(current_color),
+        }),
+        _ => Err("a layer needs <offset-x> <offset-y> [<blur> [<spread>]] \
+                  and an optional color"
+            .into()),
+    }
+}
+
+fn non_negative_blur(blur: f32) -> Result<f32, String> {
+    if blur.is_finite() && blur >= 0.0 {
+        Ok(blur)
+    } else {
+        Err("the box-shadow blur must be a non-negative px length".into())
+    }
+}
 
 /// Normalizes a `font-family` declaration to the first named family:
 /// lowercased, quotes stripped, generic families and lists reduced to
@@ -2207,9 +2404,9 @@ fn normalize_font_family(value: &str) -> Option<String> {
     let lowered = unquoted.to_ascii_lowercase();
     match lowered.as_str() {
         // Generic families resolve to the bundled default.
-        "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy"
-        | "system-ui" | "ui-sans-serif" | "ui-serif" | "ui-monospace"
-        | "-apple-system" | "inherit" | "initial" | "unset" => None,
+        "serif" | "sans-serif" | "monospace" | "cursive" | "fantasy" | "system-ui"
+        | "ui-sans-serif" | "ui-serif" | "ui-monospace" | "-apple-system" | "inherit"
+        | "initial" | "unset" => None,
         _ => Some(lowered),
     }
 }
@@ -2348,6 +2545,7 @@ mod tests {
                 hover_path: path,
                 active_path: Vec::new(),
                 focus: None,
+                focus_visible: false,
             }
         }
 
@@ -2357,6 +2555,7 @@ mod tests {
                 hover_path: Vec::new(),
                 active_path: Vec::new(),
                 focus: Some(self.node_of(fixture_id)),
+                focus_visible: false,
             }
         }
     }
@@ -2861,5 +3060,156 @@ mod tests {
         );
         assert_eq!(style.opacity, 0.6);
         assert_eq!(style.transform.scale_x, 1.05);
+    }
+
+    // -- batch 3: box-shadow / text-overflow / user-select / cursor --------
+
+    #[test]
+    fn box_shadow_parses_single_and_multi_layer() {
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &[
+                "p { box-shadow: 0 10px 24px -10px rgba(15, 23, 42, 0.35) }",
+                "p { box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), \
+                    0 2px 4px -2px #0000001a }",
+            ],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        // The second declaration wins the cascade: two layers (the
+        // Tailwind `shadow-md` shape).
+        assert_eq!(style.box_shadows.len(), 2);
+        let first = style.box_shadows[0];
+        assert_eq!(
+            (first.offset_x, first.offset_y, first.blur, first.spread),
+            (0.0, 4.0, 6.0, -1.0)
+        );
+        assert_eq!(
+            first.color,
+            Color::from_rgba8(0, 0, 0, (0.1f32 * 255.0).round() as u8)
+        );
+        assert_eq!(
+            style.box_shadows[1].color,
+            Color::from_hex("#0000001a").unwrap()
+        );
+    }
+
+    #[test]
+    fn box_shadow_defaults_color_to_current_color() {
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &["p { color: #112233; box-shadow: 4px 8px }"],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.box_shadows.len(), 1);
+        assert_eq!(
+            style.box_shadows[0].color,
+            Color::from_hex("#112233").unwrap()
+        );
+        assert_eq!(style.box_shadows[0].blur, 0.0);
+    }
+
+    #[test]
+    fn box_shadow_none_and_invalid_shapes() {
+        let mut fx = build(
+            "<p data-vv-test=p>x</p>",
+            &[
+                "p { box-shadow: none }",
+                "p { box-shadow: inset 0 1px 2px black }",
+                "p { box-shadow: 0 1px -2px black }",
+                "p { box-shadow: 0 }",
+            ],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(style.box_shadows.is_empty(), "none clears");
+        assert_eq!(diagnostics.len(), 3, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("inset"));
+        assert!(diagnostics[1].message.contains("blur"));
+        assert!(diagnostics[2].message.contains("layer"));
+    }
+
+    #[test]
+    fn rgb_colors_parse_in_comma_and_space_forms() {
+        let comma = parse_color("rgb(15, 23, 42)").unwrap();
+        assert_eq!(comma, Color::from_rgb8(15, 23, 42));
+        let space_alpha = parse_color("rgb(0 0 0 / 0.1)").unwrap();
+        assert_eq!(space_color_alpha_10(), space_alpha);
+        let rgba = parse_color("rgba(15, 23, 42, 0.35)").unwrap();
+        assert_eq!(
+            rgba,
+            Color::from_rgba8(15, 23, 42, (0.35f32 * 255.0).round() as u8)
+        );
+        let four_comma = parse_color("rgb(255, 0, 0, 0.5)").unwrap();
+        assert_eq!(four_comma.a, 128);
+        // Out-of-range and malformed values refuse.
+        assert_eq!(parse_color("rgb(300, 0, 0)"), None);
+        assert_eq!(parse_color("rgba(1, 2)"), None);
+        assert_eq!(parse_color("rgb(0 0 0 / 2)"), None);
+    }
+
+    fn space_color_alpha_10() -> Color {
+        Color::from_rgba8(0, 0, 0, (0.1f32 * 255.0).round() as u8)
+    }
+
+    #[test]
+    fn text_overflow_and_user_select_parse() {
+        let mut fx = build(
+            "<p data-vv-test=p>x</p><span data-vv-test=s>y</span>",
+            &[
+                "p { text-overflow: ellipsis; user-select: none }",
+                "span { user-select: none }",
+            ],
+        );
+        let (style, diagnostics) = fx.compute_for("p");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(style.text_overflow, TextOverflow::Ellipsis);
+        assert!(style.user_select_none);
+        let (span, _) = fx.compute_for("s");
+        assert!(span.user_select_none);
+        // Inheritance: a span inside the none subtree inherits it.
+        let mut fx2 = build(
+            "<div class=quiet><span data-vv-test=s>y</span></div>",
+            &[".quiet { user-select: none }"],
+        );
+        let (inner, _) = fx2.compute_for("s");
+        assert!(inner.user_select_none, "user-select inherits");
+    }
+
+    #[test]
+    fn user_select_auto_overrides_inherited_none() {
+        let mut fx = build(
+            "<div class=quiet><span data-vv-test=s style=\"user-select: auto\">y</span></div>",
+            &[".quiet { user-select: none }"],
+        );
+        let (inner, _) = fx.compute_for("s");
+        assert!(!inner.user_select_none);
+    }
+
+    #[test]
+    fn focus_visible_matches_only_keyboard_focus() {
+        let mut fx = build(
+            "<button data-vv-test=btn>x</button>",
+            &["button:focus-visible { background-color: #112233 }\
+              button:focus { color: #000044 }"],
+        );
+        let node = fx.node_of("btn");
+        // Keyboard focus: both :focus and :focus-visible match.
+        let keyboard = InteractionState {
+            focus: Some(node),
+            focus_visible: true,
+            ..InteractionState::default()
+        };
+        let (style, _) = fx.compute_for_with("btn", Some(&keyboard));
+        assert_eq!(style.background_color, Color::from_hex("#112233").unwrap());
+        assert_eq!(style.color, Color::from_hex("#000044").unwrap());
+        // Pointer focus: :focus matches, :focus-visible does not.
+        let pointer = InteractionState {
+            focus: Some(node),
+            ..InteractionState::default()
+        };
+        let (style, _) = fx.compute_for_with("btn", Some(&pointer));
+        assert_eq!(style.background_color, Color::TRANSPARENT);
+        assert_eq!(style.color, Color::from_hex("#000044").unwrap());
     }
 }

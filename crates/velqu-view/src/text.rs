@@ -134,7 +134,10 @@ mod tests {
         // Bold is wider than regular for DejaVu.
         let bold = measure_run(&mut fonts, crate::font::DEFAULT_BOLD, "Hello Velqu", 16);
         assert!(bold > a);
-        assert_eq!(measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "", 16), 0.0);
+        assert_eq!(
+            measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "", 16),
+            0.0
+        );
     }
 
     #[test]
@@ -142,7 +145,13 @@ mod tests {
         let mut fonts = measurer();
         // Chosen so two words fit and the third wraps.
         let width = measure_run(&mut fonts, crate::font::DEFAULT_REGULAR, "one two", 16);
-        let lines = wrap_lines(&mut fonts, crate::font::DEFAULT_REGULAR, "one two three", width, 16);
+        let lines = wrap_lines(
+            &mut fonts,
+            crate::font::DEFAULT_REGULAR,
+            "one two three",
+            width,
+            16,
+        );
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].text, "one two");
         assert_eq!(lines[1].text, "three");
@@ -151,7 +160,13 @@ mod tests {
     #[test]
     fn hard_breaks_always_split() {
         let mut fonts = measurer();
-        let lines = wrap_lines(&mut fonts, crate::font::DEFAULT_REGULAR, "a\nb\nc", 1000.0, 16);
+        let lines = wrap_lines(
+            &mut fonts,
+            crate::font::DEFAULT_REGULAR,
+            "a\nb\nc",
+            1000.0,
+            16,
+        );
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1].text, "b");
     }

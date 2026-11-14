@@ -861,11 +861,41 @@ impl velqu_view::ClipboardProvider for ArboardClipboard {
 
 /// Maps the CSS `cursor` value onto the platform cursor (M4b). `Auto`
 /// means "the UA decides" - the shell's UA default is the plain arrow.
+/// Batch 3 adds the drag pair; winit resolves the names onto the platform
+/// cursor theme (GDK's grab/grabbing on Wayland/X11).
 fn cursor_icon(style: CursorStyle) -> winit::window::CursorIcon {
     match style {
         CursorStyle::Auto | CursorStyle::Default => winit::window::CursorIcon::Default,
         CursorStyle::Pointer => winit::window::CursorIcon::Pointer,
         CursorStyle::Text => winit::window::CursorIcon::Text,
+        CursorStyle::Grab => winit::window::CursorIcon::Grab,
+        CursorStyle::Grabbing => winit::window::CursorIcon::Grabbing,
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn grab_cursors_map_onto_the_platform_icons() {
+        assert_eq!(
+            cursor_icon(CursorStyle::Grab),
+            winit::window::CursorIcon::Grab
+        );
+        assert_eq!(
+            cursor_icon(CursorStyle::Grabbing),
+            winit::window::CursorIcon::Grabbing
+        );
+        // The pre-existing set is unchanged.
+        assert_eq!(
+            cursor_icon(CursorStyle::Auto),
+            winit::window::CursorIcon::Default
+        );
+        assert_eq!(
+            cursor_icon(CursorStyle::Text),
+            winit::window::CursorIcon::Text
+        );
     }
 }
 

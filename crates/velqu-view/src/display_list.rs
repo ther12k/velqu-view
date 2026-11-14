@@ -253,6 +253,21 @@ pub(crate) enum DisplayItem {
     PushOpacity(f32),
     /// Ends the innermost opacity scope.
     PopOpacity,
+    /// One outer `box-shadow` layer (batch 3): a rounded shadow shape
+    /// (`bounds`, offset and spread already applied, corner `radius`)
+    /// painted **outside** the element's border box (`inner`, corner
+    /// `inner_radius`) — the CSS rule that a shadow never shows through a
+    /// transparent element. `blur` feathers the outer edge; the painter
+    /// approximates it with stepped ring fills (deterministic, no
+    /// anti-aliasing). Zero-blur shadows paint as a single solid ring.
+    OuterShadow {
+        bounds: Rect,
+        radius: f32,
+        inner: Rect,
+        inner_radius: f32,
+        blur: f32,
+        color: Color,
+    },
 }
 
 /// The paint-ready result of one layout pass.

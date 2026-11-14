@@ -333,10 +333,7 @@ pub(crate) fn build_boxes(
     let itemifies_children = style.display == Display::Flex;
     let mut anonymous_run: Option<BoxNode> = None;
     // Runs of inline content flush here when the parent itemifies.
-    fn flush_anonymous_run(
-        run: &mut Option<BoxNode>,
-        children: &mut Vec<BoxNode>,
-    ) {
+    fn flush_anonymous_run(run: &mut Option<BoxNode>, children: &mut Vec<BoxNode>) {
         // The run's style is already a flex row (set at construction) —
         // it must NOT be forced to block here, or multi-child runs (e.g.
         // EQ-bar spans, inline button groups) stack vertically.
@@ -356,7 +353,8 @@ pub(crate) fn build_boxes(
                         Display::None => {}
                         Display::Block | Display::Flex | Display::Grid => {
                             flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
+                            {
                                 box_node.children.push(child_box);
                             }
                         }
@@ -364,7 +362,8 @@ pub(crate) fn build_boxes(
                         // even where display is inline.
                         _ if dom.tag_name(child) == Some("img") => {
                             flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
+                            {
                                 box_node.children.push(child_box);
                             }
                         }
@@ -376,7 +375,8 @@ pub(crate) fn build_boxes(
                         // inheriting the parent's cross-alignment and
                         // gap, which were authored for these children.
                         _ => {
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
+                            {
                                 let run = anonymous_run.get_or_insert_with(|| {
                                     let mut run_style = style.clone();
                                     run_style.display = Display::Flex;
@@ -384,7 +384,8 @@ pub(crate) fn build_boxes(
                                     run_style.align_items = style.align_items;
                                     run_style.row_gap = style.row_gap;
                                     run_style.column_gap = style.column_gap;
-                                    run_style.justify_content = crate::style::JustifyContent::default();
+                                    run_style.justify_content =
+                                        crate::style::JustifyContent::default();
                                     BoxNode {
                                         node: root,
                                         fixture_id: None,
@@ -791,6 +792,35 @@ fn emit_box(
     if transform_scope {
         let matrix = element_transform_matrix(node, scale);
         list.items.push(DisplayItem::PushTransform { matrix });
+    }
+
+    // Outer box-shadows (batch 3): painted under the element's own chrome,
+    // clipped at the border box so they never show through a transparent
+    // element. CSS paints the first-listed layer on top, so layers emit in
+    // reverse order. Values are authored logical px; the device scale
+    // applies like border-radius.
+    for shadow in style.box_shadows.iter().rev() {
+        if shadow.color.a == 0 {
+            continue;
+        }
+        let spread = shadow.spread * scale;
+        let bounds = Rect {
+            x: node.border_box.x + shadow.offset_x * scale - spread,
+            y: node.border_box.y + shadow.offset_y * scale - spread,
+            w: node.border_box.w + 2.0 * spread,
+            h: node.border_box.h + 2.0 * spread,
+        };
+        if bounds.w <= 0.0 || bounds.h <= 0.0 {
+            continue;
+        }
+        list.items.push(DisplayItem::OuterShadow {
+            bounds,
+            radius: (radius + spread).max(0.0),
+            inner: node.border_box,
+            inner_radius: radius,
+            blur: shadow.blur * scale,
+            color: shadow.color,
+        });
     }
 
     // Own chrome (background, border): the painter applies the current

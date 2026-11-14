@@ -804,7 +804,9 @@ impl VelquView {
         bold: Option<Vec<u8>>,
     ) -> Result<(), VelquError> {
         if family.trim().is_empty() {
-            return Err(VelquError::EmptySource { kind: SourceKind::Css });
+            return Err(VelquError::EmptySource {
+                kind: SourceKind::Css,
+            });
         }
         self.fonts
             .register(family, &regular, false)
@@ -1904,8 +1906,8 @@ impl VelquView {
             // frame pump awake at 60fps with an invisible infinite
             // animation. Stop it; sync restarts it when the node paints
             // again.
-            let hidden = self.reactive_hidden.contains(&node)
-                || (boxes_current && !self.node_has_box(node));
+            let hidden =
+                self.reactive_hidden.contains(&node) || (boxes_current && !self.node_has_box(node));
             if hidden {
                 self.anim.stop_infinite_for(node);
                 continue;
@@ -2275,6 +2277,11 @@ impl VelquView {
             hover_path,
             active_path,
             focus: self.focus,
+            // Batch 3: `:focus-visible` keys off the focus origin ADR 0011
+            // already records — keyboard navigation matches, pointer and
+            // programmatic focus do not (the conservative slice of the CSS
+            // keyboard heuristic).
+            focus_visible: self.focus_origin == Some(input::FocusOrigin::Keyboard),
         }
     }
 
@@ -2686,7 +2693,9 @@ impl VelquView {
 
     /// Focuses an enabled control, places the caret under the press point,
     /// and captures the pointer for drag selection (M4c1). Disabled
-    /// controls are ignored; readonly controls are selectable.
+    /// controls are ignored; readonly controls are selectable. A
+    /// `user-select: none` subtree keeps caret placement but never
+    /// captures the pointer for drag selection (batch 3).
     fn begin_control_selection(&mut self, viewport: Viewport, node: dom::NodeId, x: f32, y: f32) {
         if self.controls.get(&node).is_some_and(|state| state.disabled) {
             return;
@@ -2698,8 +2707,10 @@ impl VelquView {
         if let Some(state) = self.controls.get_mut(&node) {
             state.editor.collapse_to(offset);
         }
-        self.pointer_capture = Some(node);
-        self.pointer_anchor = Some(offset);
+        if !self.node_user_select_none(node) {
+            self.pointer_capture = Some(node);
+            self.pointer_anchor = Some(offset);
+        }
         self.events.push(Event::SelectionChanged {
             target: self.node_target(node),
             anchor: offset,
@@ -2709,13 +2720,28 @@ impl VelquView {
         self.note_presentation_cause("selection");
     }
 
+    /// Whether `node`'s computed style carries `user-select: none` (a
+    /// static property — inherited, interaction rules may not set it), so
+    /// the selection gestures must leave the value's selection alone.
+    /// Pure read of the cached layout; never lays out.
+    fn node_user_select_none(&self, node: dom::NodeId) -> bool {
+        self.last_viewport
+            .and_then(|vp| self.cached_layout(vp))
+            .and_then(|laid| layout::find_box(&laid.root, node))
+            .is_some_and(|box_node| box_node.style.user_select_none)
+    }
+
     /// Extends the captured control's selection to the pointer position.
     /// Mapping ignores clipping (capture deliberately survives leaving the
     /// box); the offset clamps to the nearest line's grapheme boundaries.
+    /// A `user-select: none` subtree never extends (batch 3).
     fn extend_control_selection(&mut self, viewport: Viewport, x: f32, y: f32) -> bool {
         let Some(node) = self.pointer_capture else {
             return false;
         };
+        if self.node_user_select_none(node) {
+            return false;
+        }
         let Some(anchor) = self.pointer_anchor else {
             return false;
         };
@@ -2951,6 +2977,9 @@ impl VelquView {
         let Some(node) = self.focus else {
             return false;
         };
+        // `user-select: none` (batch 3): the value stays editable, but the
+        // selection-building gesture is refused for the subtree.
+        let selectable = !self.node_user_select_none(node);
         let Some(state) = self.controls.get_mut(&node) else {
             return false;
         };
@@ -3021,7 +3050,11 @@ impl VelquView {
             }
             KeyCommand::Home => state.editor.move_home(modifiers.shift),
             KeyCommand::End => state.editor.move_end(modifiers.shift),
-            KeyCommand::SelectAll if modifiers.select_all() => state.editor.select_all(),
+            KeyCommand::SelectAll if modifiers.select_all() => {
+                if selectable {
+                    state.editor.select_all();
+                }
+            }
             KeyCommand::Enter if !state.readonly && state.kind.accepts_newline() => {
                 state.editor.insert_text("\n");
             }
@@ -9469,7 +9502,7 @@ mod tests {
         let mut view = VelquView::new();
         view.load_html(
             "<!doctype html><html><body style=\"margin: 0\">\
-             <div data-vv-test=a class=\"w-64 h-8 shadow-md hover:flex\"></div>\
+             <div data-vv-test=a class=\"w-64 h-8 ring-2 hover:flex\"></div>\
              </body></html>",
         )
         .unwrap();
@@ -9484,8 +9517,280 @@ mod tests {
         assert_eq!(fact_of(&facts, "a").width, 256.0, "w-64 now applies");
         let diagnostics = view.tailwind_diagnostics();
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-        assert!(diagnostics[0].starts_with("class \"shadow-md\":"));
+        assert!(diagnostics[0].starts_with("class \"ring-2\":"));
         assert!(diagnostics[1].starts_with("class \"hover:flex\":"));
+    }
+
+    // -- batch 3: box-shadow, cursor grab, user-select, ellipsis,
+    //    focus-visible, negative margins -----------------------------------
+
+    #[test]
+    fn box_shadow_paints_outside_the_border_box_and_stays_deterministic() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>\
+             body { margin: 0; background-color: #ffffff }\
+             .card { width: 100px; height: 50px;\
+                     box-shadow: 0 10px 24px rgba(15, 23, 42, 0.35) }\
+             </style></head><body><div class=card></div></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        let first = view.render(vp).unwrap().frame;
+        // Inside the (transparent) element: the shadow is clipped at the
+        // border box and never shows through.
+        assert_eq!(
+            first.pixel(50, 25),
+            Some(Color::WHITE),
+            "the shadow never paints inside the element"
+        );
+        // In the shadow zone below the element (offset 10, blur 24): a
+        // blended feather, not the bare background and not opaque.
+        let shadowed = first.pixel(50, 60).expect("in viewport");
+        assert_ne!(shadowed, Color::WHITE, "the shadow paints below");
+        // Well past the feather: background again.
+        assert_eq!(first.pixel(50, 90), Some(Color::WHITE));
+        // Deterministic raster.
+        let second = view.render(vp).unwrap().frame;
+        assert_eq!(first.sha256_hex(), second.sha256_hex());
+    }
+
+    #[test]
+    fn tailwind_shadow_presets_compile_and_paint() {
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=card class=\"shadow-md bg-rose-600 w-32 h-16\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 120, 1.0).unwrap();
+        view.layout_facts(vp).unwrap();
+        assert!(
+            view.tailwind_diagnostics().is_empty(),
+            "{:?}",
+            view.tailwind_diagnostics()
+        );
+        let frame = view.render(vp).unwrap().frame;
+        // The element paints its own background (the shadow is under it)…
+        assert_eq!(
+            frame.pixel(10, 10),
+            Some(Color::from_hex("#e11d48").unwrap())
+        );
+        // …and the md shadow feathers below the 64px-tall card.
+        let below = frame.pixel(10, 66).expect("below the card");
+        assert_ne!(below, Color::WHITE, "shadow-md feathers below the box");
+    }
+
+    #[test]
+    fn cursor_grab_cursors_map_through_the_runtime() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>\
+             body { margin: 0 }\
+             .card { cursor: grab; width: 120px; height: 120px }\
+             .knob { cursor: grabbing; width: 40px; height: 40px }\
+             </style></head><body>\
+             <div class=card><div class=knob id=knob>x</div></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        // The drag pair reaches the public cursor query (the shell maps
+        // the values onto the platform icons).
+        assert_eq!(view.cursor_under(vp, 100.0, 100.0), CursorStyle::Grab);
+        assert_eq!(
+            view.cursor_under(vp, 10.0, 10.0),
+            CursorStyle::Grabbing,
+            "the knob's own cursor wins over the card's"
+        );
+        assert_eq!(view.cursor_under(vp, 180.0, 180.0), CursorStyle::Auto);
+    }
+
+    #[test]
+    fn focus_visible_applies_only_through_keyboard_focus() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>\
+             body { margin: 0; background-color: #ffffff }\
+             div { width: 100px; height: 100px }\
+             #a:focus { background-color: #224466 }\
+             #a:focus-visible { background-color: #112233 }\
+             </style></head><body><div id=a></div></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        // Keyboard navigation (focus_next): both rules match and share
+        // specificity, so the later :focus-visible rule wins.
+        view.focus_next();
+        view.render(vp).unwrap();
+        assert_eq!(view.focus_origin(), Some(FocusOrigin::Keyboard));
+        assert_eq!(
+            view.render(vp).unwrap().frame.pixel(50, 50),
+            Some(Color::from_hex("#112233").unwrap()),
+            ":focus-visible paints for keyboard focus"
+        );
+
+        // Programmatic focus: :focus still matches, :focus-visible does not.
+        view.set_focus(None);
+        let _ = view.take_events();
+        view.set_focus(Some("a"));
+        view.render(vp).unwrap();
+        assert_eq!(view.focus_origin(), Some(FocusOrigin::Programmatic));
+        assert_eq!(
+            view.render(vp).unwrap().frame.pixel(50, 50),
+            Some(Color::from_hex("#224466").unwrap()),
+            ":focus matches without the visible bit"
+        );
+
+        // The whole affair is paint-only (ADR 0011).
+        assert_eq!(view.layout_stats().passes, passes, "focus never lays out");
+    }
+
+    #[test]
+    fn user_select_none_blocks_selection_gestures_but_not_the_caret() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html><head><style>\
+             body { margin: 0 } .quiet { user-select: none }\
+             </style></head><body>\
+             <div class=quiet><input id=locked value=hello></div>\
+             <input id=free value=hello>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+
+        // Drag across the locked input (inside the none subtree): the
+        // caret places, but no selection is built.
+        let locked_caret = view.control_facts(vp).unwrap().controls[0].caret_rect;
+        view.pointer_press(vp, locked_caret.x + 1.0, locked_caret.y + 5.0);
+        view.pointer_move(vp, locked_caret.x + 100.0, locked_caret.y + 5.0);
+        view.pointer_release(vp, locked_caret.x + 100.0, locked_caret.y + 5.0);
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            (
+                facts.controls[0].selection_anchor,
+                facts.controls[0].selection_focus
+            ),
+            (0, 0),
+            "no drag selection under user-select: none"
+        );
+
+        // The same gesture selects in the plain input.
+        let free_caret = view.control_facts(vp).unwrap().controls[1].caret_rect;
+        view.pointer_press(vp, free_caret.x + 1.0, free_caret.y + 5.0);
+        view.pointer_move(vp, free_caret.x + 100.0, free_caret.y + 5.0);
+        view.pointer_release(vp, free_caret.x + 100.0, free_caret.y + 5.0);
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            (
+                facts.controls[1].selection_anchor,
+                facts.controls[1].selection_focus
+            ),
+            (0, 5),
+            "the unrestricted input still drag-selects"
+        );
+
+        // Ctrl+A selects the free input but never the locked one.
+        let modifiers = KeyModifiers {
+            ctrl: true,
+            ..KeyModifiers::default()
+        };
+        view.set_focus(Some("locked"));
+        let _ = view.take_events();
+        view.key_command(KeyCommand::SelectAll, modifiers);
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            (
+                facts.controls[0].selection_anchor,
+                facts.controls[0].selection_focus
+            ),
+            (0, 0),
+            "SelectAll refuses under user-select: none"
+        );
+        view.set_focus(Some("free"));
+        let _ = view.take_events();
+        view.key_command(KeyCommand::SelectAll, modifiers);
+        let facts = view.control_facts(vp).unwrap();
+        assert_eq!(
+            (
+                facts.controls[1].selection_anchor,
+                facts.controls[1].selection_focus
+            ),
+            (0, 5),
+            "SelectAll works in the unrestricted input"
+        );
+    }
+
+    #[test]
+    fn truncate_ellipses_an_overflowing_nowrap_line() {
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <p data-vv-test=cut class=\"truncate w-40\">\
+             aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll\
+             </p>\
+             <p data-vv-test=plain class=\"overflow-hidden whitespace-nowrap w-40\">\
+             aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll\
+             </p>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        assert!(
+            view.tailwind_diagnostics().is_empty(),
+            "{:?}",
+            view.tailwind_diagnostics()
+        );
+        let lines = &fact_of(&facts, "cut").text_runs;
+        // Still one nowrap line, now ending in the ellipsis mark.
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with('\u{2026}'), "{lines:?}");
+        assert!(lines[0].starts_with("aaa"), "kept from the line start");
+
+        // Without text-overflow, the same nowrap line keeps its full text
+        // (clipped at paint only).
+        let plain_lines = &fact_of(&facts, "plain").text_runs;
+        assert_eq!(plain_lines.len(), 1);
+        assert!(plain_lines[0].ends_with("lll"), "{plain_lines:?}");
+        assert!(!plain_lines[0].contains('\u{2026}'));
+    }
+
+    #[test]
+    fn negative_margins_reach_layout() {
+        let mut view = VelquView::new();
+        view.enable_tailwind();
+        view.load_html(
+            "<!doctype html><html><body style=\"margin: 0\">\
+             <div data-vv-test=first class=\"h-8 bg-rose-600\"></div>\
+             <div data-vv-test=negative class=\"-mt-2 h-8 bg-blue-600\"></div>\
+             <div data-vv-test=positive class=\"mt-2 h-8 bg-green-600\"></div>\
+             </body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        let facts = view.layout_facts(vp).unwrap();
+        assert!(
+            view.tailwind_diagnostics().is_empty(),
+            "{:?}",
+            view.tailwind_diagnostics()
+        );
+        let first = fact_of(&facts, "first");
+        let negative = fact_of(&facts, "negative");
+        let positive = fact_of(&facts, "positive");
+        // -mt-2 pulls the block 8px up into its predecessor; mt-2 pushes
+        // the next one 8px down (no margin collapsing in the Taffy pass).
+        assert_eq!(negative.y, first.y + 32.0 - 8.0);
+        assert_eq!(positive.y, negative.y + 32.0 + 8.0);
     }
 
     #[test]

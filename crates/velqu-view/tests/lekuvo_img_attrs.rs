@@ -19,7 +19,10 @@ fn img_void_element_keeps_id_and_fixture() {
     view.render(vp).unwrap();
     let facts = view.layout_facts(vp).unwrap();
     let grip = facts.nodes.iter().find(|f| f.fixture_id == "grip");
-    println!("GRIP FACT: {:?}", grip.as_ref().map(|f| (f.x, f.y, f.width, f.height)));
+    println!(
+        "GRIP FACT: {:?}",
+        grip.as_ref().map(|f| (f.x, f.y, f.width, f.height))
+    );
     // The img sits at (0,0,14,14) in this document (top-aligned): probe
     // its center, not the row's vertical middle.
     let grip = grip.expect("img data-vv-test must produce a layout fact");

@@ -121,6 +121,17 @@ pub(crate) fn paint_document(
             DisplayItem::PopTransform => ctx.pop_transform(),
             DisplayItem::PushOpacity(alpha) => ctx.push_opacity(*alpha),
             DisplayItem::PopOpacity => ctx.pop_opacity(),
+            DisplayItem::OuterShadow {
+                bounds,
+                radius,
+                inner,
+                inner_radius,
+                blur,
+                color,
+            } => {
+                ctx.draw_outer_shadow(*bounds, *radius, *inner, *inner_radius, *blur, *color);
+                ctx.items += 1;
+            }
         }
     }
 
@@ -382,6 +393,50 @@ impl PaintCtx<'_> {
         }
     }
 
+    /// Paints one outer box-shadow layer: ring fills between the shadow's
+    /// expanded bounds and the element's border box, so the shadow never
+    /// shows inside a transparent element (CSS clips outer shadows at the
+    /// border edge). The blur feather is approximated with
+    /// [`SHADOW_FEATHER_STEPS`] stacked rings — each carries an equal slice
+    /// of the shadow alpha, so alpha accumulates toward the element edge
+    /// and fades outward (deterministic integer-ish math, no
+    /// anti-aliasing). A zero blur paints one solid ring. Rings compose
+    /// under the current transform/clip/opacity like any fill.
+    fn draw_outer_shadow(
+        &mut self,
+        bounds: Rect,
+        radius: f32,
+        inner: Rect,
+        inner_radius: f32,
+        blur: f32,
+        color: Color,
+    ) {
+        if color.a == 0 || bounds.w <= 0.0 || bounds.h <= 0.0 {
+            return;
+        }
+        let steps = if blur > 0.0 { SHADOW_FEATHER_STEPS } else { 1 };
+        let slice = ((color.a as f32) / steps as f32).round().max(1.0) as u8;
+        let slice_color = Color::from_rgba8(color.r, color.g, color.b, slice.min(color.a));
+        for step in 0..steps {
+            // Outermost ring first: nearer rings stack over them, so the
+            // alpha accumulates toward the element edge.
+            let expand = blur * (step as f32 + 1.0) / steps as f32;
+            let rect = Rect {
+                x: bounds.x - expand,
+                y: bounds.y - expand,
+                w: bounds.w + 2.0 * expand,
+                h: bounds.h + 2.0 * expand,
+            };
+            self.fill_rounded_ring(
+                &rect,
+                (radius + expand).max(0.0),
+                &inner,
+                &[inner_radius; 4],
+                slice_color,
+            );
+        }
+    }
+
     /// Blits a decoded image into `rect` with nearest-neighbor sampling
     /// (`object-fit: fill`). Edges snap like fills; source indices come from
     /// integer math only, so sampling is deterministic across runs. The
@@ -493,6 +548,11 @@ impl PaintCtx<'_> {
         }
     }
 }
+
+/// How many stacked rings approximate the box-shadow blur feather. More
+/// rings smooth the falloff at linear cost; 8 keeps a `shadow-md` (6px
+/// blur) visibly soft without dominating paint time.
+const SHADOW_FEATHER_STEPS: usize = 8;
 
 /// Borrowed view of one [`DisplayItem::TextRun`] for painting.
 struct TextRunPlacement<'a> {
