@@ -21,10 +21,11 @@ use std::time::Duration;
 
 use cssparser::Parser;
 
-use crate::anim::{Easing, PropKind};
+use crate::anim::{Easing, PropKind, SpringSpec};
 use crate::color::Color;
 use crate::css::{Combinator, Declaration, Rule, Selector, Simple, Specificity, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::gradient::{parse_gradient, Gradient};
 
 /// A resolved CSS length (percentages preserved for layout resolution).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -325,6 +326,18 @@ pub(crate) struct BoxShadow {
     pub color: Color,
 }
 
+impl BoxShadow {
+    /// The no-shadow value: from/to endpoints animate from or to "no
+    /// shadow" (a fully transparent, zero-offset layer).
+    pub(crate) const NONE: BoxShadow = BoxShadow {
+        offset_x: 0.0,
+        offset_y: 0.0,
+        blur: 0.0,
+        spread: 0.0,
+        color: Color::TRANSPARENT,
+    };
+}
+
 /// `text-overflow` (batch 3): `clip` (default) or `ellipsis`, applied to a
 /// single `white-space: nowrap` line that overflows its box. Multi-line
 /// ellipsis is outside the profile.
@@ -420,6 +433,8 @@ pub(crate) struct TransitionProperties {
     pub radius: bool,
     /// `width`/`height` (layout-affecting: each tick is a Taffy pass).
     pub layout: bool,
+    /// `box-shadow` (first layer; paint-only).
+    pub box_shadow: bool,
     /// `transition-all` — covers everything animatable.
     pub all: bool,
 }
@@ -433,6 +448,7 @@ impl TransitionProperties {
                 PropKind::Opacity => self.opacity,
                 PropKind::Transform => self.transform,
                 PropKind::BorderRadius => self.radius,
+                PropKind::BoxShadow => self.box_shadow,
                 PropKind::BackgroundColor | PropKind::BorderColor | PropKind::Color => self.colors,
             }
     }
@@ -446,12 +462,16 @@ impl TransitionProperties {
 pub(crate) struct TransitionSpec {
     /// The property groups this transition animates.
     pub properties: TransitionProperties,
-    /// Active-phase length.
+    /// Active-phase length (unused by a spring driver — its duration is
+    /// emergent).
     pub duration: Duration,
     /// Time to hold the from-value before the active phase.
     pub delay: Duration,
-    /// The progress curve.
+    /// The progress curve (used when `spring` is `None`).
     pub easing: Easing,
+    /// ADR 0027: physical spring parameters. When set, the spawn path
+    /// starts a spring driver instead of the timed easing curve.
+    pub spring: Option<SpringSpec>,
 }
 
 /// Preset looping animations (ADR 0024: Tailwind's `animate-*` utilities).
@@ -483,6 +503,10 @@ pub(crate) struct ComputedStyle {
     pub border_radius: f32,
     pub color: Color,
     pub background_color: Color,
+    /// `background-image`: a single `linear-gradient`/`radial-gradient`
+    /// layer (multi-layer images are out of profile). Not inherited;
+    /// paints over `background_color` inside the padding box.
+    pub background_image: Option<Gradient>,
     pub font_size: f32,
     pub font_weight: u16,
     /// `font-family` first family, normalized (lowercased, unquoted).
@@ -536,6 +560,9 @@ pub(crate) struct ComputedStyle {
     pub transition_delay: Duration,
     /// ADR 0024: transition-timing-function.
     pub transition_easing: Easing,
+    /// ADR 0027: `transition-timing-function: spring(...)` — physical
+    /// spring parameters replacing the easing curve. `None` = curve.
+    pub transition_spring: Option<SpringSpec>,
     /// ADR 0024: preset looping animation (not inherited).
     pub animation: AnimationKind,
     /// Batch 3: outer `box-shadow` layers, in declaration order (paint-only,
@@ -568,6 +595,7 @@ impl ComputedStyle {
             border_radius: 0.0,
             color: Color::BLACK,
             background_color: Color::TRANSPARENT,
+            background_image: None,
             font_size: 16.0,
             font_weight: 400,
             font_family: None,
@@ -602,6 +630,7 @@ impl ComputedStyle {
             transition_duration: Duration::ZERO,
             transition_delay: Duration::ZERO,
             transition_easing: Easing::DEFAULT,
+            transition_spring: None,
             animation: AnimationKind::None,
             box_shadows: Vec::new(),
             text_overflow: TextOverflow::Clip,
@@ -610,12 +639,13 @@ impl ComputedStyle {
     }
 
     /// The active transition for this style, or `None` when nothing
-    /// animates (empty property set or zero duration — the change lands
-    /// instantly, per CSS).
+    /// animates (empty property set; a timed transition also needs a
+    /// non-zero duration — a spring's duration is emergent, ADR 0027).
     pub(crate) fn transition(&self) -> Option<TransitionSpec> {
-        if self.transition_duration.is_zero()
-            || self.transition_properties == TransitionProperties::default()
-        {
+        if self.transition_properties == TransitionProperties::default() {
+            return None;
+        }
+        if self.transition_duration.is_zero() && self.transition_spring.is_none() {
             return None;
         }
         Some(TransitionSpec {
@@ -623,6 +653,7 @@ impl ComputedStyle {
             duration: self.transition_duration,
             delay: self.transition_delay,
             easing: self.transition_easing,
+            spring: self.transition_spring,
         })
     }
 }
@@ -861,6 +892,7 @@ impl ComputedStyle {
         // behavior for the none/auto pair the profile supports).
         self.user_select_none = parent.user_select_none;
         self.background_color = Color::TRANSPARENT; // backgrounds do not inherit
+        self.background_image = None; // backgrounds do not inherit
     }
 }
 
@@ -1276,10 +1308,36 @@ fn apply_declaration(
             "auto" | "text" => style.user_select_none = false,
             _ => diagnostics.push(unsupported("user-select value")),
         },
-        "background-color" | "background" => match parse_color(&declaration.value) {
+        "background-color" => match parse_color(&declaration.value) {
             Some(c) => style.background_color = c,
             None => diagnostics.push(unsupported("color")),
         },
+        // `background` shorthand: a color, a gradient layer, or `none`
+        // (v1 profile — the full multi-layer shorthand is out of scope).
+        "background" => {
+            let value = declaration.value.trim();
+            if value == "none" {
+                style.background_color = Color::TRANSPARENT;
+                style.background_image = None;
+            } else if let Some(gradient) = parse_gradient(value) {
+                style.background_image = Some(gradient);
+            } else if let Some(c) = parse_color(value) {
+                style.background_color = c;
+                style.background_image = None;
+            } else {
+                diagnostics.push(unsupported("background value"));
+            }
+        }
+        "background-image" => {
+            let value = declaration.value.trim();
+            if value == "none" {
+                style.background_image = None;
+            } else if let Some(gradient) = parse_gradient(value) {
+                style.background_image = Some(gradient);
+            } else {
+                diagnostics.push(unsupported("background-image value"));
+            }
+        }
         "font-size" => match parse_length(&declaration.value) {
             Some(Length::Px(v)) => style.font_size = v,
             Some(Length::Rem(v)) => style.font_size = v,
@@ -1546,11 +1604,12 @@ fn apply_declaration(
             ))),
         },
         "transition" => match parse_transition_shorthand(&declaration.value) {
-            Ok((properties, duration, delay, easing)) => {
+            Ok((properties, duration, delay, easing, spring)) => {
                 style.transition_properties = properties;
                 style.transition_duration = duration;
                 style.transition_delay = delay;
                 style.transition_easing = easing;
+                style.transition_spring = spring;
             }
             Err(message) => diagnostics.push(skip(format!(
                 "unsupported transition value {:?}: {}",
@@ -1572,9 +1631,19 @@ fn apply_declaration(
             Some(delay) => style.transition_delay = delay,
             None => diagnostics.push(unsupported("transition-delay value")),
         },
-        "transition-timing-function" => match parse_easing(&declaration.value) {
-            Some(easing) => style.transition_easing = easing,
-            None => diagnostics.push(unsupported("transition-timing-function value")),
+        // The timing-function slot holds either an easing curve or a
+        // physical spring (ADR 0027) — the last declaration wins, so each
+        // form clears the other.
+        "transition-timing-function" => {
+            if let Some(spec) = parse_spring(&declaration.value) {
+                style.transition_spring = Some(spec);
+                style.transition_easing = Easing::DEFAULT;
+            } else if let Some(easing) = parse_easing(&declaration.value) {
+                style.transition_easing = easing;
+                style.transition_spring = None;
+            } else {
+                diagnostics.push(unsupported("transition-timing-function value"));
+            }
         },
         "animation" => match declaration.value.trim() {
             val if val.starts_with("spin") => style.animation = AnimationKind::Spin,
@@ -1855,6 +1924,7 @@ fn parse_easing(value: &str) -> Option<Easing> {
         "ease" | "ease-in-out" => Some(Easing::EASE_IN_OUT),
         "ease-in" => Some(Easing::EASE_IN),
         "ease-out" => Some(Easing::EASE_OUT),
+        // (The spring() function is parsed by [`parse_spring`], ADR 0027.)
         bezier if bezier.starts_with("cubic-bezier(") && bezier.ends_with(')') => {
             let inner = &bezier["cubic-bezier(".len()..bezier.len() - 1];
             let mut parts = inner.split(',');
@@ -1895,6 +1965,7 @@ fn parse_transition_properties(value: &str) -> Result<TransitionProperties, Stri
             "transform" => properties.transform = true,
             "border-radius" => properties.radius = true,
             "width" | "height" => properties.layout = true,
+            "box-shadow" => properties.box_shadow = true,
             other => unknown.push(other.to_owned()),
         }
     }
@@ -1903,7 +1974,7 @@ fn parse_transition_properties(value: &str) -> Result<TransitionProperties, Stri
     } else {
         Err(format!(
             "unknown transition properties {} (animatable: colors, opacity, transform, \
-             border-radius, width, height, all)",
+             border-radius, width, height, box-shadow, all)",
             unknown.join(", ")
         ))
     }
@@ -1912,14 +1983,25 @@ fn parse_transition_properties(value: &str) -> Result<TransitionProperties, Stri
 /// Parses the `transition` shorthand: `none`, or a space-separated mix
 /// where the property list appears at most once, the first time is the
 /// duration, an optional second time is the delay, and an optional curve
-/// keyword is the easing (CSS ordering rules).
+/// keyword/function is the easing (a curve or a `spring(...)` spec, CSS
+/// ordering rules).
 fn parse_transition_shorthand(
     value: &str,
-) -> Result<(TransitionProperties, Duration, Duration, Easing), String> {
+) -> Result<
+    (
+        TransitionProperties,
+        Duration,
+        Duration,
+        Easing,
+        Option<SpringSpec>,
+    ),
+    String,
+> {
     let mut properties: Option<TransitionProperties> = None;
     let mut duration: Option<Duration> = None;
     let mut delay: Option<Duration> = None;
     let mut easing: Option<Easing> = None;
+    let mut spring: Option<SpringSpec> = None;
     for token in top_level_tokens(value) {
         let token = token.trim();
         if token == "none" {
@@ -1947,6 +2029,10 @@ fn parse_transition_shorthand(
             easing = Some(curve);
             continue;
         }
+        if let Some(spec) = parse_spring(token) {
+            spring = Some(spec);
+            continue;
+        }
         // Anything else must be a property list.
         if properties.is_some() {
             return Err(format!("unexpected token {token:?}"));
@@ -1958,7 +2044,35 @@ fn parse_transition_shorthand(
         duration.unwrap_or(Duration::ZERO),
         delay.unwrap_or(Duration::ZERO),
         easing.unwrap_or(Easing::DEFAULT),
+        spring,
     ))
+}
+
+/// Parses `spring(stiffness, damping[, mass])` (ADR 0027): comma- or
+/// space-separated numbers. Zero stiffness is valid (the spawn path
+/// applies the target instantly); normalization clamps the rest.
+fn parse_spring(value: &str) -> Option<SpringSpec> {
+    let value = value.trim();
+    let inner = value
+        .strip_prefix("spring(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let mut parts = inner
+        .split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter(|part| !part.is_empty());
+    let stiffness = parts.next()?.trim().parse::<f32>().ok()?;
+    let damping = parts.next()?.trim().parse::<f32>().ok()?;
+    let mass = match parts.next() {
+        Some(mass) => mass.trim().parse::<f32>().ok()?,
+        None => 1.0,
+    };
+    if parts.next().is_some()
+        || [stiffness, damping, mass]
+            .iter()
+            .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    Some(SpringSpec::normalized(stiffness, damping, mass))
 }
 
 /// Parses a `transform` value: `none` or a space-separated sequence of 2D
@@ -2227,11 +2341,12 @@ pub(crate) fn parse_length(value: &str) -> Option<Length> {
     }
 }
 
-/// Named colors + `#rgb`/`#rrggbb`/`#rrggbbaa` + `rgb()`/`rgba()` (sRGB
-/// only). The function form accepts the legacy comma shape — `rgb(15, 23,
-/// 42)`, `rgba(15, 23, 42, 0.35)`, and `rgb(15, 23, 42, 0.35)` — and the
-/// CSS Color 4 space shape Tailwind v3 emits — `rgb(0 0 0 / 0.1)`. Alpha
-/// is a 0–1 number; percentage channels are outside the profile.
+/// Named colors + `#rgb`/`#rrggbb`/`#rrggbbaa` + `rgb()`/`rgba()` +
+/// `hsl()`/`hsla()` (sRGB only). The function forms accept the legacy
+/// comma shape — `rgb(15, 23, 42)`, `hsla(210, 64%, 11%, 0.35)` — and
+/// the CSS Color 4 space shape — `rgb(0 0 0 / 0.1)`,
+/// `hsl(160 85% 62%)`. Alpha is a 0–1 number; percentage channels are
+/// outside the profile.
 pub(crate) fn parse_color(value: &str) -> Option<Color> {
     let value = value.trim();
     if let Ok(color) = Color::from_hex(value) {
@@ -2252,6 +2367,16 @@ pub(crate) fn parse_color(value: &str) -> Option<Color> {
             .and_then(|rest| rest.strip_suffix(')'))
         {
             if let Some(color) = parse_rgb_channels(inner) {
+                return Some(color);
+            }
+        }
+    }
+    for prefix in ["hsl(", "hsla("] {
+        if let Some(inner) = value
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            if let Some(color) = parse_hsl_channels(inner) {
                 return Some(color);
             }
         }
@@ -2303,6 +2428,11 @@ fn channel_color(r: &str, g: &str, b: &str, a: Option<&str>) -> Option<Color> {
         (value.is_finite() && (0.0..=255.0).contains(&value)).then(|| value.round() as u8)
     };
     let color = Color::from_rgb8(channel(r)?, channel(g)?, channel(b)?);
+    with_alpha(a, color)
+}
+
+/// Applies an optional alpha string (0–1) to a color.
+fn with_alpha(a: Option<&str>, color: Color) -> Option<Color> {
     match a {
         None => Some(color),
         Some(a) => {
@@ -2312,6 +2442,79 @@ fn channel_color(r: &str, g: &str, b: &str, a: Option<&str>) -> Option<Color> {
             })
         }
     }
+}
+
+/// Parses the inside of an `hsl()`/`hsla()` function: a hue in degrees
+/// (optional `deg`), saturation and lightness as percentages (or 0–1
+/// numbers, Color 4), comma- or space-separated, with the same optional
+/// alpha shapes as `rgb()`. Conversion is the standard CSS Color 4
+/// algorithm — pure arithmetic, so results are bit-stable.
+fn parse_hsl_channels(inner: &str) -> Option<Color> {
+    // Legacy comma form: `h, s%, l%` or `h, s%, l%, a`.
+    let (main, alpha) = if inner.contains(',') {
+        let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+        let [h, s, l, rest @ ..] = parts.as_slice() else {
+            return None;
+        };
+        let alpha = match rest {
+            [] => None,
+            [a] => Some(*a),
+            _ => return None,
+        };
+        (format!("{h} {s} {l}"), alpha)
+    } else {
+        // Space form, optionally with `/ alpha`.
+        match inner.split_once('/') {
+            Some((main, rest)) => (main.trim().to_owned(), Some(rest.trim())),
+            None => (inner.trim().to_owned(), None),
+        }
+    };
+    let channels: Vec<&str> = main.split_ascii_whitespace().collect();
+    let [h, s, l] = channels.as_slice() else {
+        return None;
+    };
+    let hue = h
+        .trim()
+        .strip_suffix("deg")
+        .unwrap_or(h.trim())
+        .parse::<f32>()
+        .ok()?;
+    let component = |text: &str| -> Option<f32> {
+        if let Some(percent) = text.trim().strip_suffix('%') {
+            return percent.trim().parse::<f32>().ok().map(|v| v / 100.0);
+        }
+        text.trim().parse::<f32>().ok()
+    };
+    let saturation = component(s)?;
+    let lightness = component(l)?;
+    if !hue.is_finite() || !saturation.is_finite() || !lightness.is_finite() {
+        return None;
+    }
+    let (r, g, b) = hsl_to_rgb(hue, saturation.clamp(0.0, 1.0), lightness.clamp(0.0, 1.0));
+    let color = Color::from_rgb8(
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    );
+    with_alpha(alpha, color)
+}
+
+/// CSS Color 4 HSL → RGB, hue in degrees (any magnitude, wraps), s/l in
+/// [0, 1]. Pure f32 arithmetic (determinism rule).
+fn hsl_to_rgb(hue: f32, saturation: f32, lightness: f32) -> (f32, f32, f32) {
+    let hue = hue.rem_euclid(360.0) / 360.0;
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    let x = chroma * (1.0 - ((hue * 6.0) % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match (hue * 6.0) as u32 {
+        0 => (chroma, x, 0.0),
+        1 => (x, chroma, 0.0),
+        2 => (0.0, chroma, x),
+        3 => (0.0, x, chroma),
+        4 => (x, 0.0, chroma),
+        _ => (chroma, 0.0, x),
+    };
+    let m = lightness - chroma / 2.0;
+    (r1 + m, g1 + m, b1 + m)
 }
 
 /// Parses a `box-shadow` value into outer layers (batch 3): comma-separated

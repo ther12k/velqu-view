@@ -4,11 +4,10 @@
 //! Determinism rule: the engine runs on a **virtual clock** — a `Duration`
 //! the host advances explicitly ([`AnimationEngine::tick_by`]). It never
 //! reads `Instant`, so identical host schedules produce bit-identical
-//! interpolated values and frames across runs and platforms. (Spring
-//! easing additionally uses libm `exp`/`cos`, whose last-ulp results vary
-//! by architecture — no v0 utility or profile property maps to it, so
-//! fixtures never depend on it. Named and `cubic-bezier` easings use only
-//! IEEE-exact add/multiply.)
+//! interpolated values and frames across runs and platforms. Named and
+//! `cubic-bezier` easings use only IEEE-exact add/multiply; the physical
+//! spring driver (ADR 0027) integrates with the same restricted arithmetic
+//! — no transcendentals — so spring frames are fixture-safe too.
 //!
 //! Invalidation is dual-tier, like the renderer's own paths (ADR 0011/
 //! 0018): `Width`/`Height` animations dirty structure (a Taffy pass per
@@ -19,7 +18,7 @@ use std::collections::HashMap;
 
 use crate::color::Color;
 use crate::dom::NodeId;
-use crate::style::Transform2D;
+use crate::style::{BoxShadow, Transform2D};
 
 /// One easing curve over normalized progress `t ∈ [0, 1]`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,17 +38,9 @@ pub(crate) enum Easing {
         /// Second control point y.
         y2: f32,
     },
-    /// A damped harmonic oscillator. Reserved for a future host animation
-    /// primitive: no v0 utility or profile property constructs it (its
-    /// libm transcendentals vary by architecture, so fixtures must never
-    /// depend on it — ADR 0024). Note: uses libm transcendentals.
-    #[allow(dead_code)]
-    Spring {
-        /// Angular frequency squared; higher is stiffer.
-        stiffness: f32,
-        /// Velocity loss; `ζ = damping / (2√stiffness)`.
-        damping: f32,
-    },
+    // (The ADR 0024 reserved `Spring` curve variant never shipped: the
+    // author-facing spring is the physical driver
+    // [`TransitionDriver::Spring`], ADR 0027.)
 }
 
 impl Easing {
@@ -83,7 +74,6 @@ impl Easing {
         match *self {
             Easing::Linear => t,
             Easing::CubicBezier { x1, y1, x2, y2 } => sample_cubic_bezier(x1, y1, x2, y2, t),
-            Easing::Spring { stiffness, damping } => sample_spring(stiffness, damping, t),
         }
     }
 }
@@ -147,28 +137,73 @@ fn sample_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
     bez_component(u, y1, y2)
 }
 
-/// Spring response normalized to start 0 and settle at 1: the duration is
-/// mapped onto two natural periods of the oscillator. Underdamped springs
-/// overshoot (the returned value may leave `[0, 1]`); callers clamp the
-/// properties where overshoot is meaningless (opacity, sizes).
-fn sample_spring(stiffness: f32, damping: f32, t: f32) -> f32 {
-    let omega = stiffness.max(0.0).sqrt();
-    if omega == 0.0 {
-        return t;
+/// Physical spring parameters (ADR 0027): the damped harmonic oscillator
+/// `a = (−k·(x − target) − c·v) / m` — framer-motion's model. Stiffness
+/// `k` and damping `c` carry per-second² units; `m` scales inertia.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SpringSpec {
+    /// Angular stiffness: higher springs snap harder.
+    pub(crate) stiffness: f32,
+    /// Velocity loss per second; 0 normalizes to critical damping.
+    pub(crate) damping: f32,
+    /// Inertia; ≤ 0 falls back to 1.
+    pub(crate) mass: f32,
+}
+
+impl SpringSpec {
+    /// Normalizes authored values: non-positive stiffness animates
+    /// nothing (the spawn path applies the target directly), non-positive
+    /// mass falls back to 1, and non-positive damping takes the critical
+    /// value `2√(k·m)` so the integrator can never oscillate forever.
+    pub(crate) fn normalized(stiffness: f32, damping: f32, mass: f32) -> Self {
+        let mass = if mass > 0.0 { mass } else { 1.0 };
+        let damping = if damping > 0.0 {
+            damping
+        } else {
+            2.0 * stiffness.max(0.0).sqrt() * mass
+        };
+        Self {
+            stiffness,
+            damping,
+            mass,
+        }
     }
-    let time = t * (std::f32::consts::TAU / omega);
-    let zeta = damping / (2.0 * omega);
-    if zeta >= 1.0 {
-        // Critically damped shape (over-damped inputs clamp here): the
-        // aperiodic limit of the oscillator.
-        1.0 - (1.0 + omega * time) * (-omega * time).exp()
-    } else {
-        let omega_d = omega * (1.0 - zeta * zeta).sqrt();
-        let decay = (-zeta * omega * time).exp();
-        1.0 - decay * (omega_d * time).cos()
-            - decay * (zeta * omega / omega_d) * (omega_d * time).sin()
+
+    /// True when the spec animates nothing (the target applies directly).
+    pub(crate) fn is_instant(&self) -> bool {
+        self.stiffness <= 0.0
     }
 }
+
+/// What produces one active animation's progress. Keyframes sample an
+/// easing curve; springs integrate state per tick (ADR 0027).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum TransitionDriver {
+    /// Eased progress over `duration` (the CSS/Tailwind model).
+    Timed,
+    /// Semi-implicit Euler integration of the normalized oscillator:
+    /// `progress` is 0 at `from`, 1 at `to`, overshooting both for
+    /// underdamped springs; `velocity` is its derivative in progress
+    /// units per second.
+    Spring {
+        spec: SpringSpec,
+        progress: f32,
+        velocity: f32,
+    },
+}
+
+/// Spring integration substep (s): fixed slices of each tick keep
+/// explicit Euler stable for any plausible stiffness (ω·h ≪ 2) and make
+/// identical schedules bit-identical regardless of tick length.
+const SPRING_SUBSTEP_SECS: f32 = 1.0 / 240.0;
+
+/// Progress/velocity below which a spring counts as settled.
+const SPRING_SETTLE_EPSILON: f32 = 1e-3;
+
+/// Wall-clock cap on a spring's active phase: pathological parameters
+/// (tiny stiffness, near-zero damping) can never hold the frame pump
+/// hostage; the cap force-settles at the target.
+const SPRING_SETTLE_CAP_SECS: f32 = 10.0;
 
 /// Which property an animation drives; the retarget and completion keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -181,6 +216,9 @@ pub(crate) enum PropKind {
     BorderColor,
     Color,
     Transform,
+    /// The first `box-shadow` layer (multi-layer transitions are out of
+    /// profile); paint-only.
+    BoxShadow,
 }
 
 /// One animated property with its from/to endpoints (all values logical
@@ -222,6 +260,12 @@ pub(crate) enum AnimProperty {
         from: Transform2D,
         to: Transform2D,
     },
+    /// The first `box-shadow` layer, all length fields + color lerped
+    /// (paint-only; the shadow list beyond layer one stays static).
+    BoxShadow {
+        from: BoxShadow,
+        to: BoxShadow,
+    },
     /// An oscillating opacity loop between max and min (ADR 0024, `animate-pulse`).
     PulseOpacity {
         min: f32,
@@ -246,6 +290,7 @@ impl AnimProperty {
             AnimProperty::Transform { .. } | AnimProperty::BounceTranslateY { .. } => {
                 PropKind::Transform
             }
+            AnimProperty::BoxShadow { .. } => PropKind::BoxShadow,
         }
     }
 
@@ -273,6 +318,7 @@ impl AnimProperty {
             | AnimProperty::BorderColor { to, .. }
             | AnimProperty::Color { to, .. } => AnimValue::Col(to),
             AnimProperty::Transform { to, .. } => AnimValue::Xf(to),
+            AnimProperty::BoxShadow { to, .. } => AnimValue::Shadow(to),
         }
     }
 
@@ -310,6 +356,15 @@ impl AnimProperty {
                     translate_y: lerp(from.translate_y, to.translate_y, t),
                 });
             }
+            AnimProperty::BoxShadow { from, to } => {
+                overrides.box_shadow = Some(BoxShadow {
+                    offset_x: lerp(from.offset_x, to.offset_x, t),
+                    offset_y: lerp(from.offset_y, to.offset_y, t),
+                    blur: lerp(from.blur, to.blur, t).max(0.0),
+                    spread: lerp(from.spread, to.spread, t),
+                    color: lerp_color(from.color, to.color, t),
+                });
+            }
             AnimProperty::PulseOpacity { min, max } => {
                 let ping_pong = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
                 let opacity = lerp(max, min, ping_pong).clamp(0.0, 1.0);
@@ -326,6 +381,27 @@ impl AnimProperty {
                     translate_y: dy,
                 });
             }
+        }
+    }
+
+    /// The `from → to` span in value units for scalar properties — the
+    /// scale between normalized spring progress and physical units.
+    /// `None` for per-channel properties (colors, transforms): their
+    /// spring retargets restart at rest, since per-channel velocity
+    /// transfer to a scalar oscillator is ambiguous.
+    fn scalar_span(&self) -> Option<f32> {
+        match *self {
+            AnimProperty::Width { from, to }
+            | AnimProperty::Height { from, to }
+            | AnimProperty::Opacity { from, to }
+            | AnimProperty::BorderRadius { from, to } => Some(to - from),
+            AnimProperty::BackgroundColor { .. }
+            | AnimProperty::BorderColor { .. }
+            | AnimProperty::Color { .. }
+            | AnimProperty::Transform { .. }
+            | AnimProperty::BoxShadow { .. }
+            | AnimProperty::PulseOpacity { .. }
+            | AnimProperty::BounceTranslateY { .. } => None,
         }
     }
 
@@ -370,6 +446,10 @@ impl AnimProperty {
                 from: current.transform.unwrap_or(from),
                 to,
             },
+            AnimProperty::BoxShadow { from, to } => AnimProperty::BoxShadow {
+                from: current.box_shadow.unwrap_or(from),
+                to,
+            },
             AnimProperty::PulseOpacity { min, max } => AnimProperty::PulseOpacity { min, max },
             AnimProperty::BounceTranslateY { distance } => {
                 AnimProperty::BounceTranslateY { distance }
@@ -409,6 +489,7 @@ pub(crate) struct PropertyOverrides {
     pub(crate) border_color: Option<Color>,
     pub(crate) color: Option<Color>,
     pub(crate) transform: Option<Transform2D>,
+    pub(crate) box_shadow: Option<BoxShadow>,
 }
 
 impl PropertyOverrides {
@@ -424,6 +505,7 @@ impl PropertyOverrides {
             PropKind::BorderColor => self.border_color.map(AnimValue::Col),
             PropKind::Color => self.color.map(AnimValue::Col),
             PropKind::Transform => self.transform.map(AnimValue::Xf),
+            PropKind::BoxShadow => self.box_shadow.map(AnimValue::Shadow),
         }
     }
 }
@@ -437,6 +519,7 @@ pub(crate) enum AnimValue {
     Num(f32),
     Col(Color),
     Xf(Transform2D),
+    Shadow(BoxShadow),
 }
 
 /// How many times an animation runs (ADR 0024: transitions run once;
@@ -459,12 +542,59 @@ pub(crate) struct ActiveAnimation {
     duration: Duration64,
     easing: Easing,
     repeat: AnimationRepeat,
+    /// How progress is produced. Springs ignore `duration`/`easing`.
+    driver: TransitionDriver,
 }
 
 /// `std::time::Duration` alias keeping the struct signatures short.
 type Duration64 = std::time::Duration;
 
 impl ActiveAnimation {
+    /// Integrates the spring driver one tick: fixed substeps of the
+    /// caller's virtual-clock delta (stable explicit Euler, ADR 0027).
+    /// Returns `true` when the spring has settled (or hit the settle cap)
+    /// and the animation is done.
+    fn step_spring(&mut self, now: Duration64, dt_secs: f32) -> bool {
+        let TransitionDriver::Spring {
+            spec,
+            progress,
+            velocity,
+        } = &mut self.driver
+        else {
+            return false;
+        };
+        let elapsed = now.saturating_sub(self.started_at);
+        let Some(active) = elapsed.checked_sub(self.delay) else {
+            return false; // still inside the delay: hold the from-value
+        };
+        if active.as_secs_f32() >= SPRING_SETTLE_CAP_SECS {
+            *progress = 1.0;
+            *velocity = 0.0;
+            return true;
+        }
+        if dt_secs <= 0.0 {
+            return false;
+        }
+        let mut remaining = dt_secs;
+        while remaining > 0.0 {
+            let h = remaining.min(SPRING_SUBSTEP_SECS);
+            let acceleration =
+                (-spec.stiffness * (*progress - 1.0) - spec.damping * *velocity) / spec.mass;
+            // Semi-implicit Euler: velocity first, then position with the
+            // fresh velocity.
+            *velocity += acceleration * h;
+            *progress += *velocity * h;
+            remaining -= h;
+        }
+        if !progress.is_finite() || !velocity.is_finite() {
+            *progress = 1.0;
+            *velocity = 0.0;
+            return true;
+        }
+        (*progress - 1.0).abs() < SPRING_SETTLE_EPSILON
+            && velocity.abs() < SPRING_SETTLE_EPSILON
+    }
+
     /// Raw (uneased) progress at virtual time `now`: 0 during the delay,
     /// then linear over the duration, clamped to 1 (or cycling in [0, 1) for infinite loops).
     fn raw_progress(&self, now: Duration64) -> f32 {
@@ -528,6 +658,16 @@ impl AnimationEngine {
     /// Whether any animation is pending or running.
     pub(crate) fn has_active(&self) -> bool {
         !self.active.is_empty()
+    }
+
+    /// Whether any **layout-affecting** animation (width/height) is in
+    /// flight — the host's fast-frame signal: such animations change the
+    /// silhouette every tick and need the shortest frame cadence, while
+    /// paint-only loops (pulses, fades) tolerate the ambient 30fps.
+    pub(crate) fn has_layout_animation(&self) -> bool {
+        self.active
+            .iter()
+            .any(|anim| anim.property.affects_layout())
     }
 
     /// Whether the node has any animation in flight.
@@ -609,6 +749,7 @@ impl AnimationEngine {
                 duration,
                 easing,
                 repeat,
+                driver: TransitionDriver::Timed,
             });
             return;
         }
@@ -621,6 +762,80 @@ impl AnimationEngine {
             duration,
             easing,
             repeat,
+            driver: TransitionDriver::Timed,
+        });
+    }
+
+    /// Starts (or retargets) a physical spring animation (ADR 0027). An
+    /// existing spring on the same node+property hands over its momentum:
+    /// the retargeted animation restarts from the current on-screen value
+    /// with the physical velocity preserved (scalars only — per-channel
+    /// properties restart at rest). A zero-stiffness spec animates
+    /// nothing; the spawn path applies the target directly instead.
+    pub(crate) fn start_spring(
+        &mut self,
+        node: NodeId,
+        property: AnimProperty,
+        delay: Duration64,
+        spec: SpringSpec,
+    ) {
+        if spec.is_instant() {
+            return;
+        }
+        let kind = property.kind();
+        if let Some(index) = self
+            .active
+            .iter()
+            .position(|anim| anim.node == node && anim.property.kind() == kind)
+        {
+            let existing = self.active.remove(index);
+            let current = self.overrides.get(&node).copied().unwrap_or_default();
+            let retargeted = property.retargeted_from(current);
+            self.seed_override(node, &retargeted);
+            // Momentum handover: convert the old normalized velocity into
+            // physical value-units, then back into the new span's units.
+            let velocity = match (
+                existing.driver,
+                existing.property.scalar_span(),
+                retargeted.scalar_span(),
+            ) {
+                (
+                    TransitionDriver::Spring { velocity, .. },
+                    Some(span_old),
+                    Some(span_new),
+                ) if span_new.abs() > f32::EPSILON => span_old * velocity / span_new,
+                _ => 0.0,
+            };
+            self.active.push(ActiveAnimation {
+                node,
+                property: retargeted,
+                started_at: self.clock,
+                delay,
+                duration: Duration64::ZERO,
+                easing: Easing::DEFAULT,
+                repeat: AnimationRepeat::Once,
+                driver: TransitionDriver::Spring {
+                    spec,
+                    progress: 0.0,
+                    velocity,
+                },
+            });
+            return;
+        }
+        self.seed_override(node, &property);
+        self.active.push(ActiveAnimation {
+            node,
+            property,
+            started_at: self.clock,
+            delay,
+            duration: Duration64::ZERO,
+            easing: Easing::DEFAULT,
+            repeat: AnimationRepeat::Once,
+            driver: TransitionDriver::Spring {
+                spec,
+                progress: 0.0,
+                velocity: 0.0,
+            },
         });
     }
 
@@ -652,18 +867,24 @@ impl AnimationEngine {
     }
 
     /// Advances the virtual clock by `dt` and re-derives every override.
-    /// Finished animations pin their final (`t = 1`) samples into the
-    /// override map — equal to the cascade's targets — so a later style
-    /// recompute sees no delta and never respawns a settled transition.
+    /// Timed animations sample their easing at the clock; springs
+    /// integrate their state by `dt` (ADR 0027). Finished animations pin
+    /// their final (`t = 1`) samples into the override map — equal to the
+    /// cascade's targets — so a later style recompute sees no delta and
+    /// never respawns a settled transition.
     pub(crate) fn tick_by(&mut self, dt: Duration64) -> TickOutcome {
         if self.active.is_empty() {
             return TickOutcome::default();
         }
         self.clock += dt;
+        let dt_secs = dt.as_secs_f32();
         let mut finished = Vec::new();
         let mut completed: Vec<(NodeId, AnimProperty)> = Vec::new();
-        self.active.retain(|animation| {
-            let done = animation.is_finished(self.clock);
+        self.active.retain_mut(|animation| {
+            let done = match &mut animation.driver {
+                TransitionDriver::Timed => animation.is_finished(self.clock),
+                TransitionDriver::Spring { .. } => animation.step_spring(self.clock, dt_secs),
+            };
             if done {
                 finished.push((animation.node, animation.property.kind()));
                 completed.push((animation.node, animation.property));
@@ -674,7 +895,12 @@ impl AnimationEngine {
         let mut layout_dirty = false;
         let mut paint_dirty = false;
         for animation in &self.active {
-            let eased = animation.easing.sample(animation.raw_progress(self.clock));
+            let eased = match &animation.driver {
+                TransitionDriver::Timed => {
+                    animation.easing.sample(animation.raw_progress(self.clock))
+                }
+                TransitionDriver::Spring { progress, .. } => *progress,
+            };
             let entry = self.overrides.entry(animation.node).or_default();
             animation.property.write_override(eased, entry);
             if animation.property.affects_layout() {
@@ -786,19 +1012,176 @@ mod tests {
         }
     }
 
+    const FRAME: Duration64 = Duration64::from_millis(16);
+
     #[test]
-    fn spring_settles_at_one_without_undershooting_below_zero_at_rest() {
-        let spring = Easing::Spring {
-            stiffness: 100.0,
-            damping: 10.0,
-        };
-        assert_eq!(spring.sample(0.0), 0.0);
-        // Near the end the response is close to 1 (settled).
-        let tail = spring.sample(0.99);
-        assert!(
-            (tail - 1.0).abs() < 0.2,
-            "spring settles near 1, got {tail}"
+    fn spring_settles_and_pins_target() {
+        let mut engine = AnimationEngine::new();
+        engine.start_spring(
+            1,
+            AnimProperty::BorderRadius {
+                from: 0.0,
+                to: 24.0,
+            },
+            Duration64::ZERO,
+            SpringSpec::normalized(170.0, 26.0, 1.0),
         );
+        assert_eq!(engine.overrides().get(&1).unwrap().border_radius, Some(0.0));
+        for _ in 0..600 {
+            let tick = engine.tick_by(FRAME);
+            if !tick.more {
+                break;
+            }
+            // Never NaN, never below zero (the property clamps at 0).
+            let value = engine.overrides().get(&1).unwrap().border_radius.unwrap();
+            assert!(value.is_finite() && value >= 0.0);
+        }
+        assert!(!engine.has_active(), "spring must settle");
+        let pinned = engine.overrides().get(&1).unwrap().border_radius;
+        assert_eq!(pinned, Some(24.0), "completion pins the target");
+    }
+
+    #[test]
+    fn spring_overshoots_with_low_damping() {
+        let mut engine = AnimationEngine::new();
+        engine.start_spring(
+            2,
+            AnimProperty::Width {
+                from: 0.0,
+                to: 100.0,
+            },
+            Duration64::ZERO,
+            SpringSpec::normalized(170.0, 5.0, 1.0),
+        );
+        let mut overshot = false;
+        for _ in 0..600 {
+            let tick = engine.tick_by(FRAME);
+            let value = engine.overrides().get(&2).unwrap().width.unwrap();
+            if value > 100.0 {
+                overshot = true;
+            }
+            if !tick.more {
+                break;
+            }
+        }
+        assert!(overshot, "underdamped spring must overshoot the target");
+    }
+
+    #[test]
+    fn spring_retarget_preserves_momentum() {
+        let mut engine = AnimationEngine::new();
+        engine.start_spring(
+            3,
+            AnimProperty::Width {
+                from: 0.0,
+                to: 100.0,
+            },
+            Duration64::ZERO,
+            SpringSpec::normalized(120.0, 12.0, 1.0),
+        );
+        // Run until the value is clearly moving upward.
+        let mut mid_value = 0.0;
+        for _ in 0..50 {
+            engine.tick_by(FRAME);
+            mid_value = engine.overrides().get(&3).unwrap().width.unwrap();
+            if mid_value > 20.0 {
+                break;
+            }
+        }
+        assert!(mid_value > 20.0, "spring made progress, got {mid_value}");
+        // Retarget downward: the value must not jump and momentum must
+        // briefly carry it further up before the pull of the new target.
+        engine.start_spring(
+            3,
+            AnimProperty::Width {
+                from: 0.0,
+                to: 0.0,
+            },
+            Duration64::ZERO,
+            SpringSpec::normalized(120.0, 12.0, 1.0),
+        );
+        assert_eq!(engine.active.len(), 1, "retarget replaces, not stacks");
+        let after_retarget = engine.overrides().get(&3).unwrap().width.unwrap();
+        assert!(
+            (after_retarget - mid_value).abs() < 1e-3,
+            "retarget must not jump: {after_retarget} vs {mid_value}"
+        );
+        engine.tick_by(FRAME);
+        let next = engine.overrides().get(&3).unwrap().width.unwrap();
+        assert!(
+            next > after_retarget,
+            "momentum carries past the retarget: {next} vs {after_retarget}"
+        );
+        // The reversed spring still settles at the new target.
+        for _ in 0..600 {
+            if !engine.tick_by(FRAME).more {
+                break;
+            }
+        }
+        assert!(!engine.has_active());
+        assert_eq!(engine.overrides().get(&3).unwrap().width, Some(0.0));
+    }
+
+    #[test]
+    fn spring_delay_holds_from_value() {
+        let mut engine = AnimationEngine::new();
+        engine.start_spring(
+            4,
+            AnimProperty::Opacity {
+                from: 0.0,
+                to: 1.0,
+            },
+            Duration64::from_millis(100),
+            SpringSpec::normalized(170.0, 26.0, 1.0),
+        );
+        let tick = engine.tick_by(Duration64::from_millis(50));
+        assert!(tick.more && tick.paint_dirty);
+        assert_eq!(engine.overrides().get(&4).unwrap().opacity, Some(0.0));
+        // Past the delay the spring moves.
+        engine.tick_by(Duration64::from_millis(200));
+        let value = engine.overrides().get(&4).unwrap().opacity.unwrap();
+        assert!(value > 0.0, "spring moves after the delay, got {value}");
+    }
+
+    #[test]
+    fn spring_zero_stiffness_animates_nothing() {
+        let mut engine = AnimationEngine::new();
+        engine.start_spring(
+            5,
+            AnimProperty::Opacity {
+                from: 0.0,
+                to: 1.0,
+            },
+            Duration64::ZERO,
+            SpringSpec::normalized(0.0, 26.0, 1.0),
+        );
+        assert!(!engine.has_active());
+        assert!(engine.overrides().is_empty());
+    }
+
+    #[test]
+    fn spring_identical_schedules_are_bit_identical() {
+        let run = || {
+            let mut engine = AnimationEngine::new();
+            engine.start_spring(
+                9,
+                AnimProperty::Width {
+                    from: 0.0,
+                    to: 64.0,
+                },
+                Duration64::ZERO,
+                SpringSpec::normalized(200.0, 18.0, 1.2),
+            );
+            let mut samples = Vec::new();
+            for _ in 0..120 {
+                engine.tick_by(FRAME);
+                samples.push(engine.overrides().get(&9).unwrap().width.unwrap().to_bits());
+            }
+            samples
+        };
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "identical schedules must be bit-identical");
     }
 
     #[test]

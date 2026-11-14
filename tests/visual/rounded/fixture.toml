@@ -15,7 +15,7 @@ height = 100
 scale = 1.0
 
 [expect]
-pixels_sha256 = "f75db35ad8c9744932c6b006e6a49389d6035b629d2f3439ce52a2467aaa5f20"
+pixels_sha256 = "f5ce66b4e418628cc19043da9ee885b70019d910bfbd0c3267f9033241f39c25"
 
 [[expect.facts]]
 id = "disc"

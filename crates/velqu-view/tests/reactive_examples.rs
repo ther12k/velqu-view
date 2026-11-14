@@ -237,8 +237,9 @@ fn tabs_example_conforms() {
     assert_eq!(state_of(&view, "count"), ReactiveValue::Number(2.0));
 
     // Switch to about: one structural vx-show flip each way. Each
-    // switch costs one render pass; each `visible()` observation runs
-    // layout_facts, which is its own (structural-truth) pass.
+    // switch costs one render pass; the `visible()` observation reads
+    // the cached layout when nothing is dirty (facts are structural
+    // truth, so a clean cache answers without a pass).
     click_element(&mut view, vp, "tab-about");
     assert_eq!(visible(&mut view), ["panel-about"]);
     let passes_before = view.layout_stats().passes;
@@ -246,8 +247,8 @@ fn tabs_example_conforms() {
     assert_eq!(visible(&mut view), ["panel-count"]);
     assert_eq!(
         view.layout_stats().passes,
-        passes_before + 2,
-        "one render + one facts pass for the switch-back"
+        passes_before + 1,
+        "one render for the switch-back; the facts observation is a cache hit"
     );
 
     // State survives being hidden and re-shown.

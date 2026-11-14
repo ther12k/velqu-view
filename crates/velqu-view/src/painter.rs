@@ -7,27 +7,52 @@
 //! running clip stack; every item is bounded by the innermost clip.
 //!
 //! Determinism rules (fixture hashes depend on them):
-//! * rectangles are solid fills snapped to device-pixel edges — no
-//!   anti-aliasing, so coverage math cannot vary;
+//! * shape coverage is per-pixel (ADR 0026): exact span fractions for
+//!   straight edges, a signed-distance classification with a fixed 4×4
+//!   subsample grid for rounded boundaries. All math is pure `f32` on a
+//!   fixed grid, so coverage cannot vary across runs; fractional layout
+//!   coordinates reach the pixels unrounded (only text and images raster
+//!   at whole pixels);
+//! * gradients evaluate per pixel through the same coverage path;
 //! * glyph coverage comes from fontdue's scalar rasterizer at whole-pixel
 //!   sizes (see `font.rs`);
 //! * frame buffers are pixel-bounded upstream and allocated fallibly.
 
 use crate::color::Color;
-use crate::display_list::{Affine2D, DisplayItem, DisplayList, Rect};
+use crate::display_list::{Affine2D, DisplayItem, DisplayList, Rect, ResolvedGradient, ResolvedGradientKind};
 use crate::font::FontStore;
 use crate::viewport::Viewport;
 use crate::{Frame, VelquError};
 
+/// One axis of the deterministic per-pixel subsample grid (ADR 0026):
+/// `SUBGRID²` samples per boundary pixel at `(i + 0.5) / SUBGRID`
+/// offsets. 4×4 keeps corner banding invisible at UI scale while the
+/// SDF fast path keeps interior pixels at one distance evaluation.
+const SUBGRID: usize = 4;
+
+/// Precomputed subsample offsets within one pixel.
+const SUB_OFFSETS: [f32; SUBGRID] = [0.125, 0.375, 0.625, 0.875];
+
+/// A pixel whose center has |sdf| above this margin is fully inside or
+/// fully outside the shape: the distance-to-set function is 1-Lipschitz
+/// and the farthest pixel point from its center is the corner at
+/// √2/2 ≈ 0.7071, so 0.71 guarantees the whole pixel is on one side.
+const SDF_MARGIN: f32 = 0.71;
+
 /// Paints `list` over `background` into a frame for `viewport`.
 ///
-/// Returns the frame, the number of items painted, and the number of glyphs
-/// composited (reported through [`crate::RenderStats`]).
+/// `previous` seeds partial-damage painting: `Some((pixels, damage))`
+/// copies the previous frame's pixels and repaints **only** the damage
+/// rectangle (device px, already the union the caller diffed); `None`
+/// clears the whole surface. Returns the frame, the number of items
+/// painted, and the number of glyphs composited (reported through
+/// [`crate::RenderStats`]).
 pub(crate) fn paint_document(
     list: &DisplayList,
     background: Color,
     viewport: Viewport,
     fonts: &mut FontStore,
+    previous: Option<(&[u8], Rect)>,
 ) -> Result<(Frame, usize, usize), VelquError> {
     let byte_count = u64::from(viewport.width()) * u64::from(viewport.height()) * 4;
     let byte_count =
@@ -43,11 +68,37 @@ pub(crate) fn paint_document(
         })?;
     rgba.resize(byte_count, 0);
 
-    for px in rgba.chunks_exact_mut(4) {
-        px[0] = background.r;
-        px[1] = background.g;
-        px[2] = background.b;
-        px[3] = background.a;
+    // Damage clipping: with a previous frame, keep its pixels and clear +
+    // repaint only inside the damage rect. The rect is clamped and
+    // integer-snapped outward so every partial item stays covered.
+    let damage = previous.as_ref().map(|(_, rect)| clamp_damage(rect, viewport));
+    match (&previous, damage) {
+        (Some((pixels, _)), Some(rect)) => {
+            let (dx0, dy0, dx1, dy1) = rect;
+            let w = viewport.width() as usize;
+            if dx1 > dx0 && dy1 > dy0 {
+                rgba.copy_from_slice(pixels);
+                for py in dy0..dy1 {
+                    let row = py as usize * w * 4;
+                    for px in rgba[row + dx0 as usize * 4..row + dx1 as usize * 4]
+                        .chunks_exact_mut(4)
+                    {
+                        px[0] = background.r;
+                        px[1] = background.g;
+                        px[2] = background.b;
+                        px[3] = background.a;
+                    }
+                }
+            }
+        }
+        _ => {
+            for px in rgba.chunks_exact_mut(4) {
+                px[0] = background.r;
+                px[1] = background.g;
+                px[2] = background.b;
+                px[3] = background.a;
+            }
+        }
     }
 
     let mut ctx = PaintCtx {
@@ -61,6 +112,7 @@ pub(crate) fn paint_document(
         transform_stack: Vec::new(),
         opacity: 1.0,
         opacity_stack: Vec::new(),
+        damage,
     };
 
     for item in &list.items {
@@ -85,6 +137,14 @@ pub(crate) fn paint_document(
                 color,
             } => {
                 ctx.fill_rounded_ring(outer, *radius, inner, inner_radii, *color);
+                ctx.items += 1;
+            }
+            DisplayItem::GradientFill {
+                rect,
+                radius,
+                gradient,
+            } => {
+                ctx.fill_gradient(rect, *radius, gradient);
                 ctx.items += 1;
             }
             DisplayItem::TextRun {
@@ -162,6 +222,20 @@ struct PaintCtx<'a> {
     /// of enclosing scopes.
     opacity: f32,
     opacity_stack: Vec<f32>,
+    /// Partial-damage window (`None` = paint the whole surface): rows and
+    /// columns outside it keep the previous frame's pixels. Half-open
+    /// integer device bounds `(x0, y0, x1, y1)`.
+    damage: Option<(i64, i64, i64, i64)>,
+}
+
+/// Clamps a device-pixel damage rect to the viewport, snapping outward to
+/// whole pixels (half-open integer bounds). Degenerate rects collapse.
+fn clamp_damage(rect: &Rect, viewport: Viewport) -> (i64, i64, i64, i64) {
+    let x0 = rect.x.floor().max(0.0) as i64;
+    let y0 = rect.y.floor().max(0.0) as i64;
+    let x1 = (rect.x + rect.w).ceil().clamp(0.0, viewport.width() as f32) as i64;
+    let y1 = (rect.y + rect.h).ceil().clamp(0.0, viewport.height() as f32) as i64;
+    (x0, y0, x1.max(x0), y1.max(y0))
 }
 
 /// One active clip scope: a rectangle in device pixels, optionally with
@@ -236,6 +310,16 @@ impl PaintCtx<'_> {
     }
 
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
+        // Damage safety net: any path that reaches a pixel outside the
+        // damage window keeps the previous frame's pixel. Row/column
+        // scoping in the fills and loops makes this rare; correctness here
+        // makes it impossible to leak writes.
+        if let Some((dx0, dy0, dx1, dy1)) = self.damage {
+            let (xi, yi) = (x as i64, y as i64);
+            if xi < dx0 || xi >= dx1 || yi < dy0 || yi >= dy1 {
+                return;
+            }
+        }
         let i = (y * self.width as usize + x) * 4;
         let dst = Color::from_rgba8(
             self.rgba[i],
@@ -250,18 +334,50 @@ impl PaintCtx<'_> {
         self.rgba[i + 3] = out.a;
     }
 
+    /// Blends `color` at fractional shape coverage `cov ∈ (0, 1)` (the
+    /// rounded fraction of the fixed sample grid, ADR 0026): the source
+    /// alpha scales by `round(cov·255)` before the normal blend.
+    fn blend_pixel_coverage(&mut self, x: usize, y: usize, color: Color, cov: f32) {
+        let coverage_alpha = (cov * 255.0).round().clamp(0.0, 255.0) as u8;
+        if coverage_alpha == 0 {
+            return;
+        }
+        let shade = Color::from_rgba8(color.r, color.g, color.b, scale_u8(coverage_alpha, color.a));
+        self.blend_pixel(x, y, shade);
+    }
+
+    /// Fills an axis-aligned rectangle with exact per-pixel coverage
+    /// (ADR 0026): the overlap of the pixel square with the rect spans is
+    /// a 1D fraction per axis, so fractional coordinates render at their
+    /// true coverage — no edge snapping. Interior pixels take the
+    /// full-strength path.
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
         let color = self.modulate(color);
         if self.transform.is_axis_aligned() {
             let placed = self.transform.apply_rect(&Rect { x, y, w, h });
-            let x0 = placed.x.round().max(0.0) as u32;
-            let y0 = placed.y.round().max(0.0) as u32;
-            let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as u32;
-            let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as u32;
-            for py in y0..y1 {
-                for px in x0..x1 {
-                    if self.clip_contains(px as i64, py as i64) {
+            let x0 = placed.x.max(0.0);
+            let y0 = placed.y.max(0.0);
+            let x1 = (placed.x + placed.w).min(self.width as f32);
+            let y1 = (placed.y + placed.h).min(self.height as f32);
+            if x1 <= x0 || y1 <= y0 {
+                return;
+            }
+            let (rows0, rows1) = self.damage_rows(y0.floor() as i64, y1.ceil() as i64);
+            for py in rows0..rows1 {
+                let fy = span_coverage(py as f32, y0, y1);
+                if fy <= 0.0 {
+                    continue;
+                }
+                let (cols0, cols1) = self.damage_cols(x0.floor() as i64, x1.ceil() as i64);
+                for px in cols0..cols1 {
+                    if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    let cov = span_coverage(px as f32, x0, x1) * fy;
+                    if cov >= 1.0 {
                         self.blend_pixel(px as usize, py as usize, color);
+                    } else if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
                 }
             }
@@ -272,66 +388,111 @@ impl PaintCtx<'_> {
                 self.width,
                 self.height,
             );
-            for py in y0..y1 {
+            let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
+            for py in rows0..rows1 {
                 for px in x0..x1 {
-                    if !self.clip_contains(px as i64, py as i64) {
+                    if !self.clip_contains(px as i64, py) {
                         continue;
                     }
-                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
-                    if lx >= x && lx < x + w && ly >= y && ly < y + h {
+                    let cov = subsample_coverage(&inv, px as f32, py as f32, |lx, ly| {
+                        lx >= x && lx < x + w && ly >= y && ly < y + h
+                    });
+                    if cov >= 1.0 {
                         self.blend_pixel(px as usize, py as usize, color);
+                    } else if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
                 }
             }
         }
     }
 
-    /// Fills a rounded rectangle: same edge snapping as `fill_rect`, with
-    /// per-pixel shape coverage (pixel **center** inside the rounded
-    /// bounds). No anti-aliasing — coverage is a strict in/out test, so
-    /// results are deterministic. The corner radius scales with the
-    /// transform (ADR 0024). Rotated shapes sample via inverse transform mapping.
+    /// Intersects a half-open row range with the damage window.
+    fn damage_rows(&self, y0: i64, y1: i64) -> (i64, i64) {
+        match self.damage {
+            None => (y0, y1),
+            Some((_, dy0, _, dy1)) => (y0.max(dy0), y1.min(dy1)),
+        }
+    }
+
+    /// Intersects a half-open column range with the damage window.
+    fn damage_cols(&self, x0: i64, x1: i64) -> (i64, i64) {
+        match self.damage {
+            None => (x0, x1),
+            Some((dx0, _, dx1, _)) => (x0.max(dx0), x1.min(dx1)),
+        }
+    }
+
+    /// Fills a rounded rectangle with per-pixel coverage (ADR 0026): a
+    /// signed-distance classification fast-paths interior pixels (one
+    /// `sqrt`), and boundary-band pixels evaluate the fixed 4×4 subsample
+    /// grid — fractional positions and radii render at true coverage. The
+    /// corner radius scales with the transform (ADR 0024). Rotated shapes
+    /// subsample through inverse transform mapping.
+    ///
+    /// Row spans: per scanline the inside interval is derived from the same
+    /// corner math (conservative ±2px, exact predicate inside), so the
+    /// outside-span scan disappears.
     fn fill_rounded(&mut self, rect: &Rect, radius: f32, color: Color) {
         let color = self.modulate(color);
         if self.transform.is_axis_aligned() {
             let placed = self.transform.apply_rect(rect);
             let radius = radius * self.transform.scale_factor();
-            let x0 = placed.x.round().max(0.0) as i64;
-            let y0 = placed.y.round().max(0.0) as i64;
-            let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
-            let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
-            for py in y0..y1 {
-                for px in x0..x1 {
+            let x0 = placed.x.max(0.0).floor() as i64;
+            let y0 = placed.y.max(0.0).floor() as i64;
+            let x1 = (placed.x + placed.w).min(self.width as f32).ceil() as i64;
+            let y1 = (placed.y + placed.h).min(self.height as f32).ceil() as i64;
+            let (rows0, rows1) = self.damage_rows(y0, y1);
+            for py in rows0..rows1 {
+                let (span0, span1) = rounded_row_span(&placed, radius, py);
+                if span0 >= span1 {
+                    continue;
+                }
+                let (cols0, cols1) = self.damage_cols(span0 - 2, span1 + 2);
+                for px in cols0.max(x0)..cols1.min(x1) {
                     if !self.clip_contains(px, py) {
                         continue;
                     }
                     let cx = px as f32 + 0.5;
                     let cy = py as f32 + 0.5;
-                    if point_in_rounded_rect(cx, cy, &placed, radius) {
+                    let sd = rounded_rect_sdf(cx, cy, &placed, radius);
+                    if sd <= -SDF_MARGIN {
                         self.blend_pixel(px as usize, py as usize, color);
+                    } else if sd < SDF_MARGIN {
+                        let cov = rounded_subsample_coverage(&placed, radius, px as f32, py as f32);
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
                 }
             }
         } else if let Some(inv) = self.transform.inverse() {
             let (x0, y0, x1, y1) = transform_bounds(&self.transform, rect, self.width, self.height);
-            for py in y0..y1 {
+            let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
+            for py in rows0..rows1 {
                 for px in x0..x1 {
-                    if !self.clip_contains(px as i64, py as i64) {
+                    if !self.clip_contains(px as i64, py) {
                         continue;
                     }
-                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
-                    if point_in_rounded_rect(lx, ly, rect, radius) {
+                    let cov = subsample_coverage(&inv, px as f32, py as f32, |lx, ly| {
+                        point_in_rounded_rect(lx, ly, rect, radius)
+                    });
+                    if cov >= 1.0 {
                         self.blend_pixel(px as usize, py as usize, color);
+                    } else if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
                 }
             }
         }
     }
 
-    /// Fills a rounded border ring: pixels inside the outer rounded shape
-    /// and outside the inner one. Inner corner radii are the outer radius
-    /// minus the adjacent border widths (clamped at 0), so uneven borders
-    /// keep a sensible ring. Transforms map both edges (ADR 0024).
+    /// Fills a rounded border ring with coverage `cov_outer − cov_inner`
+    /// (ADR 0026): a 1px hairline at any fractional position renders at
+    /// its true partial coverage — no wobble, no disappearing rows.
+    /// Outer pixels classify through the rounded-rect SDF; inner-shape
+    /// coverage subsamples only when the pixel can touch the hole's
+    /// boundary (straight-edge and corner-zone shortcuts). Inner corner
+    /// radii are the outer radius minus the adjacent border widths
+    /// (clamped at 0). Transforms map both edges (ADR 0024).
     fn fill_rounded_ring(
         &mut self,
         outer: &Rect,
@@ -352,41 +513,73 @@ impl PaintCtx<'_> {
                 inner_radii[2] * scale,
                 inner_radii[3] * scale,
             ];
-            let x0 = placed_outer.x.round().max(0.0) as i64;
-            let y0 = placed_outer.y.round().max(0.0) as i64;
+            let x0 = placed_outer.x.max(0.0).floor() as i64;
+            let y0 = placed_outer.y.max(0.0).floor() as i64;
             let x1 = (placed_outer.x + placed_outer.w)
-                .round()
-                .clamp(0.0, self.width as f32) as i64;
+                .min(self.width as f32)
+                .ceil() as i64;
             let y1 = (placed_outer.y + placed_outer.h)
-                .round()
-                .clamp(0.0, self.height as f32) as i64;
-            for py in y0..y1 {
-                for px in x0..x1 {
+                .min(self.height as f32)
+                .ceil() as i64;
+            let (rows0, rows1) = self.damage_rows(y0, y1);
+            for py in rows0..rows1 {
+                let (span0, span1) = rounded_row_span(&placed_outer, radius, py);
+                if span0 >= span1 {
+                    continue;
+                }
+                let (cols0, cols1) = self.damage_cols(span0 - 2, span1 + 2);
+                for px in cols0.max(x0)..cols1.min(x1) {
                     if !self.clip_contains(px, py) {
                         continue;
                     }
                     let cx = px as f32 + 0.5;
                     let cy = py as f32 + 0.5;
-                    let in_outer = point_in_rounded_rect(cx, cy, &placed_outer, radius);
-                    let in_inner = point_in_rounded_rect4(cx, cy, &placed_inner, &inner_radii);
-                    if in_outer && !in_inner {
-                        self.blend_pixel(px as usize, py as usize, color);
+                    let sd = rounded_rect_sdf(cx, cy, &placed_outer, radius);
+                    if sd >= SDF_MARGIN {
+                        continue; // fully outside the outer shape
                     }
+                    if pixel_deep_inside_inner(cx, cy, &placed_inner, &inner_radii) {
+                        continue; // fully inside the hole: ring alpha ≤ 0
+                    }
+                    let cov = ring_subsample_coverage(
+                        &placed_outer,
+                        radius,
+                        &placed_inner,
+                        &inner_radii,
+                        px as f32,
+                        py as f32,
+                    );
+                    self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                 }
             }
         } else if let Some(inv) = self.transform.inverse() {
             let (x0, y0, x1, y1) =
                 transform_bounds(&self.transform, outer, self.width, self.height);
-            for py in y0..y1 {
+            let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
+            for py in rows0..rows1 {
                 for px in x0..x1 {
-                    if !self.clip_contains(px as i64, py as i64) {
+                    if !self.clip_contains(px as i64, py) {
                         continue;
                     }
-                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
-                    let in_outer = point_in_rounded_rect(lx, ly, outer, radius);
-                    let in_inner = point_in_rounded_rect4(lx, ly, inner, inner_radii);
-                    if in_outer && !in_inner {
+                    let mut outer_hits = 0usize;
+                    let mut inner_hits = 0usize;
+                    for sy in SUB_OFFSETS {
+                        for sx in SUB_OFFSETS {
+                            let (lx, ly) = inv.apply_point(px as f32 + sx, py as f32 + sy);
+                            if point_in_rounded_rect(lx, ly, outer, radius) {
+                                outer_hits += 1;
+                            }
+                            if point_in_rounded_rect4(lx, ly, inner, inner_radii) {
+                                inner_hits += 1;
+                            }
+                        }
+                    }
+                    let cov = (outer_hits as f32 - inner_hits as f32)
+                        / (SUBGRID * SUBGRID) as f32;
+                    if cov >= 1.0 {
                         self.blend_pixel(px as usize, py as usize, color);
+                    } else if cov > 0.0 {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
                     }
                 }
             }
@@ -399,9 +592,9 @@ impl PaintCtx<'_> {
     /// border edge). The blur feather is approximated with
     /// [`SHADOW_FEATHER_STEPS`] stacked rings — each carries an equal slice
     /// of the shadow alpha, so alpha accumulates toward the element edge
-    /// and fades outward (deterministic integer-ish math, no
-    /// anti-aliasing). A zero blur paints one solid ring. Rings compose
-    /// under the current transform/clip/opacity like any fill.
+    /// and fades outward (deterministic; the rings inherit the coverage
+    /// rasterization of ADR 0026). A zero blur paints one solid ring.
+    /// Rings compose under the current transform/clip/opacity like any fill.
     fn draw_outer_shadow(
         &mut self,
         bounds: Rect,
@@ -437,6 +630,98 @@ impl PaintCtx<'_> {
         }
     }
 
+    /// Paints a resolved gradient inside `rect` (rounded when
+    /// `radius > 0`, same shape semantics as the solid fills). Per pixel:
+    /// the shape coverage path (spans/SDF/subsamples) times the gradient
+    /// color at the pixel's gradient coordinate — linear gradients project
+    /// onto the gradient line, radial gradients take the normalized
+    /// elliptical distance. Stop interpolation is channel-wise `f32` lerp,
+    /// so identical gradients produce identical pixels (ADR 0026).
+    fn fill_gradient(&mut self, rect: &Rect, radius: f32, gradient: &ResolvedGradient) {
+        if gradient.stops.is_empty() || rect.w <= 0.0 || rect.h <= 0.0 {
+            return;
+        }
+        if self.transform.is_axis_aligned() {
+            let placed = self.transform.apply_rect(rect);
+            let radius = radius * self.transform.scale_factor();
+            let Some(inv) = self.transform.inverse() else {
+                return;
+            };
+            let x0 = placed.x.max(0.0).floor() as i64;
+            let y0 = placed.y.max(0.0).floor() as i64;
+            let x1 = (placed.x + placed.w).min(self.width as f32).ceil() as i64;
+            let y1 = (placed.y + placed.h).min(self.height as f32).ceil() as i64;
+            let (rows0, rows1) = self.damage_rows(y0, y1);
+            for py in rows0..rows1 {
+                let (span0, span1) = if radius > 0.0 {
+                    rounded_row_span(&placed, radius, py)
+                } else {
+                    rounded_row_span(&placed, 0.0, py)
+                };
+                if span0 >= span1 {
+                    continue;
+                }
+                let (cols0, cols1) = self.damage_cols(span0 - 2, span1 + 2);
+                for px in cols0.max(x0)..cols1.min(x1) {
+                    if !self.clip_contains(px, py) {
+                        continue;
+                    }
+                    let cx = px as f32 + 0.5;
+                    let cy = py as f32 + 0.5;
+                    let sd = rounded_rect_sdf(cx, cy, &placed, radius);
+                    let cov = if sd <= -SDF_MARGIN {
+                        1.0
+                    } else if sd < SDF_MARGIN {
+                        rounded_subsample_coverage(&placed, radius, px as f32, py as f32)
+                    } else {
+                        0.0
+                    };
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(cx, cy);
+                    let t = gradient_project(gradient, lx, ly);
+                    if t.is_nan() {
+                        continue;
+                    }
+                    let color = self.modulate(gradient_color_at(&gradient.stops, t));
+                    if cov >= 1.0 {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    } else {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
+                    }
+                }
+            }
+        } else if let Some(inv) = self.transform.inverse() {
+            let (x0, y0, x1, y1) = transform_bounds(&self.transform, rect, self.width, self.height);
+            let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
+            for py in rows0..rows1 {
+                for px in x0..x1 {
+                    if !self.clip_contains(px as i64, py) {
+                        continue;
+                    }
+                    let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
+                    let cov = subsample_coverage(&inv, px as f32, py as f32, |lx, ly| {
+                        lx >= rect.x && lx < rect.x + rect.w && ly >= rect.y && ly < rect.y + rect.h
+                    });
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let t = gradient_project(gradient, lx, ly);
+                    if t.is_nan() {
+                        continue;
+                    }
+                    let color = self.modulate(gradient_color_at(&gradient.stops, t));
+                    if cov >= 1.0 {
+                        self.blend_pixel(px as usize, py as usize, color);
+                    } else {
+                        self.blend_pixel_coverage(px as usize, py as usize, color, cov);
+                    }
+                }
+            }
+        }
+    }
+
     /// Blits a decoded image into `rect` with nearest-neighbor sampling
     /// (`object-fit: fill`). Edges snap like fills; source indices come from
     /// integer math only, so sampling is deterministic across runs. The
@@ -450,9 +735,10 @@ impl PaintCtx<'_> {
             let y0 = placed.y.round().max(0.0) as i64;
             let x1 = (placed.x + placed.w).round().clamp(0.0, self.width as f32) as i64;
             let y1 = (placed.y + placed.h).round().clamp(0.0, self.height as f32) as i64;
+            let (rows0, rows1) = self.damage_rows(y0, y1);
             let dst_w = (x1 - x0).max(1);
             let dst_h = (y1 - y0).max(1);
-            for dy in y0..y1 {
+            for dy in rows0..rows1 {
                 let sy = ((dy - y0) * src_h / dst_h) as usize;
                 for dx in x0..x1 {
                     if !self.clip_contains(dx, dy) {
@@ -520,13 +806,28 @@ impl PaintCtx<'_> {
         let color = self.modulate(run.color);
         let mut pen_x = pen_start;
         let baseline = baseline_start;
+        // Damage rows: glyphs fully outside the damage window skip their
+        // coverage scans (the blend damage check already guards writes).
+        let (damage_y0, damage_y1) = self
+            .damage
+            .map(|(_, dy0, _, dy1)| (dy0, dy1))
+            .unwrap_or((0, self.height as i64));
         for ch in run.text.chars() {
             let glyph = fonts.glyph(face, ch, px);
             let advance = glyph.advance * scale;
             let bitmap_left = pen_x as i64 + glyph.xmin as i64;
             let bitmap_top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
+            let bitmap_bottom = bitmap_top + glyph.height as i64;
+            if bitmap_bottom <= damage_y0 || bitmap_top >= damage_y1 {
+                self.glyphs += 1;
+                pen_x += advance;
+                continue;
+            }
             for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
                 let dy = bitmap_top + row as i64;
+                if dy < damage_y0 || dy >= damage_y1 {
+                    continue;
+                }
                 if dy < 0 || dy >= self.height as i64 {
                     continue;
                 }
@@ -553,6 +854,79 @@ impl PaintCtx<'_> {
 /// rings smooth the falloff at linear cost; 8 keeps a `shadow-md` (6px
 /// blur) visibly soft without dominating paint time.
 const SHADOW_FEATHER_STEPS: usize = 8;
+
+/// Per-item device-pixel bounds, in paint order — **one entry per item**
+/// (index-aligned with `items`; scoping items that paint nothing carry the
+/// empty [`Rect::default`]). Transform scopes are resolved
+/// (`PushTransform`/`PopTransform`); clip scopes only shrink what an item
+/// paints and are ignored (over-damage is safe, under-damage is not).
+/// Every bound is inflated by a small margin for edge snapping and glyph
+/// overshoot. The render loop diffs consecutive lists through these bounds
+/// to derive the partial-damage window.
+pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
+    const MARGIN: f32 = 3.0;
+    let mut bounds = Vec::with_capacity(items.len());
+    let mut transform = Affine2D::IDENTITY;
+    let mut stack: Vec<Affine2D> = Vec::new();
+    for item in items {
+        let rect = match item {
+            DisplayItem::FillRect { rect, .. }
+            | DisplayItem::RoundedFill { rect, .. }
+            | DisplayItem::GradientFill { rect, .. }
+            | DisplayItem::DrawImage { rect, .. } => Some(*rect),
+            DisplayItem::RoundedBorder { outer, .. } => Some(*outer),
+            DisplayItem::OuterShadow {
+                bounds: b, blur, ..
+            } => {
+                let reach = blur.max(0.0);
+                Some(Rect {
+                    x: b.x - reach,
+                    y: b.y - reach,
+                    w: b.w + 2.0 * reach,
+                    h: b.h + 2.0 * reach,
+                })
+            }
+            DisplayItem::TextRun { x, y, text, px, .. } => {
+                // Conservative: 1em per character covers every glyph's
+                // advance; the vertical band covers ascender overshoot and
+                // descenders for whole-pixel sizes.
+                let (bx, baseline) = transform.apply_point(x.round(), y.round());
+                let px_scaled = f32::from(*px) * transform.scale_factor();
+                let width = text.chars().count() as f32 * px_scaled.max(1.0);
+                Some(Rect {
+                    x: bx,
+                    y: baseline - 2.0 * px_scaled.max(1.0),
+                    w: width,
+                    h: 3.0 * px_scaled.max(1.0),
+                })
+            }
+            DisplayItem::PushTransform { matrix } => {
+                stack.push(transform);
+                transform = transform.compose(matrix);
+                None
+            }
+            DisplayItem::PopTransform => {
+                transform = stack.pop().unwrap_or(Affine2D::IDENTITY);
+                None
+            }
+            DisplayItem::PushClip(_)
+            | DisplayItem::PushClipRounded { .. }
+            | DisplayItem::PopClip
+            | DisplayItem::PushOpacity(_)
+            | DisplayItem::PopOpacity => None,
+        };
+        bounds.push(rect.map_or_else(Rect::default, |placed_rect| {
+            let placed = transform.apply_rect(&placed_rect);
+            Rect {
+                x: placed.x - MARGIN,
+                y: placed.y - MARGIN,
+                w: placed.w + 2.0 * MARGIN,
+                h: placed.h + 2.0 * MARGIN,
+            }
+        }));
+    }
+    bounds
+}
 
 /// Borrowed view of one [`DisplayItem::TextRun`] for painting.
 struct TextRunPlacement<'a> {
@@ -601,6 +975,32 @@ fn point_in_rounded_rect(x: f32, y: f32, rect: &Rect, radius: f32) -> bool {
     dx * dx + dy * dy <= r * r
 }
 
+/// The half-open pixel-column interval on row `py` that can possibly pass
+/// [`point_in_rounded_rect`] for this shape. Derived from the same corner
+/// math (`dx ≤ √(r²−dy²)` on the row), widened by a 2px f32-safety margin;
+/// the caller still runs the exact predicate inside the span, so coverage
+/// is bit-identical to the full-scan while the outside scan disappears.
+/// Empty (or inverted) spans mean the row has no coverage.
+fn rounded_row_span(rect: &Rect, radius: f32, py: i64) -> (i64, i64) {
+    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
+    let cy = py as f32 + 0.5;
+    if r <= 0.0 {
+        // floor/ceil (not round): the span must include partially covered
+        // edge pixels under coverage rasterization (ADR 0026).
+        let x0 = rect.x.floor().max(0.0) as i64;
+        let x1 = (rect.x + rect.w).ceil().clamp(0.0, i64::MAX as f32) as i64;
+        return (x0, x1);
+    }
+    let dy = (rect.y + r - cy).max(cy - (rect.y + rect.h - r)).max(0.0);
+    if dy > r {
+        return (0, 0);
+    }
+    let dx_max = (r * r - dy * dy).sqrt();
+    let span0 = (rect.x + r - dx_max).floor().max(0.0) as i64;
+    let span1 = (rect.x + rect.w - r + dx_max).ceil().clamp(0.0, i64::MAX as f32) as i64;
+    (span0, span1)
+}
+
 /// Strict inside-test for a rounded rectangle with per-corner radii
 /// (`tl, tr, br, bl`) — used for the inner edge of rounded borders, where
 /// uneven border widths make corners shrink by different amounts.
@@ -647,6 +1047,178 @@ fn point_in_rounded_rect4(x: f32, y: f32, rect: &Rect, radii: &[f32; 4]) -> bool
 /// Coverage-to-alpha scaling that stays exact at the ends (0, 255).
 fn scale_u8(a: u8, b: u8) -> u8 {
     ((a as u16 * b as u16 + 127) / 255) as u8
+}
+
+/// Fraction of the unit interval [px, px+1] covered by [lo, hi] — the
+/// exact straight-edge coverage fraction (ADR 0026).
+fn span_coverage(px: f32, lo: f32, hi: f32) -> f32 {
+    (hi.min(px + 1.0) - lo.max(px)).clamp(0.0, 1.0)
+}
+
+/// Signed distance to a uniform-radius rounded-rectangle boundary:
+/// negative inside, positive outside. Pure `f32` (one `sqrt`), so the
+/// classification is bit-identical across runs (ADR 0026). `sd ≤ 0` is
+/// equivalent to [`point_in_rounded_rect`].
+fn rounded_rect_sdf(x: f32, y: f32, rect: &Rect, radius: f32) -> f32 {
+    let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
+    let hw = rect.w / 2.0 - r;
+    let hh = rect.h / 2.0 - r;
+    let qx = (x - (rect.x + rect.w / 2.0)).abs() - hw;
+    let qy = (y - (rect.y + rect.h / 2.0)).abs() - hh;
+    let dx = qx.max(0.0);
+    let dy = qy.max(0.0);
+    (dx * dx + dy * dy).sqrt() + qx.max(qy).min(0.0) - r
+}
+
+/// Fraction of the fixed `SUBGRID²` samples of device pixel `(px, py)`
+/// inside the uniform-radius rounded rect.
+fn rounded_subsample_coverage(rect: &Rect, radius: f32, px: f32, py: f32) -> f32 {
+    let mut inside = 0usize;
+    for sy in SUB_OFFSETS {
+        for sx in SUB_OFFSETS {
+            if point_in_rounded_rect(px + sx, py + sy, rect, radius) {
+                inside += 1;
+            }
+        }
+    }
+    inside as f32 / (SUBGRID * SUBGRID) as f32
+}
+
+/// Ring coverage: outer samples minus inner samples, clamped at zero
+/// (the inner shape nests inside the outer, so the difference is the
+/// exact per-sample ring area).
+fn ring_subsample_coverage(
+    outer: &Rect,
+    radius: f32,
+    inner: &Rect,
+    inner_radii: &[f32; 4],
+    px: f32,
+    py: f32,
+) -> f32 {
+    let mut outer_inside = 0usize;
+    let mut inner_inside = 0usize;
+    for sy in SUB_OFFSETS {
+        for sx in SUB_OFFSETS {
+            let x = px + sx;
+            let y = py + sy;
+            if point_in_rounded_rect(x, y, outer, radius) {
+                outer_inside += 1;
+            }
+            if point_in_rounded_rect4(x, y, inner, inner_radii) {
+                inner_inside += 1;
+            }
+        }
+    }
+    // saturating: a degenerate ring (outer == inner bounds) can count a
+    // sample on the shared edge inside the inner shape only — measure
+    // zero, deterministic, never worth a negative alpha.
+    (outer_inside.saturating_sub(inner_inside) as f32 / (SUBGRID * SUBGRID) as f32).max(0.0)
+}
+
+/// True when the whole pixel is certainly inside the per-corner rounded
+/// rect: at least [`SDF_MARGIN`] inside every straight edge and outside
+/// every corner zone expanded by the margin (the rounded shape is the
+/// plain rect minus corner cutouts, so this is a conservative
+/// whole-pixel-in-hole test). Used to skip the ring's interior.
+fn pixel_deep_inside_inner(cx: f32, cy: f32, rect: &Rect, radii: &[f32; 4]) -> bool {
+    let r_max = radii[0].max(radii[1]).max(radii[2]).max(radii[3]);
+    let x0 = rect.x;
+    let y0 = rect.y;
+    let x1 = rect.x + rect.w;
+    let y1 = rect.y + rect.h;
+    if cx < x0 + SDF_MARGIN
+        || cx > x1 - SDF_MARGIN
+        || cy < y0 + SDF_MARGIN
+        || cy > y1 - SDF_MARGIN
+    {
+        return false;
+    }
+    let zone = r_max.max(0.0) + SDF_MARGIN;
+    if cx < x0 + zone && cy < y0 + zone {
+        return false;
+    }
+    if cx > x1 - zone && cy < y0 + zone {
+        return false;
+    }
+    if cx > x1 - zone && cy > y1 - zone {
+        return false;
+    }
+    if cx < x0 + zone && cy > y1 - zone {
+        return false;
+    }
+    true
+}
+
+/// Coverage of a shape (tested in local space through `inv`) over the
+/// fixed `SUBGRID²` samples of device pixel `(px, py)` — the rotated /
+/// transformed counterpart of the direct subsample functions.
+fn subsample_coverage(
+    inv: &Affine2D,
+    px: f32,
+    py: f32,
+    inside: impl Fn(f32, f32) -> bool,
+) -> f32 {
+    let mut hits = 0usize;
+    for sy in SUB_OFFSETS {
+        for sx in SUB_OFFSETS {
+            let (lx, ly) = inv.apply_point(px + sx, py + sy);
+            if inside(lx, ly) {
+                hits += 1;
+            }
+        }
+    }
+    hits as f32 / (SUBGRID * SUBGRID) as f32
+}
+
+/// The gradient coordinate at a local-space point: linear gradients
+/// project onto the gradient line (`0` at start, `1` at end); radial
+/// gradients take the normalized elliptical distance (1 on the shape).
+fn gradient_project(gradient: &ResolvedGradient, x: f32, y: f32) -> f32 {
+    match &gradient.kind {
+        ResolvedGradientKind::Linear { start, end } => {
+            let dx = end.0 - start.0;
+            let dy = end.1 - start.1;
+            ((x - start.0) * dx + (y - start.1) * dy) / (dx * dx + dy * dy).max(1e-6)
+        }
+        ResolvedGradientKind::Radial { center, rx, ry } => {
+            (((x - center.0) / rx).powi(2) + ((y - center.1) / ry).powi(2)).sqrt()
+        }
+    }
+}
+
+/// Evaluates the stop list at `t`: end colors clamp, the bracketing
+/// segment channel-lerps (the animation engine's rounding), and equal
+/// adjacent positions act as hard stops (later color wins at the seam).
+fn gradient_color_at(stops: &[(f32, Color)], t: f32) -> Color {
+    let first = &stops[0];
+    if t <= first.0 {
+        return first.1;
+    }
+    let last = &stops[stops.len() - 1];
+    if t >= last.0 {
+        return last.1;
+    }
+    let mut index = 0usize;
+    while index + 2 < stops.len() && stops[index + 1].0 <= t {
+        index += 1;
+    }
+    let (p0, c0) = stops[index];
+    let (p1, c1) = stops[index + 1];
+    let span = p1 - p0;
+    let u = if span > 1e-6 {
+        ((t - p0) / span).clamp(0.0, 1.0)
+    } else if t >= p1 {
+        1.0
+    } else {
+        0.0
+    };
+    let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * u).round() as u8;
+    Color::from_rgba8(
+        channel(c0.r, c1.r),
+        channel(c0.g, c1.g),
+        channel(c0.b, c1.b),
+        channel(c0.a, c1.a),
+    )
 }
 
 /// Computes the pixel bounds of a transformed rectangle, clamped to the viewport.

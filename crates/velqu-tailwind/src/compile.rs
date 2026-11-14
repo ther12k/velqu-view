@@ -82,6 +82,7 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
     let mut rules = 0usize;
     let mut seen: Vec<&str> = Vec::new();
     let mut keyframes: Vec<&'static str> = Vec::new();
+    let mut compiled: Vec<(bool, String, Vec<(&'static str, String)>)> = Vec::new();
 
     for class in classes {
         let class = class.trim();
@@ -99,12 +100,7 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
         }
         match compile_one_class(class) {
             Ok((selector, declarations)) => {
-                let body = declarations
-                    .iter()
-                    .map(|(property, value)| format!("{property}: {value};"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                css.push_str(&format!(".{selector} {{ {body} }}\n"));
+                compiled.push((is_transition_modifier(&declarations), selector, declarations));
                 rules += 1;
                 // Tailwind emits the `@keyframes` a named animation needs
                 // alongside the utility; mirror that so the build output is
@@ -121,6 +117,23 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
                 message,
             }),
         }
+    }
+
+    // Canonical transition ordering (Tailwind emits `transition-property`
+    // utilities before their `duration-*`/`delay-*`/`ease-*` modifiers).
+    // First-appearance order makes the winner depend on which element the
+    // document mentions first — a card with `transition-all` after some
+    // earlier element's `duration-500` would silently run at the base
+    // 150ms. Modifiers sort after property carriers; within each group the
+    // first-appearance order is preserved (stable sort).
+    compiled.sort_by(|a, b| a.0.cmp(&b.0));
+    for (_, selector, declarations) in compiled {
+        let body = declarations
+            .iter()
+            .map(|(property, value)| format!("{property}: {value};"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        css.push_str(&format!(".{selector} {{ {body} }}\n"));
     }
 
     for name in keyframes {
@@ -1575,6 +1588,26 @@ fn time_step(token: &str) -> Option<u32> {
     TIMES.contains(&ms).then_some(ms)
 }
 
+/// Whether a compiled rule is a transition *modifier* — it sets only
+/// `transition-duration`/`transition-delay`/`transition-timing-function`
+/// without a `transition-property` (`duration-*`, `delay-*`, `ease-*`).
+/// Modifiers must sort after the property carriers (`transition`,
+/// `transition-all`, …) so a modifier later in the sheet wins the cascade
+/// regardless of which element mentioned it first in the document.
+fn is_transition_modifier(declarations: &[(&'static str, String)]) -> bool {
+    declarations
+        .iter()
+        .all(|(property, _)| *property != "transition-property")
+        && declarations
+            .iter()
+            .any(|(property, _)| {
+                matches!(
+                    *property,
+                    "transition-duration" | "transition-delay" | "transition-timing-function"
+                )
+            })
+}
+
 /// The `transition` family's shared duration + easing defaults: every
 /// `transition-*` utility carries them so a bare `transition-colors` is
 /// complete on its own (matching Tailwind); `duration-*`/`ease-*` then
@@ -2238,6 +2271,33 @@ mod tests {
         assert!(build.css.contains("transition-duration: 500ms;"));
         assert!(build.css.contains("transition-duration: 1000ms;"));
         assert!(build.css.contains("transition-timing-function: linear;"));
+    }
+
+    /// Cascade order regression: `duration-*`/`ease-*` modifiers must sort
+    /// AFTER `transition-*` property rules no matter which element in the
+    /// document mentioned them first. First-appearance order let a card's
+    /// `transition-all` (mentioned later) silently override an earlier
+    /// `duration-500` back to the 150ms base.
+    #[test]
+    fn transition_modifiers_sort_after_property_rules() {
+        // "duration-500" appears BEFORE "transition-all", like the lekuvo
+        // document (pill first, card later).
+        let build = compile_utilities(&["duration-500", "ease-out", "transition-all"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        let transition_pos = build
+            .css
+            .find(".transition-all {")
+            .expect("transition-all compiled");
+        let duration_pos = build
+            .css
+            .find(".duration-500 {")
+            .expect("duration-500 compiled");
+        let ease_pos = build.css.find(".ease-out {").expect("ease-out compiled");
+        assert!(
+            transition_pos < duration_pos && transition_pos < ease_pos,
+            "transition-property rule must precede its modifiers:\n{}",
+            build.css
+        );
         assert!(
             build
                 .css

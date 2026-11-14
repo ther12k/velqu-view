@@ -9,7 +9,7 @@ height = 200
 scale = 2.0
 
 [expect]
-pixels_sha256 = "fd4654308f8cfb5165f28b7e82a9751a5fa7e679340f383978cca71c3dbfca76"
+pixels_sha256 = "12df1a7475fa52f9fd8e2dec322dbccac2325fadf7374865a8d41a96ee0c4d1b"
 
 [[expect.facts]]
 id = "grid"

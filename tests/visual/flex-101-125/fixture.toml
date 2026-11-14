@@ -7,7 +7,7 @@ css = ["examples/flex/app.css"]
 viewport = { width = 500, height = 375, scale = 1.25 }
 
 [expect]
-pixels_sha256 = "115eb55ca15bbae5b87203a3683fc439bea3f88ec616725e5e96552a41dbde9d"
+pixels_sha256 = "f79c3fe2437eb077d135a0df7707bd848100c45fd9455d0200da8ef4a2606e8f"
 
 [[expect.facts]]
 id = "row"

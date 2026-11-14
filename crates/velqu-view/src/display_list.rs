@@ -268,6 +268,42 @@ pub(crate) enum DisplayItem {
         blur: f32,
         color: Color,
     },
+    /// A gradient background layer (P0 notch-port): the gradient already
+    /// resolved against the padding box, painted inside `rect` (rounded
+    /// when `radius > 0`, same shape semantics as
+    /// [`DisplayItem::RoundedFill`]).
+    GradientFill {
+        rect: Rect,
+        radius: f32,
+        gradient: ResolvedGradient,
+    },
+}
+
+/// A gradient resolved against a concrete box: paint-ready device-px
+/// geometry plus stop fractions. Produced by `gradient::Gradient::resolve`
+/// at display-list emission; the painter evaluates it per pixel.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResolvedGradient {
+    pub(crate) kind: ResolvedGradientKind,
+    /// Stop positions as fractions of the gradient line (linear) or the
+    /// horizontal radius (radial), in authored order, monotonic
+    /// non-decreasing; equal adjacent positions are hard stops.
+    pub(crate) stops: Vec<(f32, Color)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ResolvedGradientKind {
+    /// Start/end points of the gradient line, device px.
+    Linear {
+        start: (f32, f32),
+        end: (f32, f32),
+    },
+    /// Center and radii, device px (a circle has `rx == ry`).
+    Radial {
+        center: (f32, f32),
+        rx: f32,
+        ry: f32,
+    },
 }
 
 /// The paint-ready result of one layout pass.

@@ -314,12 +314,22 @@ fn run_fixture(dir: &Path) {
                 dir.display()
             );
         }
-        Some(expected) => assert_eq!(
-            expected,
-            actual_hash,
-            "{}: pixel digest changed (update baseline.png + hash after review)",
-            dir.display()
-        ),
+        Some(expected) if expected != actual_hash => {
+            // Intentional raster changes (e.g. a new rasterization policy)
+            // re-pin in one pass: `VV_REGEN=1 cargo test` rewrites each
+            // changed baseline and prints the digest to set; without the
+            // flag a changed digest fails as always.
+            if std::env::var_os("VV_REGEN").is_some_and(|value| value != "0") {
+                let _ = result.frame.save_png(&dir.join("baseline.png"));
+                eprintln!("regen {}: pixels_sha256 = {actual_hash}", dir.display());
+            } else {
+                panic!(
+                    "{}: pixel digest changed (update baseline.png + hash after review)",
+                    dir.display()
+                );
+            }
+        }
+        Some(_) => {}
     }
 
     for probe in &fixture.expect.pixel {

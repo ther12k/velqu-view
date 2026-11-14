@@ -437,3 +437,72 @@ fn looping_animation_in_hidden_subtree_stays_idle() {
         "re-hiding must stop the loop again"
     );
 }
+
+/// ADR 0027 conformance: a `spring(...)` timing function drives the
+/// physical spring driver — duration is ignored (emergent), the value
+/// overshoots an underdamped target, the engine settles idle, and an
+/// identical tick schedule reproduces the exact width vector.
+#[test]
+fn spring_width_transition_settles_with_momentum_and_is_deterministic() {
+    let html = r#"<html><body>
+        <div vx-state="{ open: false }">
+            <div data-vv-test="panel" :class="open ? 'panel open' : 'panel'"></div>
+            <button id="toggle" @click="open = !open" class="h-6 w-24">toggle</button>
+        </div>
+    </body></html>"#;
+    let css = ".panel { width: 100px; height: 40px; background-color: #16a34a; \
+               transition-property: width; transition-timing-function: spring(120, 14, 1); } \
+               .panel.open { width: 300px; }";
+
+    let run = || -> Vec<f32> {
+        let vp = viewport();
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(html).unwrap();
+        view.load_css(css).unwrap();
+        settle(&mut view, vp);
+        assert_eq!(width_of(&mut view, vp, "panel"), 100.0);
+
+        click_id(&mut view, vp, "toggle");
+        assert!(view.has_active_animations(), "spring spawned");
+        assert_eq!(
+            width_of(&mut view, vp, "panel"),
+            100.0,
+            "no first-frame jump: the spring seeds its from-value"
+        );
+
+        let mut widths = Vec::new();
+        for _ in 0..120 {
+            step_and_render(&mut view, vp, 16);
+            widths.push(width_of(&mut view, vp, "panel"));
+            if !view.has_active_animations() {
+                break;
+            }
+        }
+        assert!(
+            !view.has_active_animations(),
+            "underdamped spring(120, 14) settles well inside 2s"
+        );
+        // Underdamped (ζ ≈ 0.64): momentum carries the panel past the
+        // target before it settles back — the signature the timed-curve
+        // retarget could never produce.
+        assert!(
+            widths.iter().any(|width| *width > 300.0),
+            "spring overshoots the target, widths tail: {:?}",
+            &widths[widths.len().saturating_sub(8)..]
+        );
+        let last = *widths.last().unwrap();
+        assert!(
+            (last - 300.0).abs() < 1.0,
+            "settles at the target width, got {last}"
+        );
+        widths
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(
+        first, second,
+        "identical tick schedules produce identical width vectors"
+    );
+}

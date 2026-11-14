@@ -98,6 +98,7 @@ mod display_list;
 mod dom;
 mod editor;
 mod font;
+mod gradient;
 mod html;
 mod image;
 mod input;
@@ -105,6 +106,7 @@ mod inspect;
 mod keyboard;
 mod layout;
 mod painter;
+mod perf;
 mod reload;
 mod source;
 mod style;
@@ -361,6 +363,12 @@ pub struct RenderStats {
     pub items: usize,
     /// Number of glyph bitmaps composited.
     pub glyphs: usize,
+    /// Partial-damage window for this frame (`None` = full surface): the
+    /// device-pixel rect `(x, y, w, h)` the painter actually repainted.
+    /// Everything outside it equals the previous frame, so a host can
+    /// present just this rect. `None` on the first frame, after a
+    /// viewport or document change, and whenever the whole surface changed.
+    pub damage: Option<(u16, u16, u16, u16)>,
 }
 
 /// Layout instrumentation (ADR 0008): enough to *see* whether whole-tree
@@ -544,6 +552,18 @@ pub struct VelquView {
     presentation_causes: Vec<String>,
     structural_causes_dropped: usize,
     presentation_causes_dropped: usize,
+    /// `LEKUVO_PERF`/`VV_PERF` frame instrumentation (see `perf.rs`);
+    /// inert unless the env flag is set.
+    perf: perf::FramePerf,
+    /// Per-document cascade cache (see `layout::StyleCache`): exact-keyed
+    /// computed styles, invalidated by any matching-input change. Animation
+    /// frames freeze attributes and sheets, so every node but the animating
+    /// one hits the cache.
+    style_cache: layout::StyleCache,
+    /// The last painted frame's display list + bounds + pixels: the diff
+    /// input for partial-damage painting (see the render path). Cleared
+    /// implicitly by viewport/geometry mismatch checks; cheap to keep.
+    prev_paint: Option<PaintedFrame>,
     // -- transition engine (ADR 0024) ----------------------------------
     /// In-flight animations + the virtual clock. Ticked only by the host
     /// ([`VelquView::step_animations_by`]); renders apply the engine's
@@ -594,6 +614,9 @@ struct StyleDiffSnapshot {
     border_color: Color,
     color: Color,
     transform: style::Transform2D,
+    /// The first `box-shadow` layer (`None` = no shadow) — the layer the
+    /// box-shadow transition animates (ADR 0027).
+    box_shadow: Option<style::BoxShadow>,
 }
 
 /// One candidate animation, gathered while immutable layout state is
@@ -724,6 +747,9 @@ impl VelquView {
             presentation_causes: Vec::new(),
             structural_causes_dropped: 0,
             presentation_causes_dropped: 0,
+            perf: perf::FramePerf::new(),
+            style_cache: layout::StyleCache::default(),
+            prev_paint: None,
             anim: anim::AnimationEngine::new(),
             pending_style_diffs: std::collections::HashMap::new(),
             transition_phases: Vec::new(),
@@ -1006,6 +1032,9 @@ impl VelquView {
     /// [`VelquView::enable_tailwind`] and on every document load while
     /// enabled; output is a deterministic function of the class list.
     fn rebuild_tailwind(&mut self) {
+        // The generated utility sheet is a cascade input: drop cached
+        // computed styles so the next pass re-matches against it.
+        self.style_cache.invalidate();
         self.tailwind_css = None;
         self.tailwind_diagnostics_list.clear();
         if !self.tailwind_enabled {
@@ -1185,6 +1214,7 @@ impl VelquView {
         self.anim.clear();
         self.pending_style_diffs.clear();
         self.transition_phases.clear();
+        self.style_cache.invalidate();
         self.rebuild_reactive();
         // Utility classes are per-document too: recompile when enabled.
         self.rebuild_tailwind();
@@ -1196,6 +1226,8 @@ impl VelquView {
     /// stylesheets and override the generated utilities at equal
     /// specificity (ADR 0009).
     fn collect_style_blocks(&mut self) {
+        // `<style>` blocks are cascade inputs.
+        self.style_cache.invalidate();
         self.style_blocks.clear();
         let mut blocks: Vec<String> = Vec::new();
         self.dom.walk(|id, _| {
@@ -1255,6 +1287,7 @@ impl VelquView {
     /// Re-parses every stylesheet source (cssparser is fast; sheets are
     /// small). Rule `order` values stay globally consistent across sheets.
     fn rebuild_css(&mut self) {
+        self.style_cache.invalidate();
         let mut order = 0;
         self.parsed_css = self
             .stylesheets
@@ -1320,9 +1353,11 @@ impl VelquView {
         if self.document.is_none() {
             return Err(VelquError::DocumentNotLoaded);
         }
+        self.perf.begin();
         self.frame_index += 1;
         self.prepare_images();
 
+        let css_started = std::time::Instant::now();
         // UA defaults (M2a baseline: body margin, heading sizes, hidden
         // head elements) then author sheets, in order.
         let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
@@ -1351,6 +1386,7 @@ impl VelquView {
             order += parsed.rules.len() as u32;
             parsed_author.push(parsed);
         }
+        self.perf.css_parse = css_started.elapsed();
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
         // Pending style diffs (ADR 0024): structural class/style changes
@@ -1360,6 +1396,7 @@ impl VelquView {
         // animations spawn with correct from-values and the first frame
         // shows the start state, never a jump to the target.
         if !self.pending_style_diffs.is_empty() {
+            let style_started = std::time::Instant::now();
             let interaction = self.interaction_state();
             let root_element = layout::layout_root(&self.dom);
             let styles = layout::compute_all_styles(
@@ -1367,13 +1404,16 @@ impl VelquView {
                 root_element,
                 &mut cascade,
                 Some(&interaction),
+                &mut self.style_cache,
             );
             self.spawn_pending_transition_diffs(&styles);
+            self.perf.style += style_started.elapsed();
         }
         let passes_before = self.layout_passes;
         let repaints_before = self.repaint_passes;
         let mut settled: Vec<u64> = Vec::new();
         if self.structure_dirty || self.cached_layout(viewport).is_none() {
+            self.perf.path = Some(perf::FramePath::Structural);
             // Structural change or new viewport: full layout. The current
             // interaction state feeds stateful selectors so pixels are
             // correct after resize/restyle too (M4b).
@@ -1390,6 +1430,7 @@ impl VelquView {
                 root_element,
                 &mut cascade,
                 Some(&interaction),
+                &mut self.style_cache,
             );
             self.sync_looping_animations(&styles, false);
             self.run_layout(viewport, &mut cascade, Some(&interaction));
@@ -1406,18 +1447,23 @@ impl VelquView {
             }
             self.structure_dirty = false;
         } else if self.presentation_dirty {
+            self.perf.path = Some(perf::FramePath::Presentation);
             // Steady state with a presentation-only change. Recompute
             // styles with the current interaction state, patch the cached
             // tree, re-emit — no Taffy pass (ADR 0011).
             let causes = std::mem::take(&mut self.presentation_causes);
             let dropped = self.presentation_causes_dropped;
             self.presentation_causes_dropped = 0;
+            let presentation_started = std::time::Instant::now();
             self.repaint_presentation(viewport, &mut cascade);
+            self.perf.presentation = presentation_started.elapsed();
             if let Some(seq) =
                 self.trace_invalidation(InvalidationClass::Presentation, causes, dropped)
             {
                 settled.push(seq);
             }
+        } else {
+            self.perf.path = Some(perf::FramePath::Cached);
         }
         // Otherwise nothing changed since the last emitted frame: paint
         // the cached display list unchanged — zero Taffy passes, zero
@@ -1433,13 +1479,23 @@ impl VelquView {
             // Nothing visible (e.g. an all-hidden document): paint the
             // author background only.
             let background = document_background(&parsed_author);
+            let paint_started = std::time::Instant::now();
             let (frame, items, glyphs) = painter::paint_document(
                 &display_list::DisplayList::default(),
                 background,
                 viewport,
                 &mut self.fonts,
+                None,
             )?;
+            self.perf.paint = paint_started.elapsed();
+            self.perf.items = items;
+            self.perf.glyphs = glyphs;
+            self.perf.viewport = (viewport.width(), viewport.height());
+            self.perf.damage_rects = 1;
+            self.perf.damage_area =
+                u64::from(viewport.width()) * u64::from(viewport.height());
             self.display_items_last = items;
+            self.perf.log(self.frame_index);
             return Ok(FrameResult {
                 frame,
                 stats: RenderStats {
@@ -1447,6 +1503,7 @@ impl VelquView {
                     viewport,
                     items,
                     glyphs,
+                    damage: None,
                 },
             });
         }
@@ -1455,9 +1512,86 @@ impl VelquView {
         // Disjoint-field borrows: the laid-out display list (immutable)
         // and the font store (mutable) never overlap.
         let display_list = &self.last_laid.as_ref().expect("checked above").display_list;
-        let (frame, items, glyphs) =
-            painter::paint_document(display_list, background, viewport, &mut self.fonts)?;
+        // Partial damage: diff the display list against the last painted
+        // one (item equality plus transform-resolved bounds — a scroll
+        // moves content while items stay equal); the union of divergent
+        // items' bounds is the repaint window. Everything outside it keeps
+        // the previous frame's pixels.
+        let bounds_now = painter::display_list_bounds(&display_list.items);
+        let previous_state = self.prev_paint.take();
+        let usable = previous_state.filter(|state| {
+            state.viewport
+                == (viewport.width(), viewport.height(), viewport.scale_factor())
+                && state.background == background
+                && state.items.len() == display_list.items.len()
+        });
+        let damage = usable.as_ref().and_then(|state| {
+            let mut union: Option<(i64, i64, i64, i64)> = None;
+            for (index, item) in display_list.items.iter().enumerate() {
+                if *item != state.items[index] || bounds_now[index] != state.bounds[index] {
+                    union = grow_union(union, bounds_now[index]);
+                    union = grow_union(union, state.bounds[index]);
+                }
+            }
+            union.map(|(x0, y0, x1, y1)| {
+                (
+                    x0.clamp(0, i64::from(viewport.width())) as u16,
+                    y0.clamp(0, i64::from(viewport.height())) as u16,
+                    (x1 - x0).clamp(0, i64::from(viewport.width())) as u16,
+                    (y1 - y0).clamp(0, i64::from(viewport.height())) as u16,
+                )
+            })
+        });
+        let previous_pixels = usable.as_ref().zip(damage).map(|(state, (x, y, w, h))| {
+            (
+                state.frame.pixels(),
+                display_list::Rect {
+                    x: f32::from(x),
+                    y: f32::from(y),
+                    w: f32::from(w),
+                    h: f32::from(h),
+                },
+            )
+        });
+        let paint_started = std::time::Instant::now();
+        let (frame, items, glyphs) = painter::paint_document(
+            display_list,
+            background,
+            viewport,
+            &mut self.fonts,
+            previous_pixels,
+        )?;
+        self.perf.paint = paint_started.elapsed();
+        self.perf.items = items;
+        self.perf.glyphs = glyphs;
+        self.perf.viewport = (viewport.width(), viewport.height());
+        match damage {
+            Some((_, _, w, h)) => {
+                self.perf.damage_rects = 1;
+                self.perf.damage_area = u64::from(w) * u64::from(h);
+            }
+            None => {
+                self.perf.damage_rects = 1;
+                self.perf.damage_area =
+                    u64::from(viewport.width()) * u64::from(viewport.height());
+            }
+        }
         self.display_items_last = items;
+        // Seed the next frame's diff: the frame the painter produced is the
+        // full-surface truth (previous pixels + damage repaint).
+        self.prev_paint = Some(PaintedFrame {
+            items: display_list.items.clone(),
+            bounds: bounds_now,
+            background,
+            frame: Frame::from_parts(
+                frame.width(),
+                frame.height(),
+                frame.pixels().to_vec(),
+            ),
+            viewport: (viewport.width(), viewport.height(), viewport.scale_factor()),
+        });
+        let damage_out = damage.filter(|&(_, _, w, h)| w > 0 && h > 0);
+        self.perf.log(self.frame_index);
         Ok(FrameResult {
             frame,
             stats: RenderStats {
@@ -1465,6 +1599,7 @@ impl VelquView {
                 viewport,
                 items,
                 glyphs,
+                damage: damage_out,
             },
         })
     }
@@ -1530,6 +1665,7 @@ impl VelquView {
         interaction: Option<&style::InteractionState>,
     ) {
         let started = std::time::Instant::now();
+        let mut timings = perf::PassTimings::default();
         let laid = layout::layout_document(
             &self.dom,
             viewport,
@@ -1540,9 +1676,16 @@ impl VelquView {
             interaction,
             &self.reactive_hidden,
             self.anim.overrides(),
+            &mut timings,
+            &mut self.style_cache,
         );
+        self.perf.style_in_pass = timings.style;
+        self.perf.build_boxes = timings.boxes;
+        self.perf.taffy = timings.taffy;
+        self.perf.emit = timings.emit;
         self.layout_passes += 1;
         self.layout_duration_last = started.elapsed();
+        self.perf.layout_total = self.layout_duration_last;
         self.layout_nodes_last = laid
             .as_ref()
             .map(|laid| layout::count_box_tree(&laid.root))
@@ -1562,10 +1705,17 @@ impl VelquView {
     /// paint-only fields, and re-emit the display list. Layout geometry,
     /// scroll extents, and the Taffy pass count are untouched.
     fn repaint_presentation(&mut self, _viewport: Viewport, cascade: &mut style::Cascade<'_>) {
+        let style_started = std::time::Instant::now();
         let interaction = self.interaction_state();
         let root_element = layout::layout_root(&self.dom);
-        let mut styles =
-            layout::compute_all_styles(&self.dom, root_element, cascade, Some(&interaction));
+        let mut styles = layout::compute_all_styles(
+            &self.dom,
+            root_element,
+            cascade,
+            Some(&interaction),
+            &mut self.style_cache,
+        );
+        self.perf.style += style_started.elapsed();
         // Transition differ (ADR 0024): compare the fresh targets against
         // the cached box styles (the previous on-screen values) and spawn
         // animations for covered, changed properties. Then the overrides
@@ -1620,6 +1770,7 @@ impl VelquView {
                     border_color: box_node.style.border_color,
                     color: box_node.style.color,
                     transform: box_node.style.transform,
+                    box_shadow: box_node.style.box_shadows.first().copied(),
                 },
             );
         }
@@ -1648,13 +1799,20 @@ impl VelquView {
         {
             return;
         }
-        self.anim.start(
-            spawn.node,
-            spawn.property,
-            spawn.spec.delay,
-            spawn.spec.duration,
-            spawn.spec.easing,
-        );
+        // ADR 0027: a `spring(...)` timing function starts the physical
+        // driver (duration is emergent); otherwise the timed curve path.
+        match spawn.spec.spring {
+            Some(spring) => self
+                .anim
+                .start_spring(spawn.node, spawn.property, spawn.spec.delay, spring),
+            None => self.anim.start(
+                spawn.node,
+                spawn.property,
+                spawn.spec.delay,
+                spawn.spec.duration,
+                spawn.spec.easing,
+            ),
+        }
     }
 
     /// Diffs fresh cascade output against the cached box styles and
@@ -1735,6 +1893,20 @@ impl VelquView {
                     property: anim::AnimProperty::Transform {
                         from: cached.transform,
                         to: fresh.transform,
+                    },
+                    spec,
+                });
+            }
+            // The first shadow layer transitions (ADR 0027); absent layers
+            // animate to/from the transparent no-shadow value.
+            let cached_shadow = cached.box_shadows.first().copied();
+            let fresh_shadow = fresh.box_shadows.first().copied();
+            if cached_shadow != fresh_shadow {
+                spawns.push(PendingSpawn {
+                    node: *node,
+                    property: anim::AnimProperty::BoxShadow {
+                        from: cached_shadow.unwrap_or(style::BoxShadow::NONE),
+                        to: fresh_shadow.unwrap_or(style::BoxShadow::NONE),
                     },
                     spec,
                 });
@@ -1849,6 +2021,17 @@ impl VelquView {
                     property: anim::AnimProperty::Transform {
                         from: snapshot.transform,
                         to: fresh.transform,
+                    },
+                    spec,
+                });
+            }
+            let fresh_shadow = fresh.box_shadows.first().copied();
+            if snapshot.box_shadow != fresh_shadow {
+                self.consider_transition_start(PendingSpawn {
+                    node,
+                    property: anim::AnimProperty::BoxShadow {
+                        from: snapshot.box_shadow.unwrap_or(style::BoxShadow::NONE),
+                        to: fresh_shadow.unwrap_or(style::BoxShadow::NONE),
                     },
                     spec,
                 });
@@ -1977,6 +2160,14 @@ impl VelquView {
         self.anim.has_active()
     }
 
+    /// Whether any layout-affecting animation (width/height) is in flight —
+    /// the host's fast-frame signal: hosts run their shortest cadence while
+    /// this is true (a morph moves the silhouette every tick) and the
+    /// ambient cadence otherwise.
+    pub fn has_layout_animation(&self) -> bool {
+        self.anim.has_layout_animation()
+    }
+
     /// Debug: lists active animations as (node, property-kind) pairs.
     pub fn active_animations_debug(&self) -> Vec<(usize, String)> {
         self.anim
@@ -2063,6 +2254,7 @@ impl VelquView {
             injected_phase_classes(&base, &utilities, &state),
         );
         self.rebuild_tailwind();
+        self.style_cache.invalidate();
         self.note_structural_cause("vx-transition phase swap");
         self.mark_structure_dirty();
     }
@@ -2073,6 +2265,7 @@ impl VelquView {
     fn complete_phase(&mut self, phase: TransitionPhase) {
         if matches!(phase.kind, TransitionPhaseKind::Leaving) {
             self.reactive_hidden.insert(phase.node);
+            self.style_cache.invalidate();
             // A hidden node has no boxes; any straggler capture is dead.
             self.pending_style_diffs.remove(&phase.node);
         } else {
@@ -2302,12 +2495,48 @@ impl VelquView {
     /// Lays the current document out and returns fixture-facing facts.
     ///
     /// Runs the same cascade+layout pass as [`VelquView::render`] minus
-    /// painting. Keys are `data-vv-test` values (ADR 0005).
+    /// painting — **only when the cached layout cannot answer**: a clean
+    /// structure with a matching viewport reads the cached pass, so hosts
+    /// polling facts every frame (mascot compositing, input regions) cost
+    /// a tree walk, not a relayout. Presentation-only changes never alter
+    /// facts (they patch paint fields; geometry and the box set stand).
+    /// Keys are `data-vv-test` values (ADR 0005).
     pub fn layout_facts(&mut self, viewport: Viewport) -> Result<LayoutFacts, VelquError> {
         if self.document.is_none() {
             return Err(VelquError::DocumentNotLoaded);
         }
-        self.prepare_images();
+        if self.structure_dirty || self.cached_layout(viewport).is_none() {
+            self.prepare_images();
+            self.layout_facts_relayout(viewport)?;
+        }
+        let Some(laid) = self.last_laid.as_ref() else {
+            return Ok(LayoutFacts {
+                schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
+                viewport_width: viewport.width(),
+                viewport_height: viewport.height(),
+                scale: viewport.scale_factor(),
+                nodes: Vec::new(),
+                document_scroll_width: viewport.width() as f32,
+                document_scroll_height: viewport.height() as f32,
+            });
+        };
+
+        let mut facts = LayoutFacts {
+            schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
+            viewport_width: viewport.width(),
+            viewport_height: viewport.height(),
+            scale: viewport.scale_factor(),
+            nodes: Vec::new(),
+            document_scroll_width: laid.document_scroll.width,
+            document_scroll_height: laid.document_scroll.height,
+        };
+        layout::collect_facts(&self.dom, &laid.root, viewport, &mut facts);
+        Ok(facts)
+    }
+
+    /// The full cascade+layout pass behind [`VelquView::layout_facts`]
+    /// (the cold path).
+    fn layout_facts_relayout(&mut self, viewport: Viewport) -> Result<(), VelquError> {
         let ua_sheet = StylesheetSource::new("velqu:ua", UA_STYLESHEET);
         let ua_parsed = css::parse(&ua_sheet, 0);
         let mut order = ua_parsed.rules.len() as u32;
@@ -2333,28 +2562,7 @@ impl VelquView {
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
         self.run_layout(viewport, &mut cascade, None);
-        let Some(laid) = self.last_laid.as_ref() else {
-            return Ok(LayoutFacts {
-                schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
-                viewport_width: viewport.width(),
-                viewport_height: viewport.height(),
-                scale: viewport.scale_factor(),
-                nodes: Vec::new(),
-                document_scroll_width: viewport.width() as f32,
-                document_scroll_height: viewport.height() as f32,
-            });
-        };
-        let mut facts = LayoutFacts {
-            schema_version: layout::LAYOUT_FACTS_SCHEMA_VERSION,
-            viewport_width: viewport.width(),
-            viewport_height: viewport.height(),
-            scale: viewport.scale_factor(),
-            nodes: Vec::new(),
-            document_scroll_width: laid.document_scroll.width,
-            document_scroll_height: laid.document_scroll.height,
-        };
-        layout::collect_facts(&self.dom, &laid.root, viewport, &mut facts);
-        Ok(facts)
+        Ok(())
     }
 
     /// Sets the scroll offset of a scroll container (ADR 0008).
@@ -2553,6 +2761,9 @@ impl VelquView {
             });
         }
         self.hover = hit;
+        // Interaction selectors match on hover identity: the cache keys
+        // must not survive a hover change.
+        self.style_cache.invalidate();
         // :hover styling changes pixels only when a sheet matches on it.
         if self.interaction_paint() {
             self.presentation_dirty = true;
@@ -2631,6 +2842,10 @@ impl VelquView {
             }
         }
         let changed = before != self.pressed;
+        if changed {
+            // `:active` matching input changed.
+            self.style_cache.invalidate();
+        }
         if changed && self.interaction_paint() {
             // :active styling changes pixels only when a sheet matches
             // on it (a control press dirties via its caret placement).
@@ -2651,6 +2866,8 @@ impl VelquView {
         let Some(pressed) = self.pressed.take() else {
             return false;
         };
+        // `:active` matching input changed.
+        self.style_cache.invalidate();
         // The release clears `:active`; pixels change only when a sheet
         // matches on it. A click's focus side effects dirty on their own.
         if self.interaction_paint() {
@@ -2937,6 +3154,8 @@ impl VelquView {
         let from = self.focus.take().map(|node| self.node_target(node));
         self.focus = to;
         self.focus_origin = Some(origin);
+        // `:focus` matching input changed.
+        self.style_cache.invalidate();
         // :focus styling changes pixels only when a sheet matches on it;
         // moving focus to or from a control always repaints (the caret's
         // editor paint reads focus).
@@ -3337,6 +3556,7 @@ impl VelquView {
     pub fn pointer_exit(&mut self) {
         self.pointer_pos = None;
         if let Some(old) = self.hover.take() {
+            self.style_cache.invalidate();
             self.events.push(Event::PointerLeave {
                 target: self.node_target(old),
             });
@@ -4745,6 +4965,11 @@ impl VelquView {
             self.rebuild_control_presentation();
             self.note_presentation_cause("reactive control update");
         }
+        // Attribute/text/visibility edits change cascade matching inputs
+        // (SetControlValue is editor runtime state — no selector reads it).
+        if structural || tailwind {
+            self.style_cache.invalidate();
+        }
     }
 
     /// Validates and (if valid) applies: the initial-batch path. Turn
@@ -4849,6 +5074,46 @@ fn control_label(kind: control::ControlKind) -> &'static str {
         control::ControlKind::InputText => "input",
         control::ControlKind::Textarea => "textarea",
     }
+}
+
+/// The previous frame's paint state (partial-damage diff input).
+struct PaintedFrame {
+    /// The display list as painted (item equality against the next frame).
+    items: Vec<display_list::DisplayItem>,
+    /// Index-aligned device-pixel bounds (see
+    /// `painter::display_list_bounds`).
+    bounds: Vec<display_list::Rect>,
+    /// The document background that was painted with the frame.
+    background: Color,
+    /// The full-surface frame (previous pixels + damage repaint).
+    frame: Frame,
+    /// The viewport the frame was rendered into (mismatch = full repaint).
+    viewport: (u32, u32, f32),
+}
+
+/// Grows a half-open integer rect union with one bound.
+fn grow_union(
+    union: Option<(i64, i64, i64, i64)>,
+    rect: display_list::Rect,
+) -> Option<(i64, i64, i64, i64)> {
+    if rect.w <= 0.0 || rect.h <= 0.0 {
+        return union;
+    }
+    let (x0, y0, x1, y1) = (
+        rect.x.floor() as i64,
+        rect.y.floor() as i64,
+        (rect.x + rect.w).ceil() as i64,
+        (rect.y + rect.h).ceil() as i64,
+    );
+    Some(match union {
+        None => (x0, y0, x1, y1),
+        Some((ux0, uy0, ux1, uy1)) => (
+            ux0.min(x0),
+            uy0.min(y0),
+            ux1.max(x1),
+            uy1.max(y1),
+        ),
+    })
 }
 
 /// Trace label for one mutation kind (attempted-mutation summaries).

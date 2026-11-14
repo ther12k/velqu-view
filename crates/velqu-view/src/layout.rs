@@ -234,6 +234,15 @@ pub(crate) fn apply_animation_overrides(
         if let Some(transform) = override_values.transform {
             style.transform = transform;
         }
+        // The first shadow layer animates (ADR 0027); deeper layers stay
+        // static. An element with no authored shadow grows one.
+        if let Some(shadow) = override_values.box_shadow {
+            if style.box_shadows.is_empty() {
+                style.box_shadows = vec![shadow];
+            } else {
+                style.box_shadows[0] = shadow;
+            }
+        }
     }
 }
 
@@ -246,26 +255,102 @@ pub(crate) fn compute_all_styles(
     root: NodeId,
     cascade: &mut crate::style::Cascade<'_>,
     interaction: Option<&crate::style::InteractionState>,
+    cache: &mut StyleCache,
 ) -> StyleMap {
     let mut map = StyleMap::new();
-    walk_styles(dom, root, None, cascade, interaction, &mut map);
+    walk_styles(dom, root, None, 0, cascade, interaction, &mut map, cache);
     map
+}
+
+/// The per-document cascade cache. During animation frames the tree's
+/// attributes and sheets are frozen, so every node but the animating ones
+/// recomputes to the same style — keyed exactly, never guessed: the parent
+/// part of the key is the *identity id* of the parent's computed style (a
+/// monotonic counter per epoch, never an address, so a freed entry can
+/// never alias), and the self part carries the node id plus its full
+/// attribute text. Anything that could change matching (attribute/text
+/// edits, sheet swaps, interaction changes, hidden-set flips) invalidates
+/// the epoch, which drops every entry in one clear.
+#[derive(Debug, Default)]
+pub(crate) struct StyleCache {
+    entries: std::collections::HashMap<StyleCacheKey, (u64, std::rc::Rc<ComputedStyle>)>,
+    next_id: u64,
+}
+
+/// One cache lookup key. Exact, not hashed: `tag_attrs` is the attribute
+/// text itself.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct StyleCacheKey {
+    node: NodeId,
+    /// Identity of the parent's computed style (0 = none).
+    parent: u64,
+    /// Tag name plus every attribute `name=value` pair, in DOM order.
+    tag_attrs: String,
+}
+
+impl StyleCache {
+    /// Drops every entry (some matching input changed). Ids restart so the
+    /// namespace stays small.
+    pub(crate) fn invalidate(&mut self) {
+        self.entries.clear();
+        self.next_id = 0;
+    }
 }
 
 fn walk_styles(
     dom: &Dom,
     id: NodeId,
     parent: Option<&ComputedStyle>,
+    parent_key: u64,
     cascade: &mut crate::style::Cascade<'_>,
     interaction: Option<&crate::style::InteractionState>,
     map: &mut StyleMap,
+    cache: &mut StyleCache,
 ) {
     if !matches!(dom.node(id).data, NodeData::Element { .. }) {
         return;
     }
-    let style = cascade.compute(dom, id, parent, interaction);
+    // Exact key: node id + parent style identity + tag + full attribute
+    // text. Two frames of a static tree produce identical keys; an
+    // attribute edit (class/style/vx-*) produces a different one.
+    let mut tag_attrs = String::new();
+    if let NodeData::Element { name, attrs, .. } = &dom.node(id).data {
+        tag_attrs.push_str(name.as_str());
+        for attr in attrs {
+            tag_attrs.push_str(&attr.name);
+            tag_attrs.push('=');
+            tag_attrs.push_str(&attr.value);
+            tag_attrs.push('\u{1}');
+        }
+    }
+    let key = StyleCacheKey {
+        node: id,
+        parent: parent_key,
+        tag_attrs,
+    };
+    let cached = cache.entries.get(&key).cloned();
+    let (style_key, style_rc) = match cached {
+        Some(hit) => hit,
+        None => {
+            let style = cascade.compute(dom, id, parent, interaction);
+            cache.next_id += 1;
+            let entry = (cache.next_id, std::rc::Rc::new(style));
+            cache.entries.insert(key, entry.clone());
+            entry
+        }
+    };
+    let style: ComputedStyle = (*style_rc).clone();
     for &child in &dom.node(id).children {
-        walk_styles(dom, child, Some(&style), cascade, interaction, map);
+        walk_styles(
+            dom,
+            child,
+            Some(&style),
+            style_key,
+            cascade,
+            interaction,
+            map,
+            cache,
+        );
     }
     map.insert(id, style);
 }
@@ -636,14 +721,22 @@ pub(crate) fn layout_document(
     interaction: Option<&crate::style::InteractionState>,
     hidden: &std::collections::HashSet<NodeId>,
     overrides: &crate::anim::PropertyOverrideMap,
+    timings: &mut crate::perf::PassTimings,
+    cache: &mut StyleCache,
 ) -> Option<LaidOutDocument> {
     let root_element = layout_root(dom);
 
-    let mut styles = compute_all_styles(dom, root_element, cascade, interaction);
+    let phase = std::time::Instant::now();
+    let mut styles = compute_all_styles(dom, root_element, cascade, interaction, cache);
+    timings.style = phase.elapsed();
     apply_animation_overrides(&mut styles, overrides);
+    let phase = std::time::Instant::now();
     let mut root = build_boxes(dom, root_element, &styles, images, hidden)?;
+    timings.boxes = phase.elapsed();
 
+    let phase = std::time::Instant::now();
     crate::taffy_backend::layout_box_tree(&mut root, viewport, fonts, scroll_offsets);
+    timings.taffy = phase.elapsed();
 
     // Scroll extents are derived from laid-out geometry only — no second
     // Taffy pass, and offsets never alter the geometry (ADR 0008).
@@ -664,7 +757,9 @@ pub(crate) fn layout_document(
         (viewport.width() as f32, viewport.height() as f32),
     );
 
+    let phase = std::time::Instant::now();
     let list = build_display_list(&root, viewport.scale_factor(), document_offset_clamped);
+    timings.emit = phase.elapsed();
     Some(LaidOutDocument {
         root,
         display_list: list,
@@ -838,6 +933,16 @@ fn emit_box(
                 color: style.background_color,
             });
         }
+    }
+    // A `background-image` gradient paints over the color inside the same
+    // padding box (CSS order: images above background-color). Geometry
+    // resolves here, where the padding box is final in device px.
+    if let Some(gradient) = &style.background_image {
+        list.items.push(DisplayItem::GradientFill {
+            rect: node.padding_box,
+            radius,
+            gradient: gradient.resolve(&node.padding_box),
+        });
     }
     if style.border_style_solid {
         // Border widths derive from the laid-out boxes so they always
@@ -1230,6 +1335,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         let mut facts = LayoutFacts {
@@ -1350,6 +1457,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1407,6 +1516,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         let list = &laid.display_list;
@@ -1714,6 +1825,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         let (root, list) = (&laid.root, &laid.display_list);
@@ -1889,6 +2002,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         let pane = &laid.root.children[0];
@@ -1905,6 +2020,8 @@ mod tests {
             None,
             &std::collections::HashSet::new(),
             &std::collections::HashMap::new(),
+            &mut crate::perf::PassTimings::default(),
+            &mut StyleCache::default(),
         )
         .unwrap();
         assert_eq!(plain.root.children[0].applied_scroll, (0.0, 0.0));
