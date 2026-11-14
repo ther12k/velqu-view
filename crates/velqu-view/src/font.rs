@@ -134,15 +134,18 @@ impl FontStore {
         }
     }
 
-    /// Ascent (distance above the baseline) in device pixels for `px`-sized text.
-    /// Unused since layout centers text with constant metric ratios (layout.rs);
-    /// kept for the M2b text overhaul which needs real font metrics.
-    #[allow(dead_code)]
-    pub(crate) fn ascent(&self, face: usize, px: u16) -> f32 {
+    /// The face's vertical metrics at `px`: ascent (≥ 0, above the
+    /// baseline) and descent (≤ 0, below) — from the font's horizontal
+    /// (hhea) metrics, the ones horizontal text layout uses (Latin fonts
+    /// rarely carry vmtx). Text baselines center this content range in
+    /// the line box (layout.rs), matching the painter's baseline
+    /// semantics; a face without metrics falls back to a constant model
+    /// so unknown families keep the old behavior.
+    pub(crate) fn verticals(&self, face: usize, px: u16) -> (f32, f32) {
         self.faces[face]
-            .vertical_line_metrics(px as f32)
-            .map(|line| line.ascent)
-            .unwrap_or(px as f32 * 0.8)
+            .horizontal_line_metrics(px as f32)
+            .map(|line| (line.ascent, line.descent))
+            .unwrap_or((px as f32 * 0.8, px as f32 * -0.2))
     }
 
     /// Returns the rasterized glyph for `ch`, caching by face + pixel size.

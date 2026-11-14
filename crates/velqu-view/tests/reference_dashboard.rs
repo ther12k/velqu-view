@@ -11,11 +11,11 @@ use std::path::PathBuf;
 
 // Reviewed-then-frozen raster digests (docs/reference-dashboard.md);
 // regeneration instructions live there.
-const M7_INITIAL_DIGEST: &str = "aae5ab545da6c915a762bc911325a7b2c24bbf0b9d43c5db7eaa84268263b461";
-const M7_EDITED_DIGEST: &str = "8601629cb7e85fc2ec00309834086cc896ed5b496b02128c88840e5b86c31f86";
-const M7_EMPTY_DIGEST: &str = "8f2c26f9553e20e1c0cbd1b3c9008082e27c5d9a5bdbe1807a45c46754d392be";
-const M7_SCROLLED_DIGEST: &str = "2e39f80b41a29e913ea621fd7f9c8e70e2189c3fd3cc5683055c62c69cd1bf30";
-const M7_SMALL_DIGEST: &str = "6b6d38a3b162bf0c310f1a0b2133d43bae5b05a71c686607e966b062821f5a9a";
+const M7_INITIAL_DIGEST: &str = "1db6af3b5e298ec65f96ebf58e7e86d0760708f319c7ee4eade78bd3baf7ca60";
+const M7_EDITED_DIGEST: &str = "027cbd29bf3c67be927c59c0018240f67019ebaed76d744534eaad5bec5c29d5";
+const M7_EMPTY_DIGEST: &str = "a17090a757382ed3d6429560cc1e88ca0dfeb955ad249f2e97272be578dc0ecf";
+const M7_SCROLLED_DIGEST: &str = "8794bce8d885a7f9e25909e86e4a6ccceca051f259d352d83a448645fd0b3066";
+const M7_SMALL_DIGEST: &str = "5cced363ea5730bed5f4e25e658671aa2ab8126fac9cae8ff4d9d7e7d05d3ab3";
 
 use velqu_reactive::ReactiveValue;
 use velqu_view::{Event, KeyCommand, KeyModifiers, ReloadStage, VelquView, Viewport};

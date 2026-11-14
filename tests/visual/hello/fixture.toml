@@ -9,7 +9,7 @@ viewport = { width = 800, height = 600, scale = 1.0 }
 [expect]
 # SHA-256 of the RGBA buffer; regenerate with
 #   cargo run -p velqu-lab -- --headless --size 800x600 examples/hello
-pixels_sha256 = "b6af24a4dce1af41aa69e601bdfb182f7c8c11e57d4963877c07770f8f76b91a"
+pixels_sha256 = "014c18d9f2f96e6a89dd32a192f41d9b2b4eeb15d5cf20a39f818ce5b2d9a65c"
 
 # Exact-color probes: page background, card fill, card border.
 [[expect.pixel]]

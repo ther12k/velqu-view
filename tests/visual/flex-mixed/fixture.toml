@@ -5,7 +5,7 @@ css = ["examples/flex-mixed/app.css"]
 viewport = { width = 400, height = 300, scale = 1.0 }
 
 [expect]
-pixels_sha256 = "aee6e6ccc26e53fee52cfd9627945c5bfc548907dc0d9cfa8b4aa22df5a954a3"
+pixels_sha256 = "fa34ea489872a721bcd6448c9b64a32e550699e5cc7f0c4e94cd436c32511784"
 
 [[expect.facts]]
 id = "mix"

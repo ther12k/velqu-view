@@ -2528,8 +2528,13 @@ impl VelquView {
             scale,
         );
         let offset = laid.root_offset;
-        laid.display_list =
-            layout::build_display_list_with_controls(&laid.root, scale, offset, Some(&items));
+        laid.display_list = layout::build_display_list_with_controls(
+            &self.fonts,
+            &laid.root,
+            scale,
+            offset,
+            Some(&items),
+        );
         self.control_geometry = geometry;
         self.presentation_dirty = true;
     }

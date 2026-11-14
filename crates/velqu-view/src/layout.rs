@@ -297,6 +297,7 @@ impl StyleCache {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one pass, parent id + cache are load-bearing
 fn walk_styles(
     dom: &Dom,
     id: NodeId,
@@ -758,7 +759,7 @@ pub(crate) fn layout_document(
     );
 
     let phase = std::time::Instant::now();
-    let list = build_display_list(&root, viewport.scale_factor(), document_offset_clamped);
+    let list = build_display_list(fonts, &root, viewport.scale_factor(), document_offset_clamped);
     timings.emit = phase.elapsed();
     Some(LaidOutDocument {
         root,
@@ -784,24 +785,26 @@ pub(crate) fn layout_root(dom: &Dom) -> NodeId {
 /// with the document-level transform when the page is scrolled (the
 /// viewport is the document scroller's scrollport, so no root clip scope).
 pub(crate) fn build_display_list(
+    fonts: &FontStore,
     root: &BoxNode,
     scale: f32,
     document_offset: (f32, f32),
 ) -> DisplayList {
-    build_display_list_with_controls(root, scale, document_offset, None)
+    build_display_list_with_controls(fonts, root, scale, document_offset, None)
 }
 
 /// Emits a display list with runtime control paint items layered into the
 /// structural box paint order. Control items are presentation-only and never
 /// participate in layout or structural facts.
 pub(crate) fn build_display_list_with_controls(
+    fonts: &FontStore,
     root: &BoxNode,
     scale: f32,
     document_offset: (f32, f32),
     controls: Option<&std::collections::HashMap<NodeId, Vec<DisplayItem>>>,
 ) -> DisplayList {
     let mut list = DisplayList::default();
-    emit_box(root, &mut list, None, scale, controls);
+    emit_box(fonts, root, &mut list, None, scale, controls);
     if document_offset != (0.0, 0.0) {
         list.items.insert(
             0,
@@ -862,6 +865,7 @@ pub(crate) fn element_transform_matrix(node: &BoxNode, scale: f32) -> Affine2D {
 /// clipping; the painter executes. `scale` converts logical style values
 /// (border-radius) into the device-pixel metric space.
 fn emit_box(
+    fonts: &FontStore,
     node: &BoxNode,
     list: &mut DisplayList,
     parent_clip: Option<Rect>,
@@ -1042,8 +1046,17 @@ fn emit_box(
     };
     for line in &node.lines {
         for run in &line.runs {
-            // Baseline: center the font's ink range in the line box.
-            let (ascent, descent) = font_verticals(run.px);
+            // Baseline: center the run's font content area (ascent..descent,
+            // the face's real vertical metrics) in the line box — the same
+            // face mapping the painter uses, so the model that measures the
+            // box and the one that places glyphs agree.
+            let weight = if run.bold {
+                crate::font::FontWeight::Bold
+            } else {
+                crate::font::FontWeight::Regular
+            };
+            let face = fonts.face_index(run.family.as_deref(), weight);
+            let (ascent, descent) = fonts.verticals(face, run.px);
             let ink = ascent - descent;
             let baseline = origin_y + line.y + (line.height - ink) / 2.0 + ascent;
             list.items.push(DisplayItem::TextRun {
@@ -1065,7 +1078,7 @@ fn emit_box(
     match style.overflow_y {
         crate::style::Overflow::Visible => {
             for child in &node.children {
-                emit_box(child, list, parent_clip, scale, controls);
+                emit_box(fonts, child, list, parent_clip, scale, controls);
             }
         }
         crate::style::Overflow::Hidden | crate::style::Overflow::Clip => {
@@ -1078,7 +1091,7 @@ fn emit_box(
                 list.items.push(DisplayItem::PushClip(node.padding_box));
             }
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box), scale, controls);
+                emit_box(fonts, child, list, Some(node.padding_box), scale, controls);
             }
             list.items.push(DisplayItem::PopClip);
         }
@@ -1096,7 +1109,7 @@ fn emit_box(
                 matrix: Affine2D::translation(-ox, -oy),
             });
             for child in &node.children {
-                emit_box(child, list, Some(node.padding_box), scale, controls);
+                emit_box(fonts, child, list, Some(node.padding_box), scale, controls);
             }
             list.items.push(DisplayItem::PopTransform);
             list.items.push(DisplayItem::PopClip);
@@ -1116,10 +1129,6 @@ fn emit_box(
 /// DejaVu's vertical metric ratios (ascent, |descent| per px); used only
 /// for line-box centering. Exact font metrics arrive with the M2b text
 /// overhaul; the constant keeps layout deterministic.
-fn font_verticals(px: u16) -> (f32, f32) {
-    (0.928 * px as f32, 0.236 * px as f32)
-}
-
 /// Collects [`LayoutFacts`] for every `data-vv-test` element in the tree.
 pub(crate) fn collect_facts(
     dom: &Dom,

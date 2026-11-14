@@ -13,7 +13,7 @@ height = 120
 scale = 1.0
 
 [expect]
-pixels_sha256 = "bc9eebfe076c8e1f749c2da51b8bf1ef0e701d0969deb2406a48d2a78189857f"
+pixels_sha256 = "54463308eca95a845f0975b13f886abec9e7c4f1be6ca37b373b1744773e7053"
 
 [[expect.facts]]
 id = "outer"

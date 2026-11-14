@@ -17,7 +17,7 @@ scale = 1.0
 # Migration (M3 review fixes): corners now paint rounded — `rounded-lg`
 # clips the card's corners, so the old corner pixel shows page background.
 # Facts unchanged; only the corner raster moved.
-pixels_sha256 = "9345f1ad336b3f76be0c937f5790dcbd628a72d9034fe073d9ebad724dd44093"
+pixels_sha256 = "a7a446d6d4f3f8978dd49a45d515024d9b6763c61201a42b38dc1c0fe88ac2eb"
 
 [[expect.facts]]
 id = "card"
@@ -56,9 +56,11 @@ color = "#f1f5f9"
 pos = [16, 60]
 color = "#e5e7eb"
 
-# Card interior: white.
+# Card interior: white (above the heading's cap line — the baseline
+# model centers the real font metrics, so the ink sits ~2px higher than
+# the pre-ADR-0026 constant-ratio render).
 [[expect.pixel]]
-pos = [100, 60]
+pos = [100, 45]
 color = "#FFFFFF"
 
 [[expect.pixel]]

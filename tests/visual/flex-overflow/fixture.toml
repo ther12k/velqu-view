@@ -7,7 +7,7 @@ css = ["examples/flex-overflow/app.css"]
 viewport = { width = 400, height = 300, scale = 1.0 }
 
 [expect]
-pixels_sha256 = "6e70f3f5a6bdd2fd76c103365e788b5131623100578c533aca6e4ec209fcd9f4"
+pixels_sha256 = "c975ec54be9fa30e973d1dc4730f31e1d74f6795d9ac4674dbe2c0febcd7eb8e"
 
 # Layout truth: the child keeps its full 300px width.
 [[expect.facts]]

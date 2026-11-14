@@ -19,7 +19,7 @@ height = 180
 color = "#6366f1"
 
 [expect]
-pixels_sha256 = "27ec7eb1c1ea71b886a4dbef8c3f1fea37474f1292c2acce5d76d7a259445093"
+pixels_sha256 = "52011cbb0d998252571fe213adf8575d16a4ff07dab442968a20eb26f38480c4"
 
 [[expect.facts]]
 id = "grid"
