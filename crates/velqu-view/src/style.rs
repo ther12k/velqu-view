@@ -25,7 +25,7 @@ use crate::anim::{Easing, PropKind, SpringSpec};
 use crate::color::Color;
 use crate::css::{Combinator, Declaration, Rule, Selector, Simple, Specificity, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
-use crate::gradient::{parse_gradient, Gradient};
+use crate::gradient::{Gradient, parse_gradient};
 
 /// A resolved CSS length (percentages preserved for layout resolution).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1644,7 +1644,7 @@ fn apply_declaration(
             } else {
                 diagnostics.push(unsupported("transition-timing-function value"));
             }
-        },
+        }
         "animation" => match declaration.value.trim() {
             val if val.starts_with("spin") => style.animation = AnimationKind::Spin,
             val if val.starts_with("pulse") => style.animation = AnimationKind::Pulse,

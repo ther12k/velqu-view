@@ -1,7 +1,8 @@
-// Text centering regression (ADR 0026 follow-up): a flex-centered 10px
-// line in a 32px pill must place its ink within ~1px of the box center —
-// the baseline model uses the face's real hhea metrics (font.rs
-// `verticals`), not the old constant ratios that sat text ~2px low.
+//! Text centering regression (ADR 0026 follow-up): a flex-centered 10px
+//! line in a 32px pill must place its ink within ~1px of the box center.
+//! The baseline uses the face's real hhea metrics, not the old constant
+//! ratios that sat text ~2px low.
+
 use velqu_view::{VelquView, Viewport};
 
 #[test]

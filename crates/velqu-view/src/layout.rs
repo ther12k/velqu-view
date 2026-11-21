@@ -119,8 +119,10 @@ pub(crate) struct TextOrigin {
 /// A block box: geometry plus inline content lines.
 #[derive(Debug, Clone)]
 pub(crate) struct BoxNode {
-    #[allow(dead_code)] // identity retained for future invalidation work
     pub node: NodeId,
+    /// Anonymous flex text uses its parent's DOM identity for hit testing,
+    /// but is not an element box and has no authored style of its own.
+    pub(crate) anonymous_flex_text: bool,
     pub fixture_id: Option<String>,
     /// The element's `id` attribute, if any — the runtime scroll-target
     /// identity (ADR 0008). Test fixtures keep using `data-vv-test`.
@@ -383,6 +385,7 @@ pub(crate) fn build_boxes(
         });
     let mut box_node = BoxNode {
         node: root,
+        anonymous_flex_text: false,
         fixture_id: dom.fixture_id(root).map(str::to_owned),
         element_id: dom.attribute(root, "id").map(str::to_owned),
         tag: dom.tag_name(root).unwrap_or("?").to_owned(),
@@ -407,134 +410,33 @@ pub(crate) fn build_boxes(
         return Some(box_node);
     }
 
-    let mut pending_space_before = false;
-    // Flex containers make a flex item out of every child: contiguous
-    // inline runs become one anonymous block item (CSS Flexbox §4
-    // "anonymous flex items"), never flattened into the container's own
-    // word list — flattening there both drops the box (empty spans) and
-    // reorders content (words paint before/after items arbitrarily).
-    // Grid containers keep the words-in-parent behavior for inline
-    // children (the grid-nested fixture depends on it); block
-    // containers unchanged.
-    let itemifies_children = style.display == Display::Flex;
-    let mut anonymous_run: Option<BoxNode> = None;
-    // Runs of inline content flush here when the parent itemifies.
-    fn flush_anonymous_run(run: &mut Option<BoxNode>, children: &mut Vec<BoxNode>) {
-        // The run's style is already a flex row (set at construction) —
-        // it must NOT be forced to block here, or multi-child runs (e.g.
-        // EQ-bar spans, inline button groups) stack vertically.
-        if let Some(item) = run.take() {
-            children.push(item);
-        }
-    }
-    for &child in &dom.node(root).children {
-        if itemifies_children {
+    if style.display == Display::Flex {
+        // Each element box (including inline spans) participates directly.
+        // Only runs of direct text get anonymous items (Flexbox §4). Flush
+        // before the next visible element so geometry and paint stay in
+        // source order. Comments and hidden elements produce no boxes and
+        // don't interrupt a text run.
+        let mut text_run = String::new();
+        for &child in &dom.node(root).children {
             match &dom.node(child).data {
                 NodeData::Element { .. } => {
-                    let display = styles
-                        .get(&child)
-                        .map(|s| s.display)
-                        .unwrap_or(Display::Inline);
-                    match display {
-                        Display::None => {}
-                        Display::Block | Display::Flex | Display::Grid => {
-                            flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
-                            {
-                                box_node.children.push(child_box);
-                            }
-                        }
-                        // Replaced elements are real boxes everywhere,
-                        // even where display is inline.
-                        _ if dom.tag_name(child) == Some("img") => {
-                            flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
-                            {
-                                box_node.children.push(child_box);
-                            }
-                        }
-                        // An inline element becomes (joins) the current
-                        // anonymous item instead of dissolving into the
-                        // container's words. The item itself is a flex
-                        // ROW (inline-flow semantics for box children) —
-                        // a plain block would stack them vertically —
-                        // inheriting the parent's cross-alignment and
-                        // gap, which were authored for these children.
-                        _ => {
-                            if let Some(child_box) = build_boxes(dom, child, styles, images, hidden)
-                            {
-                                let run = anonymous_run.get_or_insert_with(|| {
-                                    let mut run_style = style.clone();
-                                    run_style.display = Display::Flex;
-                                    run_style.flex_direction = crate::style::FlexDirection::Row;
-                                    run_style.align_items = style.align_items;
-                                    run_style.row_gap = style.row_gap;
-                                    run_style.column_gap = style.column_gap;
-                                    run_style.justify_content =
-                                        crate::style::JustifyContent::default();
-                                    BoxNode {
-                                        node: root,
-                                        fixture_id: None,
-                                        element_id: None,
-                                        tag: "#anonymous".to_owned(),
-                                        style: run_style,
-                                        children: Vec::new(),
-                                        lines: Vec::new(),
-                                        content: Rect::default(),
-                                        padding_box: Rect::default(),
-                                        border_box: Rect::default(),
-                                        margin: crate::style::Sides::default(),
-                                        words: Vec::new(),
-                                        text_origin: None,
-                                        replaced: None,
-                                        control: crate::control::kind_for_node(dom, root),
-                                        scroll: None,
-                                        applied_scroll: (0.0, 0.0),
-                                    }
-                                });
-                                run.children.push(child_box);
-                            }
-                        }
+                    if let Some(child_box) = build_boxes(dom, child, styles, images, hidden) {
+                        push_anonymous_flex_text(&mut box_node, &text_run);
+                        text_run.clear();
+                        box_node.children.push(child_box);
                     }
                 }
-                NodeData::Text(raw) => {
-                    // Non-whitespace text in an itemifying container gets
-                    // an anonymous block item of its own run.
-                    let collapsed = crate::text::collapse_whitespace(raw);
-                    if collapsed.is_empty() {
-                        continue;
-                    }
-                    let run = anonymous_run.get_or_insert_with(|| BoxNode {
-                        node: root,
-                        fixture_id: None,
-                        element_id: None,
-                        tag: "#anonymous".to_owned(),
-                        style: style.clone(),
-                        children: Vec::new(),
-                        lines: Vec::new(),
-                        content: Rect::default(),
-                        padding_box: Rect::default(),
-                        border_box: Rect::default(),
-                        margin: crate::style::Sides::default(),
-                        words: Vec::new(),
-                        text_origin: None,
-                        replaced: None,
-                        control: crate::control::kind_for_node(dom, root),
-                        scroll: None,
-                        applied_scroll: (0.0, 0.0),
-                    });
-                    append_text_words(
-                        raw,
-                        style.clone(),
-                        child,
-                        &mut run.words,
-                        &mut pending_space_before,
-                    );
-                }
+                NodeData::Text(raw) => text_run.push_str(raw),
                 _ => {}
             }
-            continue;
         }
+        push_anonymous_flex_text(&mut box_node, &text_run);
+        return Some(box_node);
+    }
+
+    // Block and grid keep their inline words in the parent.
+    let mut pending_space_before = false;
+    for &child in &dom.node(root).children {
         match &dom.node(child).data {
             NodeData::Element { .. } => {
                 let display = styles
@@ -569,7 +471,7 @@ pub(crate) fn build_boxes(
             NodeData::Text(raw) => {
                 append_text_words(
                     raw,
-                    style_for_text(dom, child, styles, &style),
+                    &style_for_text(dom, child, styles, &style),
                     child,
                     &mut box_node.words,
                     &mut pending_space_before,
@@ -578,8 +480,62 @@ pub(crate) fn build_boxes(
             _ => {}
         }
     }
-    flush_anonymous_run(&mut anonymous_run, &mut box_node.children);
     Some(box_node)
+}
+
+/// An anonymous flex item inherits text properties, not the element's box
+/// model, flex item properties, or paint effects.
+fn anonymous_flex_text_style(parent: &ComputedStyle) -> ComputedStyle {
+    ComputedStyle {
+        display: Display::Block,
+        color: parent.color,
+        font_size: parent.font_size,
+        font_weight: parent.font_weight,
+        font_family: parent.font_family.clone(),
+        line_height: parent.line_height,
+        text_align: parent.text_align,
+        white_space: parent.white_space,
+        cursor: parent.cursor,
+        user_select_none: parent.user_select_none,
+        ..ComputedStyle::inherited_default()
+    }
+}
+
+fn push_anonymous_flex_text(parent: &mut BoxNode, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return; // Indentation alone doesn't create a flex item or a gap.
+    }
+    let style = anonymous_flex_text_style(&parent.style);
+    let mut words = Vec::new();
+    let mut pending_space_before = false;
+    append_text_words(
+        text,
+        &style,
+        parent.node,
+        &mut words,
+        &mut pending_space_before,
+    );
+    parent.children.push(BoxNode {
+        node: parent.node,
+        anonymous_flex_text: true,
+        fixture_id: None,
+        element_id: parent.element_id.clone(),
+        tag: parent.tag.clone(),
+        style,
+        children: Vec::new(),
+        lines: Vec::new(),
+        content: Rect::default(),
+        padding_box: Rect::default(),
+        border_box: Rect::default(),
+        margin: crate::style::Sides::default(),
+        words,
+        text_origin: None,
+        replaced: None,
+        control: None,
+        scroll: None,
+        applied_scroll: (0.0, 0.0),
+    });
 }
 
 /// The style governing a text node: its parent element's computed style.
@@ -599,7 +555,7 @@ fn style_for_text(
 /// precedes the first word (CSS whitespace collapsing across nodes).
 fn append_text_words(
     raw: &str,
-    style: ComputedStyle,
+    style: &ComputedStyle,
     source: NodeId,
     words: &mut Vec<Word>,
     pending_space_before: &mut bool,
@@ -645,7 +601,7 @@ fn collect_inline_words(
                 collect_inline_words(dom, child, styles, words, pending_space_before);
             }
             NodeData::Text(raw) => {
-                append_text_words(raw, style.clone(), node, words, pending_space_before);
+                append_text_words(raw, &style, node, words, pending_space_before);
             }
             _ => {}
         }
@@ -759,7 +715,12 @@ pub(crate) fn layout_document(
     );
 
     let phase = std::time::Instant::now();
-    let list = build_display_list(fonts, &root, viewport.scale_factor(), document_offset_clamped);
+    let list = build_display_list(
+        fonts,
+        &root,
+        viewport.scale_factor(),
+        document_offset_clamped,
+    );
     timings.emit = phase.elapsed();
     Some(LaidOutDocument {
         root,
@@ -824,7 +785,11 @@ pub(crate) fn build_display_list_with_controls(
 pub(crate) fn patch_presentation_styles(root: &mut BoxNode, styles: &StyleMap) {
     fn walk(node: &mut BoxNode, styles: &StyleMap) {
         if let Some(fresh) = styles.get(&node.node) {
-            node.style = fresh.clone();
+            node.style = if node.anonymous_flex_text {
+                anonymous_flex_text_style(fresh)
+            } else {
+                fresh.clone()
+            };
             for line in &mut node.lines {
                 for run in &mut line.runs {
                     if let Some(source_style) = styles.get(&run.source) {
@@ -945,7 +910,7 @@ fn emit_box(
         list.items.push(DisplayItem::GradientFill {
             rect: node.padding_box,
             radius,
-            gradient: gradient.resolve(&node.padding_box),
+            gradient: gradient.resolve(&node.padding_box, scale),
         });
     }
     if style.border_style_solid {
@@ -1149,6 +1114,10 @@ pub(crate) fn collect_facts(
 }
 
 fn walk_facts(dom: &Dom, node: &BoxNode, out: &mut Vec<LayoutNodeFact>) {
+    if node.anonymous_flex_text {
+        // The parent reports these lines; there is no separate fixture box.
+        return;
+    }
     if let Some(fixture_id) = &node.fixture_id {
         // Box-model facts are resolved device pixels, consistent with the
         // geometry fields; derive them from the laid-out boxes so the
@@ -1188,7 +1157,17 @@ fn walk_facts(dom: &Dom, node: &BoxNode, out: &mut Vec<LayoutNodeFact>) {
                 node.margin.bottom,
                 node.margin.left,
             ],
-            text_runs: node.lines.iter().map(runs_text).collect(),
+            text_runs: node
+                .lines
+                .iter()
+                .chain(
+                    node.children
+                        .iter()
+                        .filter(|child| child.anonymous_flex_text)
+                        .flat_map(|child| &child.lines),
+                )
+                .map(runs_text)
+                .collect(),
             scroll_width: node.scroll.map(|s| s.width),
             scroll_height: node.scroll.map(|s| s.height),
         });

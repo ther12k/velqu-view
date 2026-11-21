@@ -138,13 +138,13 @@ fn sample_cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
 }
 
 /// Physical spring parameters (ADR 0027): the damped harmonic oscillator
-/// `a = (−k·(x − target) − c·v) / m` — framer-motion's model. Stiffness
-/// `k` and damping `c` carry per-second² units; `m` scales inertia.
+/// `a = (−k·(x − target) − c·v) / m` — framer-motion's model. `k/m`
+/// has units of 1/s² and `c/m` has units of 1/s.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SpringSpec {
-    /// Angular stiffness: higher springs snap harder.
+    /// Restoring force coefficient `k`: higher springs snap harder.
     pub(crate) stiffness: f32,
-    /// Velocity loss per second; 0 normalizes to critical damping.
+    /// Damping coefficient `c`, not a damping ratio; ≤ 0 means critical damping.
     pub(crate) damping: f32,
     /// Inertia; ≤ 0 falls back to 1.
     pub(crate) mass: f32,
@@ -160,7 +160,9 @@ impl SpringSpec {
         let damping = if damping > 0.0 {
             damping
         } else {
-            2.0 * stiffness.max(0.0).sqrt() * mass
+            // Square roots separately so their intermediate product k·m
+            // does not overflow before taking the root.
+            2.0 * stiffness.max(0.0).sqrt() * mass.sqrt()
         };
         Self {
             stiffness,
@@ -550,11 +552,10 @@ pub(crate) struct ActiveAnimation {
 type Duration64 = std::time::Duration;
 
 impl ActiveAnimation {
-    /// Integrates the spring driver one tick: fixed substeps of the
-    /// caller's virtual-clock delta (stable explicit Euler, ADR 0027).
-    /// Returns `true` when the spring has settled (or hit the settle cap)
-    /// and the animation is done.
-    fn step_spring(&mut self, now: Duration64, dt_secs: f32) -> bool {
+    /// Integrates the part of this tick after the delay in fixed substeps
+    /// (semi-implicit Euler, ADR 0027). Returns `true` when the spring has
+    /// settled or hit the settle cap.
+    fn step_spring(&mut self, now: Duration64, dt: Duration64) -> bool {
         let TransitionDriver::Spring {
             spec,
             progress,
@@ -572,10 +573,11 @@ impl ActiveAnimation {
             *velocity = 0.0;
             return true;
         }
-        if dt_secs <= 0.0 {
+        // `active` bounds the portion of a tick that crossed the delay.
+        let mut remaining = dt.min(active).as_secs_f32();
+        if remaining == 0.0 {
             return false;
         }
-        let mut remaining = dt_secs;
         while remaining > 0.0 {
             let h = remaining.min(SPRING_SUBSTEP_SECS);
             let acceleration =
@@ -591,8 +593,7 @@ impl ActiveAnimation {
             *velocity = 0.0;
             return true;
         }
-        (*progress - 1.0).abs() < SPRING_SETTLE_EPSILON
-            && velocity.abs() < SPRING_SETTLE_EPSILON
+        (*progress - 1.0).abs() < SPRING_SETTLE_EPSILON && velocity.abs() < SPRING_SETTLE_EPSILON
     }
 
     /// Raw (uneased) progress at virtual time `now`: 0 during the delay,
@@ -728,10 +729,11 @@ impl AnimationEngine {
         easing: Easing,
         repeat: AnimationRepeat,
     ) {
+        let kind = property.kind();
         if duration.is_zero() {
+            self.stop_transition_for(node, kind);
             return;
         }
-        let kind = property.kind();
         if let Some(index) = self
             .active
             .iter()
@@ -770,8 +772,8 @@ impl AnimationEngine {
     /// existing spring on the same node+property hands over its momentum:
     /// the retargeted animation restarts from the current on-screen value
     /// with the physical velocity preserved (scalars only — per-channel
-    /// properties restart at rest). A zero-stiffness spec animates
-    /// nothing; the spawn path applies the target directly instead.
+    /// properties restart at rest). A zero-stiffness spec cancels the
+    /// old transition so the computed target can apply immediately.
     pub(crate) fn start_spring(
         &mut self,
         node: NodeId,
@@ -779,10 +781,11 @@ impl AnimationEngine {
         delay: Duration64,
         spec: SpringSpec,
     ) {
+        let kind = property.kind();
         if spec.is_instant() {
+            self.stop_transition_for(node, kind);
             return;
         }
-        let kind = property.kind();
         if let Some(index) = self
             .active
             .iter()
@@ -799,11 +802,11 @@ impl AnimationEngine {
                 existing.property.scalar_span(),
                 retargeted.scalar_span(),
             ) {
-                (
-                    TransitionDriver::Spring { velocity, .. },
-                    Some(span_old),
-                    Some(span_new),
-                ) if span_new.abs() > f32::EPSILON => span_old * velocity / span_new,
+                (TransitionDriver::Spring { velocity, .. }, Some(span_old), Some(span_new))
+                    if span_new.abs() > f32::EPSILON =>
+                {
+                    span_old * velocity / span_new
+                }
                 _ => 0.0,
             };
             self.active.push(ActiveAnimation {
@@ -839,18 +842,53 @@ impl AnimationEngine {
         });
     }
 
-    /// Stops any animation of `kind` running on `node`.
-    #[allow(dead_code)]
-    pub(crate) fn stop_for(&mut self, node: NodeId, kind: PropKind) {
-        self.active
-            .retain(|anim| !(anim.node == node && anim.property.kind() == kind));
+    /// Cancels the transition and clears its current or pinned sample
+    /// so the cascade can apply the new target immediately. Preset
+    /// looping animations are independent of CSS transitions.
+    pub(crate) fn stop_transition_for(&mut self, node: NodeId, kind: PropKind) {
+        if let Some(index) = self
+            .active
+            .iter()
+            .position(|anim| anim.node == node && anim.property.kind() == kind)
+        {
+            if self.active[index].repeat == AnimationRepeat::Infinite {
+                return;
+            }
+            self.active.remove(index);
+        }
+        Self::clear_override_for(&mut self.overrides, node, kind);
     }
 
-    /// Stops any infinite looping animation running on `node` (e.g. when an
-    /// element's `animate-*` class is removed).
+    /// Stops any infinite looping animation running on `node` and clears
+    /// its sample (e.g. when an element's `animate-*` class is removed).
     pub(crate) fn stop_infinite_for(&mut self, node: NodeId) {
-        self.active
-            .retain(|anim| !(anim.node == node && anim.repeat == AnimationRepeat::Infinite));
+        self.active.retain(|anim| {
+            if anim.node == node && anim.repeat == AnimationRepeat::Infinite {
+                Self::clear_override_for(&mut self.overrides, node, anim.property.kind());
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn clear_override_for(overrides: &mut PropertyOverrideMap, node: NodeId, kind: PropKind) {
+        if let Some(values) = overrides.get_mut(&node) {
+            match kind {
+                PropKind::Width => values.width = None,
+                PropKind::Height => values.height = None,
+                PropKind::Opacity => values.opacity = None,
+                PropKind::BorderRadius => values.border_radius = None,
+                PropKind::BackgroundColor => values.background_color = None,
+                PropKind::BorderColor => values.border_color = None,
+                PropKind::Color => values.color = None,
+                PropKind::Transform => values.transform = None,
+                PropKind::BoxShadow => values.box_shadow = None,
+            }
+            if *values == PropertyOverrides::default() {
+                overrides.remove(&node);
+            }
+        }
     }
 
     /// Seeds the override bundle at `t = 0` so the frame the animation
@@ -877,13 +915,12 @@ impl AnimationEngine {
             return TickOutcome::default();
         }
         self.clock += dt;
-        let dt_secs = dt.as_secs_f32();
         let mut finished = Vec::new();
         let mut completed: Vec<(NodeId, AnimProperty)> = Vec::new();
         self.active.retain_mut(|animation| {
             let done = match &mut animation.driver {
                 TransitionDriver::Timed => animation.is_finished(self.clock),
-                TransitionDriver::Spring { .. } => animation.step_spring(self.clock, dt_secs),
+                TransitionDriver::Spring { .. } => animation.step_spring(self.clock, dt),
             };
             if done {
                 finished.push((animation.node, animation.property.kind()));
@@ -1015,6 +1052,13 @@ mod tests {
     const FRAME: Duration64 = Duration64::from_millis(16);
 
     #[test]
+    fn spring_fallback_damping_is_critical_with_non_unit_mass() {
+        assert_eq!(SpringSpec::normalized(64.0, 0.0, 4.0).damping, 32.0);
+        assert_eq!(SpringSpec::normalized(64.0, -1.0, 0.25).damping, 8.0);
+        assert_eq!(SpringSpec::normalized(64.0, 5.0, 4.0).damping, 5.0);
+    }
+
+    #[test]
     fn spring_settles_and_pins_target() {
         let mut engine = AnimationEngine::new();
         engine.start_spring(
@@ -1093,10 +1137,7 @@ mod tests {
         // briefly carry it further up before the pull of the new target.
         engine.start_spring(
             3,
-            AnimProperty::Width {
-                from: 0.0,
-                to: 0.0,
-            },
+            AnimProperty::Width { from: 0.0, to: 0.0 },
             Duration64::ZERO,
             SpringSpec::normalized(120.0, 12.0, 1.0),
         );
@@ -1127,18 +1168,17 @@ mod tests {
         let mut engine = AnimationEngine::new();
         engine.start_spring(
             4,
-            AnimProperty::Opacity {
-                from: 0.0,
-                to: 1.0,
-            },
+            AnimProperty::Opacity { from: 0.0, to: 1.0 },
             Duration64::from_millis(100),
             SpringSpec::normalized(170.0, 26.0, 1.0),
         );
         let tick = engine.tick_by(Duration64::from_millis(50));
         assert!(tick.more && tick.paint_dirty);
         assert_eq!(engine.overrides().get(&4).unwrap().opacity, Some(0.0));
-        // Past the delay the spring moves.
-        engine.tick_by(Duration64::from_millis(200));
+        // At exactly the end of the delay the spring has not moved yet.
+        engine.tick_by(Duration64::from_millis(50));
+        assert_eq!(engine.overrides().get(&4).unwrap().opacity, Some(0.0));
+        engine.tick_by(FRAME);
         let value = engine.overrides().get(&4).unwrap().opacity.unwrap();
         assert!(value > 0.0, "spring moves after the delay, got {value}");
     }
@@ -1148,15 +1188,74 @@ mod tests {
         let mut engine = AnimationEngine::new();
         engine.start_spring(
             5,
-            AnimProperty::Opacity {
-                from: 0.0,
-                to: 1.0,
-            },
+            AnimProperty::Opacity { from: 0.0, to: 1.0 },
             Duration64::ZERO,
             SpringSpec::normalized(0.0, 26.0, 1.0),
         );
         assert!(!engine.has_active());
         assert!(engine.overrides().is_empty());
+    }
+
+    #[test]
+    fn instant_retarget_clears_running_or_pinned_spring_value() {
+        let initial = AnimProperty::Width {
+            from: 100.0,
+            to: 300.0,
+        };
+        let new_target = AnimProperty::Width {
+            from: 100.0,
+            to: 200.0,
+        };
+        for elapsed in [FRAME, Duration64::from_secs(10)] {
+            for use_spring in [false, true] {
+                let mut engine = AnimationEngine::new();
+                engine.start(
+                    1,
+                    AnimProperty::Opacity { from: 0.0, to: 1.0 },
+                    Duration64::ZERO,
+                    Duration64::from_secs(20),
+                    Easing::Linear,
+                );
+                engine.start_spring(
+                    1,
+                    initial,
+                    Duration64::ZERO,
+                    SpringSpec::normalized(120.0, 14.0, 1.0),
+                );
+                engine.tick_by(elapsed);
+                let before = engine.overrides()[&1];
+                assert!(before.width.is_some());
+                assert_eq!(
+                    engine.active_target(1, PropKind::Width).is_some(),
+                    elapsed == FRAME
+                );
+
+                if use_spring {
+                    engine.start_spring(
+                        1,
+                        new_target,
+                        Duration64::ZERO,
+                        SpringSpec::normalized(0.0, 14.0, 1.0),
+                    );
+                } else {
+                    engine.start(
+                        1,
+                        new_target,
+                        Duration64::ZERO,
+                        Duration64::ZERO,
+                        Easing::Linear,
+                    );
+                }
+
+                assert_eq!(engine.active_target(1, PropKind::Width), None);
+                assert_eq!(engine.overrides()[&1].width, None);
+                assert_eq!(engine.overrides()[&1].opacity, before.opacity);
+                let tick = engine.tick_by(FRAME);
+                assert!(tick.more && tick.paint_dirty && !tick.layout_dirty);
+                assert!(tick.finished.is_empty());
+                assert_eq!(engine.overrides()[&1].width, None);
+            }
+        }
     }
 
     #[test]
@@ -1278,6 +1377,45 @@ mod tests {
         );
         assert!(!engine.has_active());
         assert!(engine.overrides().is_empty());
+    }
+
+    #[test]
+    fn stopping_a_loop_clears_only_its_override() {
+        let mut engine = AnimationEngine::new();
+        engine.start(
+            1,
+            AnimProperty::Width {
+                from: 100.0,
+                to: 200.0,
+            },
+            Duration64::ZERO,
+            FRAME,
+            Easing::Linear,
+        );
+        engine.start_with_repeat(
+            1,
+            AnimProperty::PulseOpacity { min: 0.5, max: 1.0 },
+            Duration64::ZERO,
+            FRAME * 2,
+            Easing::Linear,
+            AnimationRepeat::Infinite,
+        );
+        let tick = engine.tick_by(FRAME);
+        assert_eq!(tick.finished, vec![(1, PropKind::Width)]);
+        assert!(tick.more);
+        assert_eq!(engine.overrides()[&1].opacity, Some(0.5));
+
+        engine.stop_transition_for(1, PropKind::Opacity);
+        assert!(
+            engine.has_active(),
+            "a transition stop must not stop a loop"
+        );
+        assert_eq!(engine.overrides()[&1].opacity, Some(0.5));
+
+        engine.stop_infinite_for(1);
+        assert!(!engine.has_active());
+        assert_eq!(engine.overrides()[&1].opacity, None);
+        assert_eq!(engine.overrides()[&1].width, Some(200.0));
     }
 
     #[test]

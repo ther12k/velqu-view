@@ -187,7 +187,7 @@ fn project<'a>(
     let mut style = map_style(
         &node.style,
         scale,
-        PAGE_ROOT_TAGS.contains(&node.tag.as_str()),
+        !node.anonymous_flex_text && PAGE_ROOT_TAGS.contains(&node.tag.as_str()),
         node.replaced.is_some() || node.control.is_some() || node.tag == "img",
     );
 
@@ -215,9 +215,8 @@ fn project<'a>(
     }
 
     // A grid container with only inline content still needs its tracks:
-    // the inline content becomes an anonymous grid item (M2c). Flex
-    // containers with only words keep the M2b leaf measurement (equivalent
-    // geometry, byte-identical with the M2b fixtures).
+    // the inline content becomes an anonymous grid item (M2c). Direct
+    // text in flex containers already has anonymous items in the box tree.
     let words_container = node.style.display == Display::Grid && !node.words.is_empty();
 
     // Leaves: no block children — the box's own words (possibly none).
@@ -947,22 +946,30 @@ fn apply_line_ellipsis(line: &mut LaidLine, max_width: f32, fonts: &mut FontStor
     if line_width(line) <= max_width {
         return;
     }
-    let Some(last) = line.runs.last() else {
+    // Test each candidate cut using the metrics of the run that would
+    // paint the mark. A discarded run may have a different face or size.
+    let Some((keep, face, ellipsis_width)) =
+        line.runs.iter().enumerate().rev().find_map(|(index, run)| {
+            let weight = if run.bold {
+                crate::font::FontWeight::Bold
+            } else {
+                crate::font::FontWeight::Regular
+            };
+            let face = fonts.face_index(run.family.as_deref(), weight);
+            let mark_width = crate::text::measure_run(fonts, face, ELLIPSIS, run.px);
+            let fits = run.x + run.width + mark_width <= max_width;
+            (mark_width < max_width && (fits || index == 0)).then_some((
+                index + 1,
+                face,
+                mark_width,
+            ))
+        })
+    else {
+        // No room for the mark even on the first run; leave plain clipping.
         return;
     };
-    let ellipsis_face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
-    let ellipsis_width = crate::text::measure_run(fonts, ellipsis_face, ELLIPSIS, last.px);
-    if ellipsis_width >= max_width {
-        // No room to show anything: leave the plain clip behavior.
-        return;
-    }
-    while line.runs.len() > 1 && line_width(line) + ellipsis_width > max_width {
-        line.runs.pop();
-    }
-    let Some(last) = line.runs.last_mut() else {
-        return;
-    };
-    let face = fonts.face_index(last.family.as_deref(), crate::font::FontWeight::Regular);
+    line.runs.truncate(keep);
+    let last = line.runs.last_mut().expect("kept at least one run");
     // The trailing run may still overflow: trim it character by character
     // from the end (one char always survives).
     loop {

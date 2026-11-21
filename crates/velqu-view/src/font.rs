@@ -10,6 +10,7 @@
 //! painter requests, so identical viewports always hit identical rasterization.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fontdue::Font;
 
@@ -59,7 +60,7 @@ struct GlyphKey {
 /// map resolves `(family, bold)` to an index once per text run, so the
 /// per-glyph hot path stays a plain integer lookup.
 pub(crate) struct FontStore {
-    faces: Vec<Font>,
+    faces: Vec<Rc<Font>>,
     ids: HashMap<(String, bool), usize>,
     cache: HashMap<GlyphKey, Glyph>,
 }
@@ -72,35 +73,61 @@ impl FontStore {
         let settings = fontdue::FontSettings::default();
         Self {
             faces: vec![
-                Font::from_bytes(DEJAVU_SANS, settings).expect("bundled DejaVuSans.ttf is valid"),
-                Font::from_bytes(DEJAVU_SANS_BOLD, settings)
-                    .expect("bundled DejaVuSans-Bold.ttf is valid"),
+                Rc::new(
+                    Font::from_bytes(DEJAVU_SANS, settings)
+                        .expect("bundled DejaVuSans.ttf is valid"),
+                ),
+                Rc::new(
+                    Font::from_bytes(DEJAVU_SANS_BOLD, settings)
+                        .expect("bundled DejaVuSans-Bold.ttf is valid"),
+                ),
             ],
             ids: HashMap::new(),
             cache: HashMap::new(),
         }
     }
 
-    /// Registers a TTF/OTF face under `family` (matched case-insensitively
-    /// at resolution time; the stored key is lowercased here). Re-registering
-    /// the same `(family, bold)` slot replaces the face in place — indices
-    /// (and therefore glyph cache keys) stay stable. Invalid font data is an
-    /// error; the previous face (if any) is untouched.
-    pub(crate) fn register(&mut self, family: &str, data: &[u8], bold: bool) -> Result<(), String> {
-        let key = (family.to_ascii_lowercase(), bold);
-        if let Some(&index) = self.ids.get(&key) {
-            let font = Font::from_bytes(data, fontdue::FontSettings::default())
-                .map_err(|error| format!("font '{family}' (bold={bold}): {error}"))?;
-            self.faces[index] = font;
-            self.cache.clear();
-            return Ok(());
+    /// Shares the registered faces with a reload candidate, but not its
+    /// mutable glyph cache. A failed reload leaves this store untouched.
+    pub(crate) fn fork(&self) -> Self {
+        Self {
+            faces: self.faces.clone(),
+            ids: self.ids.clone(),
+            cache: HashMap::new(),
         }
-        let font = Font::from_bytes(data, fontdue::FontSettings::default())
-            .map_err(|error| format!("font '{family}' (bold={bold}): {error}"))?;
-        let index = self.faces.len();
-        self.faces.push(font);
-        self.ids.insert(key, index);
+    }
+
+    /// Parse both faces before replacing either slot, so an invalid font
+    /// leaves the registry and the current layout intact.
+    pub(crate) fn register_family(
+        &mut self,
+        family: &str,
+        regular: &[u8],
+        bold: Option<&[u8]>,
+    ) -> Result<(), String> {
+        let parse = |data: &[u8], bold: bool| {
+            Font::from_bytes(data, fontdue::FontSettings::default())
+                .map(Rc::new)
+                .map_err(|error| format!("font '{family}' (bold={bold}): {error}"))
+        };
+        let regular = parse(regular, false)?;
+        let bold = bold.map(|data| parse(data, true)).transpose()?;
+        let family = family.to_ascii_lowercase();
+        self.set_face((family.clone(), false), regular);
+        if let Some(bold) = bold {
+            self.set_face((family, true), bold);
+        }
+        self.cache.clear();
         Ok(())
+    }
+
+    fn set_face(&mut self, key: (String, bool), face: Rc<Font>) {
+        if let Some(&index) = self.ids.get(&key) {
+            self.faces[index] = face;
+        } else {
+            self.ids.insert(key, self.faces.len());
+            self.faces.push(face);
+        }
     }
 
     /// Resolves `(family, weight)` to a face index. Unknown families and

@@ -249,6 +249,65 @@ fn host_write_and_event_turns_share_one_state() {
 }
 
 #[test]
+fn later_event_turn_reconciles_an_editor_replaced_by_a_host_write() {
+    let vp = Viewport::try_new(300, 100, 1.0).unwrap();
+    for drain_first in [false, true] {
+        let mut view = view_with(
+            r#"<main vx-state="{ draft: '' }"><input id="draft" vx-model="draft"></main>"#,
+        );
+        settle(&mut view, vp);
+        let handle = view.control_facts(vp).unwrap().controls[0].target.handle;
+        view.set_focus(Some("draft"));
+        view.take_events();
+        assert!(view.insert_text("typed"));
+        let events = drain_first.then(|| view.take_events());
+
+        view.write_state("draft", ReactiveValue::String("host".into()))
+            .unwrap();
+        assert_eq!(view.control_value(handle), Some("host"));
+        let events = events.unwrap_or_else(|| view.take_events());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, velqu_view::Event::ValueChanged { .. }))
+                .count(),
+            1
+        );
+        view.pump_reactive(&events);
+
+        assert_eq!(
+            state_of(&view, "draft"),
+            ReactiveValue::String("typed".into())
+        );
+        assert_eq!(view.control_value(handle), Some("typed"));
+        assert!(view.take_events().is_empty());
+    }
+}
+
+#[test]
+fn replacing_an_editor_value_cancels_its_ime_composition() {
+    let vp = Viewport::try_new(300, 100, 1.0).unwrap();
+    let mut view =
+        view_with(r#"<main vx-state="{ draft: '' }"><input id="draft" vx-model="draft"></main>"#);
+    settle(&mut view, vp);
+    let handle = view.control_facts(vp).unwrap().controls[0].target.handle;
+    view.set_focus(Some("draft"));
+    assert!(view.insert_text("typed"));
+    view.pump_reactive_queued();
+    assert!(view.ime_preedit("漢", None));
+
+    view.write_state("draft", ReactiveValue::String("x".into()))
+        .unwrap();
+    assert_eq!(view.control_value(handle), Some("x"));
+    assert!(
+        !view.ime_commit("漢"),
+        "the old commit must not modify the new value"
+    );
+    assert!(view.take_events().is_empty());
+    view.render(vp).unwrap();
+}
+
+#[test]
 fn host_writes_are_deterministic_across_sessions() {
     let vp = Viewport::try_new(400, 300, 1.0).unwrap();
     let digest = |mut view: VelquView| -> String {

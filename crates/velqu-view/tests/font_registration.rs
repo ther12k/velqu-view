@@ -116,6 +116,40 @@ fn invalid_font_data_is_an_error() {
 }
 
 #[test]
+fn failed_bold_registration_keeps_the_regular_face() {
+    let regular = include_bytes!("../assets/fonts/DejaVuSans.ttf").to_vec();
+    let replacement = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf").to_vec();
+    let mut view = VelquView::new();
+    view.register_font("custom", regular, None).unwrap();
+    view.load_html(&DOC.replace("color:#000000", "color:#000000;font-family:custom"))
+        .unwrap();
+    let vp = Viewport::try_new(220, 60, 1.0).unwrap();
+    let before = view.render(vp).unwrap().frame.sha256_hex();
+
+    assert!(
+        view.register_font("custom", replacement.clone(), Some(vec![0]))
+            .is_err()
+    );
+    assert_eq!(view.render(vp).unwrap().frame.sha256_hex(), before);
+    view.register_font("custom", replacement, None).unwrap();
+    assert_ne!(view.render(vp).unwrap().frame.sha256_hex(), before);
+}
+
+#[test]
+fn document_reload_uses_registered_font_metrics() {
+    let bold = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf").to_vec();
+    let html = DOC.replace("color:#000000", "color:#000000;font-family:custom");
+    let vp = Viewport::try_new(220, 60, 1.0).unwrap();
+    let mut view = VelquView::new();
+    view.register_font("custom", bold, None).unwrap();
+    view.load_html(&html).unwrap();
+    let before = view.render(vp).unwrap().frame.sha256_hex();
+    view.reload_document(velqu_view::DocumentSource::new("reload", html), vp)
+        .unwrap();
+    assert_eq!(view.render(vp).unwrap().frame.sha256_hex(), before);
+}
+
+#[test]
 fn bold_variant_resolves_by_font_weight() {
     // Register ONLY a regular face for a family; bold text (font-weight:700)
     // must fall back to that family's regular face (not DejaVu bold).

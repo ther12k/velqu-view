@@ -5,8 +5,8 @@
 //! geometry resolves at display-list emission ([`Gradient::resolve`])
 //! where the padding box is known in device pixels. Stop positions
 //! follow the CSS Images rules the reference styles use: percentages of
-//! the gradient line (linear) or shape radii (radial), px positions
-//! scaled by the same reference, missing positions distributed evenly,
+//! the gradient line (linear) or horizontal radius (radial), logical px
+//! converted to device px before normalization, missing positions distributed evenly,
 //! adjacent equal positions as hard stops (the notch corner-carve
 //! `transparent 9.5px, #000 10px` pattern), and clamping so positions
 //! never go backwards.
@@ -47,10 +47,7 @@ pub(crate) enum GradientKind {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum GradientDirection {
     Angle(f32),
-    Corner {
-        right: bool,
-        bottom: bool,
-    },
+    Corner { right: bool, bottom: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +66,7 @@ pub(crate) enum RadialSize {
         ry: GradientLength,
     },
     /// One explicit size (circle): a px radius.
-    Circle {
-        r: GradientLength,
-    },
+    Circle { r: GradientLength },
 }
 
 /// A stop position or explicit radial size: px or a percentage.
@@ -110,16 +105,10 @@ fn function_body<'a>(value: &'a str, name: &str) -> Option<&'a str> {
 fn parse_linear_gradient(inner: &str) -> Option<Gradient> {
     let segments = split_top_level_commas(inner);
     let (direction, stop_segments) = match segments.first().map(|s| s.trim()) {
-        Some(first) if first.starts_with("to ") => (
-            parse_direction(first)?,
-            &segments[1..],
-        ),
+        Some(first) if first.starts_with("to ") => (parse_direction(first)?, &segments[1..]),
         Some(first) if first.ends_with("deg") => {
             let angle = first[..first.len() - 3].trim().parse::<f32>().ok()?;
-            (
-                GradientDirection::Angle(angle),
-                &segments[1..],
-            )
+            (GradientDirection::Angle(angle), &segments[1..])
         }
         _ => (GradientDirection::Angle(180.0), segments.as_slice()),
     };
@@ -289,10 +278,7 @@ fn parse_gradient_point(value: &str) -> Option<(Option<GradientLength>, Option<G
     if words.next().is_some() {
         return None;
     }
-    Some((
-        parse_gradient_axis(x),
-        parse_gradient_axis(y),
-    ))
+    Some((parse_gradient_axis(x), parse_gradient_axis(y)))
 }
 
 fn parse_gradient_axis(word: &str) -> Option<GradientLength> {
@@ -307,7 +293,11 @@ fn parse_gradient_axis(word: &str) -> Option<GradientLength> {
 fn parse_gradient_length(value: &str) -> Option<GradientLength> {
     let value = value.trim();
     if let Some(percent) = value.strip_suffix('%') {
-        return percent.trim().parse::<f32>().ok().map(GradientLength::Percent);
+        return percent
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(GradientLength::Percent);
     }
     if let Some(px) = value.strip_suffix("px") {
         return px.trim().parse::<f32>().ok().map(GradientLength::Px);
@@ -409,7 +399,8 @@ fn split_top_level_commas(value: &str) -> Vec<&str> {
 impl Gradient {
     /// Resolves the abstract gradient into paint-ready device geometry
     /// and stop fractions for `box_rect` (the padding box, device px).
-    pub(crate) fn resolve(&self, box_rect: &Rect) -> ResolvedGradient {
+    /// `scale` converts authored lengths from logical to device px.
+    pub(crate) fn resolve(&self, box_rect: &Rect, scale: f32) -> ResolvedGradient {
         let w = box_rect.w;
         let h = box_rect.h;
         let kind = match &self.kind {
@@ -447,52 +438,53 @@ impl Gradient {
                 let cx = box_rect.x
                     + position
                         .0
-                        .map(|len| resolve_axis(len, w))
+                        .map(|len| resolve_axis(len, w, scale))
                         .unwrap_or(w / 2.0);
                 let cy = box_rect.y
                     + position
                         .1
-                        .map(|len| resolve_axis(len, h))
+                        .map(|len| resolve_axis(len, h, scale))
                         .unwrap_or(h / 2.0);
                 let (rx, ry) = match (shape, size) {
                     (RadialShape::Circle, RadialSize::Circle { r }) => {
-                        let radius = resolve_axis(*r, w).max(1e-3);
+                        let radius = resolve_axis(*r, w, scale).max(1e-3);
                         (radius, radius)
                     }
-                    (
-                        RadialShape::Circle,
-                        RadialSize::FarthestCorner,
-                    ) => {
+                    (RadialShape::Circle, RadialSize::FarthestCorner) => {
                         let radius = farthest_corner_distance(box_rect, cx, cy).max(1e-3);
                         (radius, radius)
                     }
-                    (
-                        RadialShape::Ellipse,
-                        RadialSize::Ellipse { rx, ry },
-                    ) => (resolve_axis(*rx, w).max(1e-3), resolve_axis(*ry, h).max(1e-3)),
+                    (RadialShape::Ellipse, RadialSize::Ellipse { rx, ry }) => (
+                        resolve_axis(*rx, w, scale).max(1e-3),
+                        resolve_axis(*ry, h, scale).max(1e-3),
+                    ),
                     (RadialShape::Ellipse, RadialSize::FarthestCorner) => {
-                        let rx = (box_rect.x - cx)
-                            .abs()
-                            .max((box_rect.x + w - cx).abs())
-                            .max(1e-3);
-                        let ry = (box_rect.y - cy)
-                            .abs()
-                            .max((box_rect.y + h - cy).abs())
-                            .max(1e-3);
-                        (rx, ry)
+                        let far_x = (box_rect.x - cx).abs().max((box_rect.x + w - cx).abs());
+                        let far_y = (box_rect.y - cy).abs().max((box_rect.y + h - cy).abs());
+                        // Keep the farthest-side aspect ratio, but make the
+                        // farthest corner's normalized distance 1, not √2.
+                        let corner_scale = std::f32::consts::SQRT_2;
+                        (
+                            (far_x * corner_scale).max(1e-3),
+                            (far_y * corner_scale).max(1e-3),
+                        )
                     }
                     // A circle with an ellipse size pair: use rx for both.
                     (RadialShape::Circle, RadialSize::Ellipse { rx, .. }) => {
-                        let radius = resolve_axis(*rx, w).max(1e-3);
+                        let radius = resolve_axis(*rx, w, scale).max(1e-3);
                         (radius, radius)
                     }
                     // An ellipse with a single circle size: ry mirrors rx.
                     (RadialShape::Ellipse, RadialSize::Circle { r }) => {
-                        let radius = resolve_axis(*r, w).max(1e-3);
+                        let radius = resolve_axis(*r, w, scale).max(1e-3);
                         (radius, radius)
                     }
                 };
-                ResolvedGradientKind::Radial { center: (cx, cy), rx, ry }
+                ResolvedGradientKind::Radial {
+                    center: (cx, cy),
+                    rx,
+                    ry,
+                }
             }
         };
         let reference = match &kind {
@@ -505,14 +497,14 @@ impl Gradient {
         };
         ResolvedGradient {
             kind,
-            stops: resolve_stops(&self.stops, reference),
+            stops: resolve_stops(&self.stops, reference, scale),
         }
     }
 }
 
-fn resolve_axis(length: GradientLength, extent: f32) -> f32 {
+fn resolve_axis(length: GradientLength, extent: f32, scale: f32) -> f32 {
     match length {
-        GradientLength::Px(px) => px,
+        GradientLength::Px(px) => px * scale,
         GradientLength::Percent(percent) => percent / 100.0 * extent,
     }
 }
@@ -530,19 +522,18 @@ fn farthest_corner_distance(rect: &Rect, cx: f32, cy: f32) -> f32 {
 }
 
 /// Resolves authored stop positions against the gradient reference
-/// length: percentages map directly, px divide by the reference.
-/// Missing positions fill per CSS (first 0, last 1, interiors midway),
-/// then clamp monotonic so equal-adjacent pairs stay hard stops.
-fn resolve_stops(stops: &[GradientStop], reference: f32) -> Vec<(f32, Color)> {
+/// length: percentages map directly, logical px scale before dividing
+/// by the device-px reference. Missing positions fill per CSS (first 0,
+/// last 1, interiors midway), then clamp to keep stops monotonic.
+fn resolve_stops(stops: &[GradientStop], reference: f32, scale: f32) -> Vec<(f32, Color)> {
     let mut resolved: Vec<(Option<f32>, Color)> = stops
         .iter()
         .map(|stop| {
             (
-                stop.position
-                    .map(|len| match len {
-                        GradientLength::Percent(percent) => percent / 100.0,
-                        GradientLength::Px(px) => px / reference,
-                    }),
+                stop.position.map(|len| match len {
+                    GradientLength::Percent(percent) => percent / 100.0,
+                    GradientLength::Px(px) => px * scale / reference,
+                }),
                 stop.color,
             )
         })
@@ -599,10 +590,9 @@ mod tests {
 
     #[test]
     fn parses_linear_angle_and_stops() {
-        let gradient = parse_gradient(
-            "linear-gradient(160deg, #ffd9c2 0%, rgba(1, 2, 3, 0.5) 100%)",
-        )
-        .expect("parses");
+        let gradient =
+            parse_gradient("linear-gradient(160deg, #ffd9c2 0%, rgba(1, 2, 3, 0.5) 100%)")
+                .expect("parses");
         let GradientKind::Linear {
             direction: GradientDirection::Angle(angle),
         } = gradient.kind
@@ -674,15 +664,17 @@ mod tests {
             )
         );
         assert_eq!(gradient.stops.len(), 2);
-        assert_eq!(gradient.stops[1].position, Some(GradientLength::Percent(70.0)));
+        assert_eq!(
+            gradient.stops[1].position,
+            Some(GradientLength::Percent(70.0))
+        );
     }
 
     #[test]
     fn parses_circle_at_px_position_with_hard_stops() {
-        let gradient = parse_gradient(
-            "radial-gradient(circle at 0 100%, transparent 9.5px, #000 10px)",
-        )
-        .expect("parses");
+        let gradient =
+            parse_gradient("radial-gradient(circle at 0 100%, transparent 9.5px, #000 10px)")
+                .expect("parses");
         let GradientKind::Radial {
             shape,
             size,
@@ -715,7 +707,7 @@ mod tests {
         // `to right` over a 100×40 box: gradient line from (0, 20) to
         // (100, 20), length 100.
         let gradient = parse_gradient("linear-gradient(to right, #000, #fff)").unwrap();
-        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 40.0));
+        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 40.0), 1.0);
         let ResolvedGradientKind::Linear { start, end } = resolved.kind else {
             panic!("linear");
         };
@@ -730,11 +722,10 @@ mod tests {
     fn resolves_corner_carve_positions_by_radius() {
         // `circle at 0 100%` on a 20×20 box: farthest corner is (20, 0),
         // distance √(20² + 20²) ≈ 28.28. The 10px stop lands at 10/28.28.
-        let gradient = parse_gradient(
-            "radial-gradient(circle at 0 100%, transparent 9.5px, #000 10px)",
-        )
-        .unwrap();
-        let resolved = gradient.resolve(&rect(0.0, 0.0, 20.0, 20.0));
+        let gradient =
+            parse_gradient("radial-gradient(circle at 0 100%, transparent 9.5px, #000 10px)")
+                .unwrap();
+        let resolved = gradient.resolve(&rect(0.0, 0.0, 20.0, 20.0), 1.0);
         let ResolvedGradientKind::Radial { center, rx, ry } = resolved.kind else {
             panic!("radial");
         };
@@ -749,20 +740,59 @@ mod tests {
     }
 
     #[test]
+    fn linear_px_stops_scale_with_device_pixels() {
+        let gradient = parse_gradient("linear-gradient(to right, #000 10px, #fff 70%)").unwrap();
+        let resolved = gradient.resolve(&rect(16.0, 20.0, 200.0, 80.0), 2.0);
+        assert_eq!(resolved.stops[0].0, 0.1);
+        assert_eq!(resolved.stops[1].0, 0.7);
+    }
+
+    #[test]
+    fn radial_px_center_radii_and_stops_scale_with_device_pixels() {
+        let gradient =
+            parse_gradient("radial-gradient(20px 60% at 10px 25%, #000 5px, #fff 50%)").unwrap();
+        let resolved = gradient.resolve(&rect(16.0, 20.0, 200.0, 80.0), 2.0);
+        let ResolvedGradientKind::Radial { center, rx, ry } = resolved.kind else {
+            panic!("radial");
+        };
+        assert_eq!(center, (36.0, 40.0));
+        assert_eq!((rx, ry), (40.0, 48.0));
+        assert_eq!(resolved.stops[0].0, 0.25);
+        assert_eq!(resolved.stops[1].0, 0.5);
+    }
+
+    #[test]
+    fn default_radial_ellipse_reaches_its_farthest_corner() {
+        for (css, bounds) in [
+            ("radial-gradient(#000, #fff)", rect(0.0, 0.0, 100.0, 100.0)),
+            (
+                "radial-gradient(ellipse at 25% 20%, #000, #fff)",
+                rect(4.0, 7.0, 100.0, 60.0),
+            ),
+        ] {
+            let resolved = parse_gradient(css).unwrap().resolve(&bounds, 1.0);
+            let ResolvedGradientKind::Radial { center, rx, ry } = resolved.kind else {
+                panic!("radial");
+            };
+            let dx = bounds.x + bounds.w - center.0;
+            let dy = bounds.y + bounds.h - center.1;
+            assert!(((dx / rx).powi(2) + (dy / ry).powi(2) - 1.0).abs() < 1e-6);
+            assert!((rx / ry - dx / dy).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn missing_positions_distribute_evenly() {
         let gradient = parse_gradient("linear-gradient(to right, #000, #111, #222)").unwrap();
-        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 10.0));
+        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 10.0), 1.0);
         assert_eq!(resolved.stops.len(), 3);
         assert!((resolved.stops[1].0 - 0.5).abs() < 1e-6);
     }
 
     #[test]
     fn stops_never_go_backwards() {
-        let gradient = parse_gradient(
-            "linear-gradient(to right, #000 60%, #fff 20%)",
-        )
-        .unwrap();
-        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 10.0));
+        let gradient = parse_gradient("linear-gradient(to right, #000 60%, #fff 20%)").unwrap();
+        let resolved = gradient.resolve(&rect(0.0, 0.0, 100.0, 10.0), 1.0);
         assert!(
             resolved.stops[0].0 <= resolved.stops[1].0,
             "clamped monotonic: {:?}",

@@ -7,21 +7,21 @@
 //! never hard-codes Tailwind utility names (the pipeline is Tailwind compiler
 //! → CSS → profile check → renderer).
 //!
-//! **M0 scope:** the v0 profile manifest transcribed from the spec
-//! (`docs/okf/specs/tailwind-profile-v0.md`).
+//! **M0 scope:** the v0 profile manifest started from the spec
+//! (`docs/okf/specs/tailwind-profile-v0.md`); positioning follows the
+//! implemented profile (ADR 0007/0009).
 //!
 //! **M1.1 scope (ADR 0004):** classification operates on declaration
-//! *values*, not just property names — `position: sticky` and complex 3D
-//! transforms are distinguishable from their supported siblings — and the
-//! three-tier result (`Supported` / `Normalized` / `Unsupported`) plus
-//! replacement suggestions match what the M3 `velqu css check` must report.
+//! *values*, not just property names. It distinguishes supported values
+//! from deferred ones (such as 3D transforms) and can give value-specific
+//! guidance even when the whole property is deferred, as with `position`.
 //!
-//! **M3 (shipped):** the v0 utility synthesizer — `compile_utilities`
-//! maps Tailwind v3-compatible classes to plain CSS (the "Tailwind build"
-//! stage of utilities → CSS → profile check → renderer), with
-//! deterministic diagnostics for everything outside the profile — plus
-//! this checker: `check_css` classifies parsed declarations and at-rules
-//! with source lines, driving the `velqu-css-check` CLI.
+//! **M3 (shipped):** the v0 utility synthesizer — [`compile_utilities`]
+//! maps Tailwind v3-compatible classes to plain CSS for the renderer, with
+//! diagnostics for classes outside the profile. [`compile_css_utilities`]
+//! opts into standalone CSS output, including positioning and keyframes
+//! that VelquView cannot apply. [`check_css`] classifies parsed declarations
+//! and at-rules for VelquView, driving the `velqu-css-check` CLI.
 //!
 //! **Deferred beyond M3:** real compiled-Tailwind ingestion (consuming a
 //! `tailwindcss` build output).
@@ -33,7 +33,7 @@ mod compile;
 mod palette;
 
 pub use check::{CheckItem, CheckKind, CheckSummary, check_css, summarize};
-pub use compile::{TailwindBuild, UtilityDiagnostic, compile_utilities};
+pub use compile::{TailwindBuild, UtilityDiagnostic, compile_css_utilities, compile_utilities};
 
 /// How a CSS concept relates to the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +102,7 @@ pub struct CssProfile {
     pub deferred: &'static [&'static str],
 }
 
-/// Feature areas of profile v0, per the spec.
+/// Feature areas of profile v0; positioning follows the renderer's ADR 0007/0009 limits.
 pub const PROFILE_V0: CssProfile = CssProfile {
     id: "velqu-css-profile-v0",
     areas: &[
@@ -111,11 +111,6 @@ pub const PROFILE_V0: CssProfile = CssProfile {
             title: "Layout",
             properties: &[
                 "display",
-                "position",
-                "top",
-                "right",
-                "bottom",
-                "left",
                 "gap",
                 "row-gap",
                 "column-gap",
@@ -143,8 +138,6 @@ pub const PROFILE_V0: CssProfile = CssProfile {
                 "margin",
                 "padding",
                 "box-sizing",
-                "inset",
-                "z-index",
                 "overflow",
                 "overflow-x",
                 "overflow-y",
@@ -223,7 +216,9 @@ pub const PROFILE_V0: CssProfile = CssProfile {
         },
     ],
     deferred: &[
-        "position: sticky",
+        "position",
+        "inset offsets",
+        "z-index",
         "filters / backdrop filters",
         "blend modes",
         "CSS masks",
@@ -237,10 +232,9 @@ pub const PROFILE_V0: CssProfile = CssProfile {
 impl CssProfile {
     /// Property-name-level classification against this profile.
     ///
-    /// **Concept-level note:** this answers "is the property known at all",
-    /// not "is this declaration supported" — [`classify_declaration`]
-    /// distinguishes values (e.g. `position: sticky`). Use this for manifest
-    /// membership questions only.
+    /// This answers whether the property is in the supported manifest, not
+    /// whether a particular declaration is supported. [`classify_declaration`]
+    /// distinguishes values (e.g. 2D vs. 3D transforms).
     ///
     /// `--*` in the manifest matches any custom property; `var()` matches
     /// `var(…)` values.
@@ -298,13 +292,23 @@ const TRANSFORM_3D_TOKENS: &[&str] = &[
     "perspective",
 ];
 
+/// The positioning capabilities deferred by the renderer (ADR 0007/0009).
+/// Shared by the declaration checker and the renderer-target compiler filter.
+fn renderer_positioning_feature(property: &str) -> Option<&'static str> {
+    match property {
+        "position" => Some("positioning"),
+        "inset" | "top" | "right" | "bottom" | "left" => Some("inset offsets"),
+        "z-index" => Some("stacking order"),
+        _ => None,
+    }
+}
+
 /// Classifies one parsed declaration (property + value) against profile v0.
 ///
-/// This is the concept-level check the M3 checker will call per declaration.
-/// Property membership is the baseline; specific properties refine by value:
+/// Property membership is the baseline; some properties give finer guidance:
 ///
-/// * `position` — `relative`/`absolute`/`static` supported; `sticky`
-///   (deferred by the spec) and `fixed` unsupported with suggestions;
+/// * `position`, inset offsets, and `z-index` are unsupported (ADR 0007/0009).
+///   Suggestions for `position` depend on the value;
 /// * `display` — the profile's block/inline/none/flex/grid values;
 /// * `transform` — 2D translate/scale/rotate/matrix supported, 3D forms
 ///   deferred;
@@ -321,7 +325,7 @@ const TRANSFORM_3D_TOKENS: &[&str] = &[
 ///
 /// assert_eq!(
 ///     classify_declaration("position", "absolute").compatibility,
-///     Compatibility::Supported
+///     Compatibility::Unsupported
 /// );
 /// assert_eq!(
 ///     classify_declaration("color", "oklch(0.7 0.1 250)").compatibility,
@@ -335,29 +339,47 @@ pub fn classify_declaration(property: &str, value: &str) -> Classification {
     if property.starts_with("--") {
         return Classification::tier(Compatibility::Supported);
     }
+    // Keep guidance for known positioning values even though these properties
+    // are not in the supported manifest.
+    if renderer_positioning_feature(&property).is_some() {
+        let replacement = match (property.as_str(), value.as_str()) {
+            ("position", "static") => Some("omit position: static; normal flow is the default"),
+            ("position", "relative") => Some(
+                "position: relative is deferred; use margins for layout or \
+                 transform: translate(...) for a paint-only offset",
+            ),
+            ("position", "absolute") => Some(
+                "position: absolute is deferred; use flex or grid alignment where normal-flow \
+                 placement suffices",
+            ),
+            ("position", "sticky") => Some(
+                "position: sticky is deferred; place the header outside its scrolling pane \
+                 in normal flow",
+            ),
+            ("position", "fixed") => Some(
+                "position: fixed is deferred; arrange persistent controls beside scrolling \
+                 content in a flex or grid layout",
+            ),
+            ("position", _) => None,
+            ("z-index", _) => Some(
+                "z-index is deferred; to change the paint order of overlapping siblings, \
+                 reorder them in the markup",
+            ),
+            _ => Some(
+                "inset offsets are deferred; use margins for layout or \
+                 transform: translate(...) for a paint-only offset",
+            ),
+        };
+        return Classification {
+            compatibility: Compatibility::Unsupported,
+            replacement,
+        };
+    }
     if PROFILE_V0.classify_property(&property) == Compatibility::Unsupported {
         return Classification::tier(Compatibility::Unsupported);
     }
 
     match property.as_str() {
-        "position" => match value.as_str() {
-            "relative" | "absolute" | "static" => Classification::tier(Compatibility::Supported),
-            "sticky" => Classification {
-                compatibility: Compatibility::Unsupported,
-                replacement: Some(
-                    "position: sticky is deferred in profile v0; restructure with a scroll \
-                     container or fixed side layout",
-                ),
-            },
-            "fixed" => Classification {
-                compatibility: Compatibility::Unsupported,
-                replacement: Some(
-                    "position: fixed is deferred in profile v0; place the element at the \
-                     document root with position: absolute",
-                ),
-            },
-            _ => Classification::tier(Compatibility::Unsupported),
-        },
         "display" => match value.as_str() {
             "block" | "inline" | "none" | "flex" | "grid" => {
                 Classification::tier(Compatibility::Supported)
@@ -508,8 +530,8 @@ pub fn classify_at_rule(name: &str) -> Classification {
         "keyframes" => Classification {
             compatibility: Compatibility::Unsupported,
             replacement: Some(
-                "CSS animations are outside profile v0; drive motion from state bindings or a \
-                 future native animation primitive",
+                "the renderer skips @keyframes; use a native animation preset \
+                 (animation: spin, pulse, or bounce) or a transition",
             ),
         },
         "font-face" => Classification {
@@ -576,6 +598,13 @@ mod tests {
     #[test]
     fn deferred_properties_are_unsupported() {
         for property in [
+            "position",
+            "inset",
+            "top",
+            "right",
+            "bottom",
+            "left",
+            "z-index",
             "backdrop-filter",
             "mix-blend-mode",
             "mask-image",
@@ -593,24 +622,31 @@ mod tests {
 
     #[test]
     fn profile_lists_deferred_work() {
-        assert!(PROFILE_V0.deferred.contains(&"position: sticky"));
-        assert!(!PROFILE_V0.deferred.is_empty());
+        for feature in ["position", "inset offsets", "z-index"] {
+            assert!(PROFILE_V0.deferred.contains(&feature));
+        }
     }
 
     #[test]
-    fn position_values_are_distinguished() {
-        for value in ["relative", "absolute", "static"] {
-            assert_eq!(
-                classify_declaration("position", value).compatibility,
-                Compatibility::Supported,
-                "position: {value}"
+    fn deferred_position_values_keep_specific_guidance() {
+        for (value, hint) in [
+            ("static", "normal flow"),
+            ("relative", "transform: translate"),
+            ("absolute", "flex or grid alignment"),
+            ("sticky", "outside its scrolling pane"),
+            (" FIXED ", "persistent controls"),
+        ] {
+            let verdict = classify_declaration(" Position ", value);
+            assert_eq!(verdict.compatibility, Compatibility::Unsupported);
+            assert!(
+                verdict.replacement.is_some_and(|text| text.contains(hint)),
+                "position: {value}: {verdict:?}"
             );
         }
-        let sticky = classify_declaration("position", "sticky");
-        assert_eq!(sticky.compatibility, Compatibility::Unsupported);
-        assert!(sticky.replacement.unwrap().contains("sticky"));
-        let fixed = classify_declaration("position", " FIXED ");
-        assert_eq!(fixed.compatibility, Compatibility::Unsupported);
+        assert_eq!(
+            classify_declaration("position", "nonsense"),
+            Classification::tier(Compatibility::Unsupported)
+        );
     }
 
     #[test]

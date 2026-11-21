@@ -216,15 +216,16 @@ fn console_sink_is_recorded_and_capped() {
     let rt = runtime();
     rt.evaluate("console.log('hello', 42); velqu.log('via velqu'); console.error('bad', true);")
         .expect("logging never fails");
-    let lines = rt.diagnostics();
-    assert_eq!(lines[..3].to_vec(), ["hello 42", "via velqu", "bad true"]);
-    rt.evaluate("for (let i = 0; i < 10000; i++) { console.log('spam'); }")
-        .expect("spam is not an error");
-    assert!(
-        rt.diagnostics().len() <= 256,
-        "the sink is line-capped: {}",
-        rt.diagnostics().len()
-    );
+    let mut expected = Vec::from(["hello 42", "via velqu", "bad true"].map(str::to_owned));
+    assert_eq!(rt.diagnostics(), expected);
+    // Exercise one write beyond capacity without timing console throughput.
+    let fill = MAX_DIAGNOSTIC_LINES - expected.len();
+    rt.evaluate(&format!(
+        "for (let i = 0; i < {fill}; i++) {{ console.log('kept'); }} console.log('overflow');"
+    ))
+    .expect("logging past the cap is not an error");
+    expected.resize(MAX_DIAGNOSTIC_LINES, "kept".to_owned());
+    assert_eq!(rt.diagnostics(), expected);
 }
 
 #[test]

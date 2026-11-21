@@ -3,29 +3,19 @@
 //! (utilities → CSS → profile check → renderer), with no node toolchain and
 //! no network.
 //!
-//! v0 scope is exactly the renderer's profile expressed as utilities:
-//! display/flex/grid layout, positioning/inset/z-index, spacing, sizing,
-//! the v3 color palette (with `/NN` and `/[0.NN]` opacity modifiers), the
-//! `<number>px` arbitrary lengths the reference UI needs, typography,
-//! borders/radius, overflow, opacity/scale/translate, and the transition
-//! families (`transition-*`, `duration-*`, `ease-*`, `delay-*`, ADR 0024,
-//! with the named animations' `@keyframes` emitted alongside). The
-//! interaction variants (`hover:`, `focus:`, `active:`, and batch 3's
-//! `focus-visible:`) compile to `.class:hover`-style pseudo-class rules
-//! restricted to the renderer's paint-only interaction set (ADR 0011);
-//! fractional sizes and insets (`w-1/2`, `left-1/2`) resolve to
-//! percentages; negative insets (`-top-5`) and margins (`-mr-1`, batch 3)
-//! negate the spacing scale; `cursor-*` maps onto the renderer's cursor
-//! set (grab pair included in batch 3); and `border-[#hex]` arbitrary
-//! colors emit `border-color`. Batch 3 also unlocks the outer box-shadow
-//! family (`shadow-*` presets and `shadow-[…]` arbitrary values against
-//! the renderer's shadow parser), `select-none`, and `truncate`.
-//! Everything else — other variants (`disabled:`, `sm:`), non-px
-//! arbitrary values (`w-[91%]`), rings/filters (CSS-variable composition
-//! and filters), and utilities outside the renderer profile
-//! (`position: sticky`, `pointer-events-*`, `shadow-inner`,
-//! `tabular-nums`) — produces a deterministic diagnostic, never a silent
-//! drop (docs/tailwind-batch2-notes.md records the renderer-side limits).
+//! The renderer target covers display/flex/grid layout, spacing and sizing
+//! (including negative margins, fractional sizes and arbitrary px lengths),
+//! the v3 color palette (with `/NN` and `/[0.NN]` opacity modifiers),
+//! typography, borders/radius, overflow, cursor, outer box shadows, opacity,
+//! transforms, transitions, and native animation presets (ADR 0024).
+//! Interaction variants (`hover:`, `focus:`, `active:`, `focus-visible:`)
+//! compile to `.class:hover`-style rules limited to paint properties (ADR 0011).
+//!
+//! The standalone CSS target also emits positioning/inset/z-index utilities
+//! and named `@keyframes`. VelquView does not apply positioning (ADR 0007/0009)
+//! or interpret `@keyframes`; its animation presets need only the `animation`
+//! declaration. Unsupported classes produce deterministic diagnostics (see
+//! docs/tailwind-batch2-notes.md for the renderer-side limits).
 //!
 //! The output is plain CSS: one rule per class, in first-use order, so the
 //! renderer's normal cascade applies (class specificity beats element
@@ -37,7 +27,7 @@
 //! (`.hover\:bg-white\/10:hover`), which is exactly the shape the
 //! renderer's M4b interaction styling matches.
 
-use crate::{is_interaction_paint_property, palette};
+use crate::{is_interaction_paint_property, palette, renderer_positioning_feature};
 
 /// One utility class the compiler could not map, with the reason. The
 /// renderer never sees the class, so this list is the only place a dropped
@@ -62,7 +52,11 @@ pub struct TailwindBuild {
     pub rules: usize,
 }
 
-/// Compiles Tailwind-compatible utility classes into CSS text.
+/// Compiles Tailwind-compatible utility classes into CSS for VelquView.
+///
+/// Positioning, inset and stacking utilities are diagnosed, not emitted.
+/// Native animation presets compile to `animation` declarations only; the
+/// renderer does not consume `@keyframes`.
 ///
 /// ```
 /// use velqu_tailwind::compile_utilities;
@@ -74,6 +68,35 @@ pub struct TailwindBuild {
 /// assert_eq!(build.rules, 3);
 /// ```
 pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
+    compile_for(classes, CompileTarget::Renderer)
+}
+
+/// Compiles the utility subset to standalone CSS, not to the VelquView profile.
+///
+/// This additionally emits `static`/`relative`/`absolute`, insets, the
+/// `z-*` scale, and the `@keyframes` the named animations reference. The
+/// rest of the limited utility and interaction-variant grammar is unchanged.
+/// Use [`compile_utilities`] for stylesheets consumed by VelquView.
+///
+/// ```
+/// use velqu_tailwind::compile_css_utilities;
+///
+/// let build = compile_css_utilities(&["absolute", "inset-0", "animate-spin"]);
+/// assert!(build.diagnostics.is_empty());
+/// assert!(build.css.contains(".absolute { position: absolute; }"));
+/// assert!(build.css.contains("@keyframes spin {"));
+/// ```
+pub fn compile_css_utilities(classes: &[&str]) -> TailwindBuild {
+    compile_for(classes, CompileTarget::StandaloneCss)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompileTarget {
+    Renderer,
+    StandaloneCss,
+}
+
+fn compile_for(classes: &[&str], target: CompileTarget) -> TailwindBuild {
     // Preflight-lite: Tailwind sizing assumes border-box everywhere (the
     // universal selector has zero specificity, so any author rule wins).
     let mut css =
@@ -82,7 +105,7 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
     let mut rules = 0usize;
     let mut seen: Vec<&str> = Vec::new();
     let mut keyframes: Vec<&'static str> = Vec::new();
-    let mut compiled: Vec<(bool, String, Vec<(&'static str, String)>)> = Vec::new();
+    let mut compiled: Vec<CompiledRule> = Vec::new();
 
     for class in classes {
         let class = class.trim();
@@ -98,16 +121,20 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
         if class.starts_with("vv-") {
             continue;
         }
-        match compile_one_class(class) {
+        match compile_one_class(class, target) {
             Ok((selector, declarations)) => {
-                compiled.push((is_transition_modifier(&declarations), selector, declarations));
+                compiled.push(CompiledRule {
+                    modifier: is_transition_modifier(&declarations),
+                    selector,
+                    declarations,
+                });
                 rules += 1;
-                // Tailwind emits the `@keyframes` a named animation needs
-                // alongside the utility; mirror that so the build output is
-                // self-contained (the renderer drives the presets natively,
-                // so this is output completeness, not a runtime dependency).
-                if let Some(name) = named_animation(class) {
-                    if !keyframes.contains(&name) {
+                // Standalone CSS must define the names it references. The
+                // renderer drives these presets itself and skips @keyframes.
+                if target == CompileTarget::StandaloneCss {
+                    if let Some(name) =
+                        named_animation(class).filter(|name| !keyframes.contains(name))
+                    {
                         keyframes.push(name);
                     }
                 }
@@ -126,8 +153,13 @@ pub fn compile_utilities(classes: &[&str]) -> TailwindBuild {
     // earlier element's `duration-500` would silently run at the base
     // 150ms. Modifiers sort after property carriers; within each group the
     // first-appearance order is preserved (stable sort).
-    compiled.sort_by(|a, b| a.0.cmp(&b.0));
-    for (_, selector, declarations) in compiled {
+    compiled.sort_by_key(|rule| rule.modifier);
+    for CompiledRule {
+        selector,
+        declarations,
+        ..
+    } in compiled
+    {
         let body = declarations
             .iter()
             .map(|(property, value)| format!("{property}: {value};"))
@@ -173,6 +205,14 @@ fn escape_class_selector(class: &str) -> String {
 /// `.` plus its declarations.
 type CompiledClass = (String, Vec<(&'static str, String)>);
 
+/// One compiled utility awaiting canonical emission: its transition-modifier
+/// class (emission order key), selector, and declarations.
+struct CompiledRule {
+    modifier: bool,
+    selector: String,
+    declarations: Vec<(&'static str, String)>,
+}
+
 /// The interaction variants the renderer's M4b profile matches (ADR 0011,
 /// frozen set): Tailwind variant name → emitted pseudo-class. Batch 3 adds
 /// `focus-visible` (the renderer's interaction state now distinguishes
@@ -188,11 +228,31 @@ const VARIANT_PSEUDO_CLASSES: [(&str, &str); 4] = [
 
 /// Compiles one class (bare utility or `variant:utility`) into the escaped
 /// selector text that follows the leading `.` plus its declarations.
-fn compile_one_class(class: &str) -> Result<CompiledClass, String> {
+fn compile_one_class(class: &str, target: CompileTarget) -> Result<CompiledClass, String> {
     match class.split_once(':') {
-        Some((variant, inner)) => variant_declarations(class, variant, inner),
-        None => utility_declarations(class).map(|d| (escape_class_selector(class), d)),
+        Some((variant, inner)) => variant_declarations(class, variant, inner, target),
+        None => checked_declarations(class, target).map(|d| (escape_class_selector(class), d)),
     }
+}
+
+/// Check after synthesis so named, fractional, arbitrary and variant-wrapped
+/// forms share the same renderer boundary, without masking invalid values.
+fn checked_declarations(
+    class: &str,
+    target: CompileTarget,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let declarations = utility_declarations(class)?;
+    if target == CompileTarget::Renderer {
+        let deferred = declarations.iter().find_map(|(property, value)| {
+            renderer_positioning_feature(property).map(|feature| (property, value, feature))
+        });
+        if let Some((property, value, feature)) = deferred {
+            return Err(format!(
+                "{property}: {value} is deferred in the renderer ({feature}; ADR 0007/0009)"
+            ));
+        }
+    }
+    Ok(declarations)
 }
 
 /// Compiles a `hover:bg-white/10`-style variant: the inner utility is
@@ -203,7 +263,12 @@ fn compile_one_class(class: &str) -> Result<CompiledClass, String> {
 /// stateful rules with a runtime diagnostic — so a variant whose inner
 /// utility touches anything outside the frozen paint set is diagnosed
 /// here, at build time, instead.
-fn variant_declarations(class: &str, variant: &str, inner: &str) -> Result<CompiledClass, String> {
+fn variant_declarations(
+    class: &str,
+    variant: &str,
+    inner: &str,
+    target: CompileTarget,
+) -> Result<CompiledClass, String> {
     let Some(&(_, pseudo)) = VARIANT_PSEUDO_CLASSES
         .iter()
         .find(|(name, _)| *name == variant)
@@ -219,7 +284,7 @@ fn variant_declarations(class: &str, variant: &str, inner: &str) -> Result<Compi
             "variant {variant}: needs a utility after the colon"
         ));
     }
-    let declarations = utility_declarations(inner)?;
+    let declarations = checked_declarations(inner, target)?;
     if let Some((property, _)) = declarations
         .iter()
         .find(|(property, _)| !is_interaction_paint_property(property))
@@ -286,8 +351,7 @@ fn is_plain_class(class: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Maps one utility class to its declarations, or explains why it is
-/// outside the v0 profile.
+/// Synthesizes one utility's declarations before checking the output target.
 fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, String> {
     // Structural refusals first, with targeted guidance.
     if class.contains(':') {
@@ -298,9 +362,8 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
     if class.contains('!') {
         return Err("the !important modifier is not part of profile v0".into());
     }
-    // Negative utilities (ADR 0024): a leading dash is a sign, not part of
-    // the identifier. `translate-*`, `rotate-*`, the inset families, and
-    // (batch 3) the margin families accept one in profile v0.
+    // A leading dash is a sign, not part of the identifier. `translate-*`,
+    // `rotate-*` and margins accept it, as do insets for standalone CSS.
     let (negative, class) = match class.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, class),
@@ -345,8 +408,7 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
         if alpha.is_some() {
             return Err(OPACITY_MODIFIER_ONLY_ON_COLOR.into());
         }
-        let declarations = arbitrary_value_declarations(class, value)?;
-        return Ok(declarations);
+        return arbitrary_value_declarations(class, value, negative);
     }
 
     // A color utility carrying an opacity modifier resolves here, so the
@@ -712,11 +774,11 @@ fn utility_declarations(class: &str) -> Result<Vec<(&'static str, String)>, Stri
             )),
         },
 
-        // -- positioning (renderer profile: relative/absolute/static) ----------
+        // -- positioning (synthesized for standalone CSS only) ----------------
         ("static" | "relative" | "absolute", None) => Ok(vec![("position", class.to_owned())]),
         ("fixed" | "sticky", None) => Err(format!(
-            "position: {class} is deferred in profile v0; \
-             anchor with a relative/absolute parent instead"
+            "position: {class} is deferred in the renderer (ADR 0007/0009); \
+             standalone CSS synthesis only covers static/relative/absolute"
         )),
         ("inset", Some(value)) => {
             let value = negate_inset(inset_value(value)?, negative, "inset")?;
@@ -915,8 +977,8 @@ const NEGATABLE_INSETS: [&str; 5] = ["top-", "right-", "bottom-", "left-", "inse
 /// margins natively, so this is a compiler gate, not a renderer gap.
 const NEGATABLE_MARGINS: [&str; 7] = ["m-", "mx-", "my-", "mt-", "mr-", "mb-", "ml-"];
 
-/// Negates a spacing-scale inset length for the negative inset utilities
-/// (`-top-5` → -20px). `auto`/`full` have no negative form and diagnose.
+/// Applies a utility's leading dash to a margin or inset px length.
+/// `auto`/`full` have no negative form and diagnose.
 fn negate_inset(value: String, negative: bool, utility: &str) -> Result<String, String> {
     if !negative {
         return Ok(value);
@@ -925,16 +987,13 @@ fn negate_inset(value: String, negative: bool, utility: &str) -> Result<String, 
         Ok(format!("-{value}"))
     } else {
         Err(format!(
-            "cannot negate {utility} value {value:?} (only spacing-scale \
-             lengths have negative forms)"
+            "cannot negate {utility} value {value:?} (expected a non-negative px length)"
         ))
     }
 }
 
-/// Fractional size/inset values (`w-1/2`, `left-1/2`): resolved to a
-/// percentage of the containing block at layout time (the same contract as
-/// `h-full`), which the renderer's length parser accepts. Other fractions
-/// diagnose — the compiler never emits a value the renderer would reject.
+/// Fractional sizes and standalone inset offsets (`w-1/2`, `left-1/2`)
+/// become percentages. Other fractional families diagnose.
 fn fraction_declarations(
     base: &str,
     fraction: &str,
@@ -1009,6 +1068,7 @@ fn hex_color_literal(value: &str) -> Option<&str> {
 fn arbitrary_value_declarations(
     base: &str,
     value: &str,
+    negative: bool,
 ) -> Result<Vec<(&'static str, String)>, String> {
     // `transition-[…]` carries property names, not a length.
     if base == "transition" {
@@ -1090,7 +1150,7 @@ fn arbitrary_value_declarations(
         }
         return Ok(default_border(px_value(value)?));
     }
-    let px = arbitrary_px(value)?;
+    let px = negate_inset(arbitrary_px(value)?, negative, base)?;
     Ok(match base {
         "w" => vec![("width", px)],
         "h" => vec![("height", px)],
@@ -1453,9 +1513,10 @@ fn validate_shadow_layer(layer: &str) -> Result<(), String> {
             continue;
         }
         if token.contains('(') {
-            if !(token.starts_with("rgb(") || token.starts_with("rgba(")) || !token.ends_with(')') {
+            if !is_shadow_rgb_color(token) {
                 return Err(format!(
-                    "invalid shadow color {token:?} (use #hex or rgb()/rgba())"
+                    "invalid shadow color {token:?} (use #hex or rgb()/rgba() with three \
+                     numeric channels in 0..=255 and optional alpha in 0..=1)"
                 ));
             }
             colors += 1;
@@ -1484,6 +1545,40 @@ fn validate_shadow_layer(layer: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Mirror the renderer's `parse_rgb_channels`: a fourth comma channel or
+/// a slash tail can supply alpha; percentages and mixed forms are rejected.
+fn is_shadow_rgb_color(token: &str) -> bool {
+    let Some(inner) = token
+        .strip_prefix("rgb(")
+        .or_else(|| token.strip_prefix("rgba("))
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let (channels, alpha) = if inner.contains(',') {
+        let mut channels: Vec<_> = inner.split(',').map(str::trim).collect();
+        let alpha = if channels.len() == 4 {
+            channels.pop()
+        } else {
+            None
+        };
+        (channels, alpha)
+    } else {
+        let (channels, alpha) = match inner.split_once('/') {
+            Some((channels, alpha)) => (channels, Some(alpha.trim())),
+            None => (inner, None),
+        };
+        (channels.split_ascii_whitespace().collect(), alpha)
+    };
+    let in_range = |text: &str, max| {
+        text.parse::<f32>()
+            .is_ok_and(|value| (0.0..=max).contains(&value))
+    };
+    channels.len() == 3
+        && channels.iter().all(|channel| in_range(channel, 255.0))
+        && alpha.is_none_or(|alpha| in_range(alpha, 1.0))
 }
 
 /// The Tailwind spacing scale: units are 4px per step (0.25rem), with the
@@ -1598,14 +1693,12 @@ fn is_transition_modifier(declarations: &[(&'static str, String)]) -> bool {
     declarations
         .iter()
         .all(|(property, _)| *property != "transition-property")
-        && declarations
-            .iter()
-            .any(|(property, _)| {
-                matches!(
-                    *property,
-                    "transition-duration" | "transition-delay" | "transition-timing-function"
-                )
-            })
+        && declarations.iter().any(|(property, _)| {
+            matches!(
+                *property,
+                "transition-duration" | "transition-delay" | "transition-timing-function"
+            )
+        })
 }
 
 /// The `transition` family's shared duration + easing defaults: every
@@ -2115,8 +2208,9 @@ mod tests {
     }
 
     #[test]
-    fn positioning_and_stacking_compile() {
-        let build = compile_utilities(&[
+    fn positioning_and_stacking_compile_for_standalone_css() {
+        let build = compile_css_utilities(&[
+            "static",
             "relative",
             "absolute",
             "inset-0",
@@ -2133,7 +2227,8 @@ mod tests {
             "z-20",
         ]);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 14);
+        assert_eq!(build.rules, 15);
+        assert!(build.css.contains(".static { position: static; }"));
         assert!(build.css.contains(".relative { position: relative; }"));
         assert!(build.css.contains(".absolute { position: absolute; }"));
         assert!(build.css.contains(".inset-0 {"));
@@ -2150,20 +2245,52 @@ mod tests {
     }
 
     #[test]
-    fn deferred_position_values_still_diagnose() {
-        let build = compile_utilities(&["fixed", "sticky", "z-15"]);
+    fn renderer_diagnoses_positioning_in_all_synthesized_forms() {
+        let cases = [
+            ("static", "position: static"),
+            ("relative", "position: relative"),
+            ("absolute", "position: absolute"),
+            ("inset-0", "inset offsets"),
+            ("-inset-x-2", "inset offsets"),
+            ("inset-y-1/2", "inset offsets"),
+            ("-top-[2px]", "top: -2px"),
+            ("right-0", "right: 0px"),
+            ("bottom-full", "bottom: 100%"),
+            ("left-1/2", "left: 50%"),
+            ("z-10", "z-index: 10"),
+            ("z-auto", "z-index: auto"),
+            ("hover:z-20", "z-index: 20"),
+        ];
+        let classes = cases.map(|(class, _)| class);
+        let build = compile_utilities(&classes);
         assert_eq!(build.rules, 0);
-        let message_for = |class: &str| {
-            build
-                .diagnostics
-                .iter()
-                .find(|d| d.class == class)
-                .map(|d| d.message.clone())
-                .unwrap_or_default()
-        };
-        assert!(message_for("fixed").contains("position: fixed is deferred"));
-        assert!(message_for("sticky").contains("position: sticky is deferred"));
-        assert!(message_for("z-15").contains("unknown z step"));
+        assert_eq!(build.css, compile_utilities(&[]).css);
+        assert_eq!(build.diagnostics.len(), cases.len());
+        for (diagnostic, (class, declaration)) in build.diagnostics.iter().zip(cases) {
+            assert_eq!(diagnostic.class, class);
+            assert!(diagnostic.message.contains(declaration), "{diagnostic:?}");
+            assert!(
+                diagnostic.message.contains("deferred in the renderer"),
+                "{diagnostic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_position_values_still_diagnose() {
+        let classes = ["fixed", "sticky", "z-15"];
+        for build in [compile_utilities(&classes), compile_css_utilities(&classes)] {
+            assert_eq!(build.rules, 0);
+            assert_eq!(build.diagnostics.len(), 3);
+            for (diagnostic, (class, expected)) in build.diagnostics.iter().zip([
+                ("fixed", "position: fixed is deferred"),
+                ("sticky", "position: sticky is deferred"),
+                ("z-15", "unknown z step"),
+            ]) {
+                assert_eq!(diagnostic.class, class);
+                assert!(diagnostic.message.contains(expected), "{diagnostic:?}");
+            }
+        }
     }
 
     #[test]
@@ -2201,10 +2328,9 @@ mod tests {
             "text-[12px]",
             "min-w-0",
             "min-h-0",
-            "top-[2px]",
         ]);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 12);
+        assert_eq!(build.rules, 11);
         assert!(build.css.contains(".h-\\[48px\\] { height: 48px; }"));
         assert!(build.css.contains(".w-\\[3px\\] { width: 3px; }"));
         assert!(build.css.contains(".w-\\[86px\\] { width: 86px; }"));
@@ -2226,7 +2352,34 @@ mod tests {
         assert!(build.css.contains(".text-\\[12px\\] { font-size: 12px; }"));
         assert!(build.css.contains(".min-w-0 { min-width: 0px; }"));
         assert!(build.css.contains(".min-h-0 { min-height: 0px; }"));
-        assert!(build.css.contains(".top-\\[2px\\] { top: 2px; }"));
+    }
+
+    #[test]
+    fn arbitrary_px_margins_and_insets_keep_the_leading_negative_sign() {
+        let margins = compile_utilities(&["-mt-[3.5px]", "-mx-[7px]"]);
+        assert!(margins.diagnostics.is_empty(), "{:?}", margins.diagnostics);
+        assert_eq!(margins.rules, 2);
+        assert!(
+            margins
+                .css
+                .contains(".-mt-\\[3\\.5px\\] { margin-top: -3.5px; }")
+        );
+        assert!(
+            margins
+                .css
+                .contains(".-mx-\\[7px\\] { margin-left: -7px; margin-right: -7px; }")
+        );
+
+        let insets = compile_css_utilities(&["top-[2px]", "-top-[2px]", "-inset-x-[7.5px]"]);
+        assert!(insets.diagnostics.is_empty(), "{:?}", insets.diagnostics);
+        assert_eq!(insets.rules, 3);
+        assert!(insets.css.contains(".top-\\[2px\\] { top: 2px; }"));
+        assert!(insets.css.contains(".-top-\\[2px\\] { top: -2px; }"));
+        assert!(
+            insets
+                .css
+                .contains(".-inset-x-\\[7\\.5px\\] { left: -7.5px; right: -7.5px; }")
+        );
     }
 
     #[test]
@@ -2306,20 +2459,44 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_are_emitted_with_named_animations() {
-        let build = compile_utilities(&["animate-spin", "animate-pulse", "animate-bounce"]);
+    fn named_animations_emit_keyframes_only_for_standalone_css() {
+        let classes = [
+            "animate-spin",
+            "hover:animate-spin",
+            "hover:animate-pulse",
+            "animate-bounce",
+            "animate-none",
+        ];
+        let build = compile_css_utilities(&classes);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 3, "keyframes are not utility rules");
-        // The keyframes follow the utility rules, once per named animation.
-        let spin_rule = build.css.find(".animate-spin {").expect("spin rule");
+        assert_eq!(
+            build.rules,
+            classes.len(),
+            "keyframes are not utility rules"
+        );
+        // The keyframes follow the utility rules, once per named animation,
+        // including when the name is only referenced by a variant.
+        let last_rule = build
+            .css
+            .find(".animate-none {")
+            .expect("last utility rule");
         let keyframes = build.css.find("@keyframes spin {").expect("spin keyframes");
-        assert!(spin_rule < keyframes);
+        assert!(last_rule < keyframes);
+        assert_eq!(build.css.matches("@keyframes").count(), 3);
         assert!(build.css.contains("to { transform: rotate(360deg); }"));
         assert!(build.css.contains("@keyframes pulse {"));
         assert!(build.css.contains("50% { opacity: 0.5; }"));
         assert!(build.css.contains("@keyframes bounce {"));
-        // Unrelated builds do not carry unused keyframes.
-        let plain = compile_utilities(&["flex"]);
+
+        let renderer = compile_utilities(&classes);
+        assert!(
+            renderer.diagnostics.is_empty(),
+            "{:?}",
+            renderer.diagnostics
+        );
+        assert_eq!(renderer.rules, build.rules);
+        assert_eq!(renderer.css, build.css[..keyframes]);
+        let plain = compile_css_utilities(&["flex", "animate-none"]);
         assert!(!plain.css.contains("@keyframes"));
     }
 
@@ -2397,8 +2574,12 @@ mod tests {
                 .css
                 .contains(".focus\\:border-\\[\\#2b2540\\]:focus { border-color: #2b2540; }")
         );
-        // The keyframes a variant animation references are still emitted.
-        assert!(build.css.contains("@keyframes spin {"));
+        assert!(
+            build
+                .css
+                .contains(".hover\\:animate-spin:hover { animation: spin 1s linear infinite; }")
+        );
+        assert!(!build.css.contains("@keyframes"));
     }
 
     #[test]
@@ -2491,8 +2672,8 @@ mod tests {
     }
 
     #[test]
-    fn negative_insets_compile() {
-        let build = compile_utilities(&[
+    fn negative_insets_compile_for_standalone_css() {
+        let build = compile_css_utilities(&[
             "-top-5",
             "-left-4",
             "-inset-x-2",
@@ -2552,22 +2733,22 @@ mod tests {
     }
 
     #[test]
-    fn fraction_sizes_and_insets_compile() {
-        let build = compile_utilities(&[
-            "w-1/2",
-            "h-3/4",
-            "left-1/2",
-            "top-1/3",
-            "w-2/3",
-            "bottom-1/6",
-        ]);
+    fn fraction_sizes_compile_for_renderer() {
+        let build = compile_utilities(&["w-1/2", "h-3/4", "w-2/3"]);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 6);
+        assert_eq!(build.rules, 3);
         assert!(build.css.contains(".w-1\\/2 { width: 50%; }"));
         assert!(build.css.contains(".h-3\\/4 { height: 75%; }"));
+        assert!(build.css.contains(".w-2\\/3 { width: 66.666667%; }"));
+    }
+
+    #[test]
+    fn fraction_insets_compile_for_standalone_css() {
+        let build = compile_css_utilities(&["left-1/2", "top-1/3", "bottom-1/6"]);
+        assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
+        assert_eq!(build.rules, 3);
         assert!(build.css.contains(".left-1\\/2 { left: 50%; }"));
         assert!(build.css.contains(".top-1\\/3 { top: 33.333333%; }"));
-        assert!(build.css.contains(".w-2\\/3 { width: 66.666667%; }"));
         assert!(build.css.contains(".bottom-1\\/6 { bottom: 16.666667%; }"));
     }
 
@@ -2711,10 +2892,12 @@ mod tests {
             "shadow-[0_10px_24px_-10px_rgba(31,37,80,0.8)]",
             "shadow-[0_1px_2px_#0000000d]",
             "shadow-[0_0_0_1px_rgb(255_255_255/0.2)]",
+            "shadow-[0_2px_rgb(0.5,_127.5,_255)]",
+            "shadow-[0_3px_rgba(255_0_1)]",
             "shadow-[none]",
         ]);
         assert!(build.diagnostics.is_empty(), "{:?}", build.diagnostics);
-        assert_eq!(build.rules, 4);
+        assert_eq!(build.rules, 6);
         assert!(
             build
                 .css
@@ -2726,6 +2909,12 @@ mod tests {
                 .css
                 .contains("box-shadow: 0 0 0 1px rgb(255 255 255/0.2);")
         );
+        assert!(
+            build
+                .css
+                .contains("box-shadow: 0 2px rgb(0.5, 127.5, 255);")
+        );
+        assert!(build.css.contains("box-shadow: 0 3px rgba(255 0 1);"));
         assert!(
             build
                 .css
@@ -2754,6 +2943,35 @@ mod tests {
         assert!(message_for("shadow-[5px]").contains("offset-x"));
         assert!(message_for("shadow-[0_1px_2px_oklch(0.7_0.1_250)]").contains("rgb()"));
         assert!(message_for("shadow-[0_1px_2px_#zz]").contains("#hex"));
+    }
+
+    #[test]
+    fn arbitrary_shadows_reject_invalid_rgb_channels() {
+        let classes = [
+            "shadow-[0_1px_rgb(1,2)]",
+            "shadow-[0_1px_rgb(1,,3)]",
+            "shadow-[0_1px_rgba(1,2,3,0.5,0.5)]",
+            "shadow-[0_1px_rgba(1_2_3_0.5)]",
+            "shadow-[0_1px_rgb(1,2,3/0.5)]",
+            "shadow-[0_1px_rgb(1_2_3/)]",
+            "shadow-[0_1px_rgb(256,0,0)]",
+            "shadow-[0_1px_rgb(1_-1_1)]",
+            "shadow-[0_1px_rgb(100%,0,0)]",
+            "shadow-[0_1px_rgb(NaN,0,0)]",
+            "shadow-[0_1px_rgba(0,0,0,-0.1)]",
+            "shadow-[0_1px_rgb(0_0_0/1.1)]",
+            "shadow-[0_1px_rgb(0_0_0/inf)]",
+        ];
+        let build = compile_utilities(&classes);
+        assert_eq!(build.rules, 0);
+        assert_eq!(build.diagnostics.len(), classes.len());
+        for (diagnostic, class) in build.diagnostics.iter().zip(classes) {
+            assert_eq!(diagnostic.class, class);
+            assert!(
+                diagnostic.message.contains("invalid shadow color"),
+                "{diagnostic:?}"
+            );
+        }
     }
 
     #[test]

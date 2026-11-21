@@ -19,8 +19,10 @@
 //! * frame buffers are pixel-bounded upstream and allocated fallibly.
 
 use crate::color::Color;
-use crate::display_list::{Affine2D, DisplayItem, DisplayList, Rect, ResolvedGradient, ResolvedGradientKind};
-use crate::font::FontStore;
+use crate::display_list::{
+    Affine2D, DisplayItem, DisplayList, Rect, ResolvedGradient, ResolvedGradientKind,
+};
+use crate::font::{FontStore, FontWeight, Glyph};
 use crate::viewport::Viewport;
 use crate::{Frame, VelquError};
 
@@ -71,17 +73,19 @@ pub(crate) fn paint_document(
     // Damage clipping: with a previous frame, keep its pixels and clear +
     // repaint only inside the damage rect. The rect is clamped and
     // integer-snapped outward so every partial item stays covered.
-    let damage = previous.as_ref().map(|(_, rect)| clamp_damage(rect, viewport));
+    let damage = previous
+        .as_ref()
+        .map(|(_, rect)| clamp_damage(rect, viewport));
     match (&previous, damage) {
         (Some((pixels, _)), Some(rect)) => {
             let (dx0, dy0, dx1, dy1) = rect;
             let w = viewport.width() as usize;
+            rgba.copy_from_slice(pixels);
             if dx1 > dx0 && dy1 > dy0 {
-                rgba.copy_from_slice(pixels);
                 for py in dy0..dy1 {
                     let row = py as usize * w * 4;
-                    for px in rgba[row + dx0 as usize * 4..row + dx1 as usize * 4]
-                        .chunks_exact_mut(4)
+                    for px in
+                        rgba[row + dx0 as usize * 4..row + dx1 as usize * 4].chunks_exact_mut(4)
                     {
                         px[0] = background.r;
                         px[1] = background.g;
@@ -234,7 +238,9 @@ fn clamp_damage(rect: &Rect, viewport: Viewport) -> (i64, i64, i64, i64) {
     let x0 = rect.x.floor().max(0.0) as i64;
     let y0 = rect.y.floor().max(0.0) as i64;
     let x1 = (rect.x + rect.w).ceil().clamp(0.0, viewport.width() as f32) as i64;
-    let y1 = (rect.y + rect.h).ceil().clamp(0.0, viewport.height() as f32) as i64;
+    let y1 = (rect.y + rect.h)
+        .ceil()
+        .clamp(0.0, viewport.height() as f32) as i64;
     (x0, y0, x1.max(x0), y1.max(y0))
 }
 
@@ -430,9 +436,8 @@ impl PaintCtx<'_> {
     /// corner radius scales with the transform (ADR 0024). Rotated shapes
     /// subsample through inverse transform mapping.
     ///
-    /// Row spans: per scanline the inside interval is derived from the same
-    /// corner math (conservative ±2px, exact predicate inside), so the
-    /// outside-span scan disappears.
+    /// Row spans bound the horizontal extent of the rounded shape across
+    /// the full pixel row; coverage is still decided per pixel.
     fn fill_rounded(&mut self, rect: &Rect, radius: f32, color: Color) {
         let color = self.modulate(color);
         if self.transform.is_axis_aligned() {
@@ -521,7 +526,10 @@ impl PaintCtx<'_> {
             let scale = self.transform.scale_factor();
             let placed_outer = self.transform.apply_rect(outer);
             let placed_inner = self.transform.apply_rect(inner);
-            let radius = radius * scale;
+            let radius = (radius * scale)
+                .min(placed_outer.w / 2.0)
+                .min(placed_outer.h / 2.0)
+                .max(0.0);
             let inner_radii = [
                 inner_radii[0] * scale,
                 inner_radii[1] * scale,
@@ -537,111 +545,75 @@ impl PaintCtx<'_> {
                 .min(self.height as f32)
                 .ceil() as i64;
             let (rows0, rows1) = self.damage_rows(y0, y1);
-            // Per-row the ring is two horizontal bands (left/right of the
-            // hole) on rows where every pixel is *certainly* deep inside
-            // the hole, and the full outer span otherwise. The exclusion
-            // mirrors `pixel_deep_inside_inner` in range form: a pixel is
-            // skippable only when its whole 4x4 sample footprint (±0.375
-            // around the center) sits ≥ [`SDF_MARGIN`] inside every hole
-            // edge and outside every corner zone (`r_max + SDF_MARGIN`
-            // reach). Everything the range form cannot guarantee is
-            // visited and decided per pixel, so coverage is bit-identical
-            // to the full-span scan while the hole interior — eight rings
-            // × the whole shadow bbox during a morph — is never touched.
+            // Omit the middle of the hole only where every sample in it is
+            // guaranteed inside, including with unequal inner corner radii.
             let sub_radius = (SUBGRID - 1) as f32 / (2.0 * SUBGRID as f32);
-            // The corner-zone reach uses the hole radius clamped to the
-            // hole's half-dimensions exactly like
-            // `point_in_rounded_rect4` clamps per-corner radii — a
-            // `rounded-full` author radius (9999px) must not turn the
-            // zone into the whole shape and void the interior exclusion.
+            let inner_half = placed_inner.w.min(placed_inner.h) / 2.0;
             let r_inner_max = inner_radii
-                .iter()
-                .cloned()
+                .into_iter()
                 .fold(0.0f32, f32::max)
-                .min(placed_inner.w / 2.0)
-                .min(placed_inner.h / 2.0)
+                .min(inner_half)
                 .max(0.0);
-            let zone = r_inner_max + SDF_MARGIN;
-            let y0e = placed_inner.y;
-            let y1e = placed_inner.y + placed_inner.h;
-            let cross_lo = (y0e + SDF_MARGIN + sub_radius - 0.5).ceil() as i64;
-            let cross_hi = (y1e - SDF_MARGIN - sub_radius - 0.5).ceil() as i64;
+            let y_pad = SDF_MARGIN + sub_radius;
+            let x_pad = r_inner_max + y_pad;
+            let cross_lo = (placed_inner.y + y_pad - 0.5).ceil() as i64;
+            let cross_hi = (placed_inner.y + placed_inner.h - y_pad - 0.5).ceil() as i64;
+            let excl_lo = (placed_inner.x + x_pad - 0.5).ceil() as i64;
+            let excl_hi = (placed_inner.x + placed_inner.w - x_pad - 0.5).ceil() as i64;
+
+            let r_inner_min = inner_radii
+                .into_iter()
+                .fold(f32::MAX, f32::min)
+                .min(inner_half)
+                .max(0.0);
+            let outside_hole = r_inner_min + SDF_MARGIN;
+            let outside_hole2 = outside_hole * outside_hole;
+            let outside_outer = radius + SDF_MARGIN;
+            let outside_outer2 = outside_outer * outside_outer;
             for py in rows0..rows1 {
                 let (span0, span1) = rounded_row_span(&placed_outer, radius, py);
                 if span0 >= span1 {
                     continue;
                 }
                 let cy = py as f32 + 0.5;
-                // Skippable interior on crossing rows: pixels whose whole
-                // sample footprint sits beyond every corner zone reach
-                // (`zone`) and ≥ [`SDF_MARGIN`] inside the straight edges.
-                // Corner-zone rows keep only their middle range — the
-                // zones hug the hole's left/right ends.
-                let x_pad = zone + sub_radius;
-                let excl_lo = (placed_inner.x + x_pad - 0.5).ceil() as i64;
-                let excl_hi = (placed_inner.x + placed_inner.w - x_pad - 0.5).ceil() as i64;
-                let crossing = py >= cross_lo && py < cross_hi;
-                let bands: [(i64, i64); 2] = if crossing {
-                    [
-                        (span0.max(x0), excl_lo.min(span1)),
-                        (excl_hi.max(span0), span1.min(x1)),
-                    ]
+                let qyo = (cy - (placed_outer.y + placed_outer.h / 2.0)).abs()
+                    - (placed_outer.h / 2.0 - radius);
+                let qyi = (cy - (placed_inner.y + placed_inner.h / 2.0)).abs()
+                    - (placed_inner.h / 2.0 - r_inner_min);
+                let dyo = qyo.max(0.0);
+                let dyi = qyi.max(0.0);
+                // Pad the outer span before splitting; the two bands must
+                // never overlap and blend the same pixels twice.
+                let (cols0, cols1) = self.damage_cols((span0 - 2).max(x0), (span1 + 2).min(x1));
+                let bands = if py >= cross_lo && py < cross_hi && excl_lo < excl_hi {
+                    [(cols0, cols1.min(excl_lo)), (cols0.max(excl_hi), cols1)]
                 } else {
-                    [(span0.max(x0), span1.min(x1)), (0, 0)]
+                    [(cols0, cols1), (0, 0)]
                 };
-                for (band0, band1) in bands {
-                    if band1 <= band0 {
-                        continue;
-                    }
-                    // The +-2px wing covers the SDF boundary band (±0.71
-                    // around the exact span edge — fractional shapes put
-                    // real partial coverage there); the per-pixel SDF
-                    // classifies wing pixels exactly as the full scan did.
-                    let (cols0, cols1) = self.damage_cols(band0 - 2, band1 + 2);
-                    for px in cols0.max(x0)..cols1.min(x1) {
+                for (col0, col1) in bands {
+                    for px in col0..col1 {
                         if !self.clip_contains(px, py) {
                             continue;
                         }
                         let cx = px as f32 + 0.5;
-                        // Squared SDF classification (no sqrt): with
-                        // q = |p - center| - (half_extent - r), the signed
-                        // distance is sqrt(dx^2+dy^2) + min(max(qx,qy),0)
-                        // - r, so `sd >= m` reduces to `d2 >= (r+m)^2` and
-                        // `sd <= -m` to `qx <= -m || qy <= -m` — exact in
-                        // every region of the distance field.
                         let qxo = (cx - (placed_outer.x + placed_outer.w / 2.0)).abs()
-                            - outer_hw(radius, &placed_outer);
-                        let qyo = (cy - (placed_outer.y + placed_outer.h / 2.0)).abs()
-                            - outer_hh(radius, &placed_outer);
+                            - (placed_outer.w / 2.0 - radius);
                         let dxo = qxo.max(0.0);
-                        let dyo = qyo.max(0.0);
-                        if dxo * dxo + dyo * dyo
-                            >= (radius + SDF_MARGIN) * (radius + SDF_MARGIN)
-                        {
+                        let d2 = dxo * dxo + dyo * dyo;
+                        if d2 >= outside_outer2 {
                             continue; // fully outside the outer shape
                         }
-                        // Fast path: deep inside the outer shape and safely
-                        // outside the hole — coverage is exactly 1 and the
-                        // 16x2 subsample grid would only confirm it. The
-                        // hole test uses the smallest per-corner radius, so
-                        // the assumed hole is the LARGEST the shape can be
-                        // and the "safely outside" verdict is conservative.
-                        let r_inner_min = inner_radii
-                            .iter()
-                            .cloned()
-                            .fold(f32::MAX, f32::min)
-                            .min(placed_inner.w / 2.0)
-                            .min(placed_inner.h / 2.0)
-                            .max(0.0);
+                        // Solve `sqrt(d2) + min(max(qx, qy), 0) - r <= -margin`
+                        // for d2. A pixel far from one axis can still be on
+                        // the other axis's antialiased edge.
+                        let limit = radius - SDF_MARGIN - qxo.max(qyo).min(0.0);
+                        let deep_in_outer = limit >= 0.0 && d2 <= limit * limit;
+                        // The smallest inner radius bounds the largest possible
+                        // hole, so being outside it is a conservative fast path.
                         let qxi = (cx - (placed_inner.x + placed_inner.w / 2.0)).abs()
-                            - outer_hw(r_inner_min, &placed_inner);
-                        let qyi = (cy - (placed_inner.y + placed_inner.h / 2.0)).abs()
-                            - outer_hh(r_inner_min, &placed_inner);
+                            - (placed_inner.w / 2.0 - r_inner_min);
                         let dxi = qxi.max(0.0);
-                        let dyi = qyi.max(0.0);
-                        let safe_outside_hole = dxi * dxi + dyi * dyi
-                            >= (r_inner_min + SDF_MARGIN) * (r_inner_min + SDF_MARGIN);
-                        let deep_in_outer = qxo <= -SDF_MARGIN || qyo <= -SDF_MARGIN;
+                        let safe_outside_hole = dxi * dxi + dyi * dyi >= outside_hole2;
                         if deep_in_outer && safe_outside_hole {
                             self.blend_pixel(px as usize, py as usize, color);
                             continue;
@@ -683,8 +655,7 @@ impl PaintCtx<'_> {
                             }
                         }
                     }
-                    let cov = (outer_hits as f32 - inner_hits as f32)
-                        / (SUBGRID * SUBGRID) as f32;
+                    let cov = (outer_hits as f32 - inner_hits as f32) / (SUBGRID * SUBGRID) as f32;
                     if cov >= 1.0 {
                         self.blend_pixel(px as usize, py as usize, color);
                     } else if cov > 0.0 {
@@ -723,11 +694,16 @@ impl PaintCtx<'_> {
             self.fill_rounded_ring(&bounds, radius, &inner, &[inner_radius; 4], color);
             return;
         }
+        let color = self.modulate(color);
+        if color.a == 0 {
+            return;
+        }
         if self.transform.is_axis_aligned() {
             let scale = self.transform.scale_factor();
             let placed_bounds = self.transform.apply_rect(&bounds);
             let placed_inner = self.transform.apply_rect(&inner);
             let blur = blur * scale;
+            let radius = radius * scale;
             let inner_radius = inner_radius * scale;
             let x0 = (placed_bounds.x - blur).max(0.0).floor() as i64;
             let y0 = (placed_bounds.y - blur).max(0.0).floor() as i64;
@@ -759,13 +735,12 @@ impl PaintCtx<'_> {
                     } else if d_card <= -SDF_MARGIN {
                         0.0
                     } else {
-                        1.0
-                            - rounded_subsample_coverage(
-                                &placed_inner,
-                                inner_radius,
-                                px as f32,
-                                py as f32,
-                            )
+                        1.0 - rounded_subsample_coverage(
+                            &placed_inner,
+                            inner_radius,
+                            px as f32,
+                            py as f32,
+                        )
                     };
                     if outside <= 0.0 {
                         continue;
@@ -778,18 +753,18 @@ impl PaintCtx<'_> {
                 }
             }
         } else if let Some(inv) = self.transform.inverse() {
-            // Rotated: per-sample falloff × card mask averaged over the
-            // fixed grid, matching the other transformed fills.
-            let (bx0, by0, bx1, by1) =
-                transform_bounds(&self.transform, &bounds, self.width, self.height);
-            let x0 = ((bx0 as f32 - blur).max(0.0)).floor() as u32;
-            let y0 = ((by0 as f32 - blur).max(0.0)).floor() as u32;
-            let x1 = ((bx1 as f32 + blur).min(self.width as f32)).ceil() as u32;
-            let y1 = ((by1 as f32 + blur).min(self.height as f32)).ceil() as u32;
+            // The falloff is sampled in local space, so expand the shadow
+            // there before mapping its pixel bounds.
+            let (x0, y0, x1, y1) = transform_bounds(
+                &self.transform,
+                &outset(bounds, blur),
+                self.width,
+                self.height,
+            );
             let (rows0, rows1) = self.damage_rows(y0 as i64, y1 as i64);
             for py in rows0..rows1 {
                 for px in x0..x1 {
-                    if !self.clip_contains(px as i64, py as i64) {
+                    if !self.clip_contains(px as i64, py) {
                         continue;
                     }
                     let mut accumulated = 0.0f32;
@@ -887,7 +862,7 @@ impl PaintCtx<'_> {
                     }
                     let (lx, ly) = inv.apply_point(px as f32 + 0.5, py as f32 + 0.5);
                     let cov = subsample_coverage(&inv, px as f32, py as f32, |lx, ly| {
-                        lx >= rect.x && lx < rect.x + rect.w && ly >= rect.y && ly < rect.y + rect.h
+                        point_in_rounded_rect(lx, ly, rect, radius)
                     });
                     if cov <= 0.0 {
                         continue;
@@ -977,36 +952,18 @@ impl PaintCtx<'_> {
     /// the raster size scales by the transform's scale factor (rounded to
     /// a whole-pixel size — fontdue's deterministic whole-pixel contract).
     fn draw_text(&mut self, fonts: &mut FontStore, run: &TextRunPlacement<'_>) {
-        let weight = if run.bold {
-            crate::font::FontWeight::Bold
-        } else {
-            crate::font::FontWeight::Regular
-        };
-        let face = fonts.face_index(run.family.as_deref(), weight);
-        let scale = self.transform.scale_factor();
-        let (pen_start, baseline_start) = self
-            .transform
-            .apply_point(run.x.round(), run.baseline_y.round());
-        let px = (run.px as f32 * scale).round().max(1.0) as u16;
         let color = self.modulate(run.color);
-        let mut pen_x = pen_start;
-        let baseline = baseline_start;
         // Damage rows: glyphs fully outside the damage window skip their
         // coverage scans (the blend damage check already guards writes).
         let (damage_y0, damage_y1) = self
             .damage
             .map(|(_, dy0, _, dy1)| (dy0, dy1))
             .unwrap_or((0, self.height as i64));
-        for ch in run.text.chars() {
-            let glyph = fonts.glyph(face, ch, px);
-            let advance = glyph.advance * scale;
-            let bitmap_left = pen_x as i64 + glyph.xmin as i64;
-            let bitmap_top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
+        run.visit_glyphs(fonts, self.transform, |glyph, bitmap_left, bitmap_top| {
+            self.glyphs += 1;
             let bitmap_bottom = bitmap_top + glyph.height as i64;
             if bitmap_bottom <= damage_y0 || bitmap_top >= damage_y1 {
-                self.glyphs += 1;
-                pen_x += advance;
-                continue;
+                return;
             }
             for (row, coverage_row) in glyph.coverage.chunks_exact(glyph.width.max(1)).enumerate() {
                 let dy = bitmap_top + row as i64;
@@ -1029,90 +986,83 @@ impl PaintCtx<'_> {
                     self.blend_pixel(dx as usize, dy as usize, shade);
                 }
             }
-            self.glyphs += 1;
-            pen_x += advance;
-        }
+        });
     }
 }
 
-/// Per-item device-pixel bounds, in paint order — **one entry per item**
-/// (index-aligned with `items`; scoping items that paint nothing carry the
-/// empty [`Rect::default`]). Transform scopes are resolved
-/// (`PushTransform`/`PopTransform`); clip scopes only shrink what an item
-/// paints and are ignored (over-damage is safe, under-damage is not).
-/// Every bound is inflated by a small margin for edge snapping and glyph
-/// overshoot. The render loop diffs consecutive lists through these bounds
-/// to derive the partial-damage window.
-pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
-    const MARGIN: f32 = 3.0;
+/// Index-aligned device-pixel bounds for partial damage. Draw bounds include
+/// rasterized glyph bitmaps and are intersected with the painter's clip
+/// rectangles (rounded clip corners may exclude more). Both ends of each
+/// scope carry the union of its enclosed draws, so changing a scope can
+/// invalidate draws whose own geometry and display items did not change.
+pub(crate) fn display_list_bounds(items: &[DisplayItem], fonts: &mut FontStore) -> Vec<Rect> {
     let mut bounds = Vec::with_capacity(items.len());
     let mut transform = Affine2D::IDENTITY;
-    let mut stack: Vec<Affine2D> = Vec::new();
-    // Running clip intersection, mirroring the painter's clip semantics
-    // (clips live in the scope's parent space, applied by the current
-    // transform). Without this, children of a zero-height overflow-hidden
-    // container (a morphing card at height 0) carry full unclipped
-    // geometry far outside anything they can paint, and the damage diff
-    // over-covers from their (item, bounds) mismatches alone.
+    let mut transform_stack = Vec::new();
     let mut clip: Option<Rect> = None;
-    let mut clip_stack: Vec<Option<Rect>> = Vec::new();
-    for item in items {
-        let rect = match item {
+    let mut clip_stack = Vec::new();
+    let mut scopes: Vec<(usize, Rect)> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let placed = match item {
             DisplayItem::FillRect { rect, .. }
             | DisplayItem::RoundedFill { rect, .. }
             | DisplayItem::GradientFill { rect, .. }
-            | DisplayItem::DrawImage { rect, .. } => Some(*rect),
-            DisplayItem::RoundedBorder { outer, .. } => Some(*outer),
+            | DisplayItem::DrawImage { rect, .. } => {
+                Some(transformed_draw_bounds(&transform, rect))
+            }
+            DisplayItem::RoundedBorder { outer, .. } => {
+                Some(transformed_draw_bounds(&transform, outer))
+            }
             DisplayItem::OuterShadow {
-                bounds: b, blur, ..
+                bounds: rect, blur, ..
             } => {
                 let reach = blur.max(0.0);
-                Some(Rect {
-                    x: b.x - reach,
-                    y: b.y - reach,
-                    w: b.w + 2.0 * reach,
-                    h: b.h + 2.0 * reach,
+                Some(if transform.is_axis_aligned() {
+                    // This path applies a uniform device-space falloff even
+                    // when the rect itself is scaled differently per axis.
+                    let placed = transform.apply_rect(rect);
+                    outset(placed, reach * transform.scale_factor())
+                } else {
+                    // The rotated painter evaluates the falloff in local space.
+                    transformed_draw_bounds(&transform, &outset(*rect, reach))
                 })
             }
-            DisplayItem::TextRun { x, y, text, px, .. } => {
-                // Conservative: 1em per character covers every glyph's
-                // advance; the vertical band covers ascender overshoot and
-                // descenders for whole-pixel sizes.
-                let (bx, baseline) = transform.apply_point(x.round(), y.round());
-                let px_scaled = f32::from(*px) * transform.scale_factor();
-                let width = text.chars().count() as f32 * px_scaled.max(1.0);
-                Some(Rect {
-                    x: bx,
-                    y: baseline - 2.0 * px_scaled.max(1.0),
-                    w: width,
-                    h: 3.0 * px_scaled.max(1.0),
-                })
+            DisplayItem::TextRun {
+                x,
+                y,
+                text,
+                px,
+                bold,
+                color,
+                family,
+            } => {
+                let run = TextRunPlacement {
+                    x: *x,
+                    baseline_y: *y,
+                    text,
+                    px: *px,
+                    bold: *bold,
+                    color: *color,
+                    family,
+                };
+                Some(run.bitmap_bounds(fonts, transform))
             }
             DisplayItem::PushTransform { matrix } => {
-                stack.push(transform);
+                transform_stack.push(transform);
                 transform = transform.compose(matrix);
                 None
             }
             DisplayItem::PopTransform => {
-                transform = stack.pop().unwrap_or(Affine2D::IDENTITY);
+                transform = transform_stack.pop().unwrap_or(Affine2D::IDENTITY);
                 None
             }
-            DisplayItem::PushClip(clip_rect) => {
+            DisplayItem::PushClip(rect) | DisplayItem::PushClipRounded { rect, .. } => {
                 clip_stack.push(clip);
-                let placed = transform.apply_rect(clip_rect);
-                clip = Some(match clip {
-                    Some(outer) => intersect_rects(outer, placed),
-                    None => placed,
-                });
-                None
-            }
-            DisplayItem::PushClipRounded { rect, .. } => {
-                clip_stack.push(clip);
-                let placed = transform.apply_rect(rect);
-                clip = Some(match clip {
-                    Some(outer) => intersect_rects(outer, placed),
-                    None => placed,
-                });
+                // Deliberately use the painter's opposite-corner mapping
+                // and binary mask, not the four-corner draw AABB.
+                let (x0, y0, x1, y1) = clip_pixel_bounds(&transform.apply_rect(rect));
+                let placed = rect_from_edges(x0 as f32, y0 as f32, x1 as f32, y1 as f32);
+                clip = Some(clip.map_or(placed, |outer| intersect_rects(outer, placed)));
                 None
             }
             DisplayItem::PopClip => {
@@ -1121,21 +1071,70 @@ pub(crate) fn display_list_bounds(items: &[DisplayItem]) -> Vec<Rect> {
             }
             DisplayItem::PushOpacity(_) | DisplayItem::PopOpacity => None,
         };
-        bounds.push(rect.map_or_else(Rect::default, |placed_rect| {
-            let placed = transform.apply_rect(&placed_rect);
-            let placed = match clip {
-                Some(outer) => intersect_rects(outer, placed),
-                None => placed,
-            };
-            Rect {
-                x: placed.x - MARGIN,
-                y: placed.y - MARGIN,
-                w: placed.w + 2.0 * MARGIN,
-                h: placed.h + 2.0 * MARGIN,
+        let mut bound = placed.map_or_else(Rect::default, |rect| {
+            clip.map_or(rect, |outer| intersect_rects(outer, rect))
+        });
+        if item.is_scope() {
+            if matches!(
+                item,
+                DisplayItem::PopClip | DisplayItem::PopTransform | DisplayItem::PopOpacity
+            ) {
+                if let Some((push, extent)) = scopes.pop() {
+                    bounds[push] = extent;
+                    bound = extent;
+                }
+            } else {
+                scopes.push((index, Rect::default()));
             }
-        }));
+        }
+        bounds.push(bound);
+        if let Some((_, extent)) = scopes.last_mut() {
+            *extent = union_rects(*extent, bound);
+        }
     }
     bounds
+}
+
+fn transformed_draw_bounds(transform: &Affine2D, rect: &Rect) -> Rect {
+    if transform.is_axis_aligned() {
+        transform.apply_rect(rect)
+    } else {
+        let (x0, y0, x1, y1) = transform.rect_aabb(rect);
+        rect_from_edges(x0.floor(), y0.floor(), x1.ceil(), y1.ceil())
+    }
+}
+
+fn outset(rect: Rect, reach: f32) -> Rect {
+    rect_from_edges(
+        rect.x - reach,
+        rect.y - reach,
+        rect.x + rect.w + reach,
+        rect.y + rect.h + reach,
+    )
+}
+
+fn rect_from_edges(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+    Rect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    }
+}
+
+fn union_rects(a: Rect, b: Rect) -> Rect {
+    if b.w <= 0.0 || b.h <= 0.0 {
+        return a;
+    }
+    if a.w <= 0.0 || a.h <= 0.0 {
+        return b;
+    }
+    rect_from_edges(
+        a.x.min(b.x),
+        a.y.min(b.y),
+        (a.x + a.w).max(b.x + b.w),
+        (a.y + a.h).max(b.y + b.h),
+    )
 }
 
 /// Integer-free rect intersection (empty when disjoint).
@@ -1144,11 +1143,10 @@ fn intersect_rects(a: Rect, b: Rect) -> Rect {
     let y0 = a.y.max(b.y);
     let x1 = (a.x + a.w).min(b.x + b.w);
     let y1 = (a.y + a.h).min(b.y + b.h);
-    Rect {
-        x: x0,
-        y: y0,
-        w: (x1 - x0).max(0.0),
-        h: (y1 - y0).max(0.0),
+    if x1 <= x0 || y1 <= y0 {
+        Rect::default()
+    } else {
+        rect_from_edges(x0, y0, x1, y1)
     }
 }
 
@@ -1164,15 +1162,66 @@ struct TextRunPlacement<'a> {
     family: &'a Option<String>,
 }
 
+impl TextRunPlacement<'_> {
+    /// Shares the painter's integer bitmap placement with the damage walk.
+    fn visit_glyphs(
+        &self,
+        fonts: &mut FontStore,
+        transform: Affine2D,
+        mut visit: impl FnMut(&Glyph, i64, i64),
+    ) {
+        let weight = if self.bold {
+            FontWeight::Bold
+        } else {
+            FontWeight::Regular
+        };
+        let face = fonts.face_index(self.family.as_deref(), weight);
+        let scale = transform.scale_factor();
+        let (mut pen_x, baseline) = transform.apply_point(self.x.round(), self.baseline_y.round());
+        let px = (self.px as f32 * scale).round().max(1.0) as u16;
+        for ch in self.text.chars() {
+            let glyph = fonts.glyph(face, ch, px);
+            let left = pen_x as i64 + glyph.xmin as i64;
+            let top = baseline as i64 - glyph.ymin as i64 - glyph.height as i64;
+            visit(glyph, left, top);
+            pen_x += glyph.advance * scale;
+        }
+    }
+
+    fn bitmap_bounds(&self, fonts: &mut FontStore, transform: Affine2D) -> Rect {
+        let mut bounds = Rect::default();
+        self.visit_glyphs(fonts, transform, |glyph, x, y| {
+            let bitmap = Rect {
+                x: x as f32,
+                y: y as f32,
+                w: glyph.width as f32,
+                h: glyph.height as f32,
+            };
+            bounds = union_rects(bounds, bitmap);
+        });
+        bounds
+    }
+}
+
+/// Half-open bounds of the painter's binary clip. Both origin and size
+/// truncate independently, including for clips with rounded corners.
+fn clip_pixel_bounds(rect: &Rect) -> (i64, i64, i64, i64) {
+    let x = rect.x as i64;
+    let y = rect.y as i64;
+    (
+        x,
+        y,
+        x.saturating_add(rect.w as i64),
+        y.saturating_add(rect.h as i64),
+    )
+}
+
 /// Does the pixel (x, y) sit inside every part of the clip shape? Square
 /// shapes use the integer half-open test; rounded shapes test the pixel
 /// **center** against the rounded bounds.
 fn shape_contains(shape: &ClipShape, x: i64, y: i64) -> bool {
-    let cx = shape.rect.x as i64;
-    let cy = shape.rect.y as i64;
-    let in_rect =
-        x >= cx && x < cx + shape.rect.w as i64 && y >= cy && y < cy + shape.rect.h as i64;
-    if !in_rect {
+    let (x0, y0, x1, y1) = clip_pixel_bounds(&shape.rect);
+    if x < x0 || x >= x1 || y < y0 || y >= y1 {
         return false;
     }
     if shape.radius <= 0.0 {
@@ -1199,29 +1248,28 @@ fn point_in_rounded_rect(x: f32, y: f32, rect: &Rect, radius: f32) -> bool {
     dx * dx + dy * dy <= r * r
 }
 
-/// The half-open pixel-column interval on row `py` that can possibly pass
-/// [`point_in_rounded_rect`] for this shape. Derived from the same corner
-/// math (`dx ≤ √(r²−dy²)` on the row), widened by a 2px f32-safety margin;
-/// the caller still runs the exact predicate inside the span, so coverage
-/// is bit-identical to the full-scan while the outside scan disappears.
-/// Empty (or inverted) spans mean the row has no coverage.
+/// Conservative pixel-column interval for coverage across row `py`.
+/// The widest horizontal slice is at the y closest to the straight zone;
+/// using the center alone can drop covered edge pixels or entire rows.
 fn rounded_row_span(rect: &Rect, radius: f32, py: i64) -> (i64, i64) {
     let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
-    let cy = py as f32 + 0.5;
     if r <= 0.0 {
-        // floor/ceil (not round): the span must include partially covered
-        // edge pixels under coverage rasterization (ADR 0026).
         let x0 = rect.x.floor().max(0.0) as i64;
         let x1 = (rect.x + rect.w).ceil().clamp(0.0, i64::MAX as f32) as i64;
         return (x0, x1);
     }
-    let dy = (rect.y + r - cy).max(cy - (rect.y + rect.h - r)).max(0.0);
+    let y = py as f32;
+    let dy = (rect.y + r - (y + 1.0))
+        .max(y - (rect.y + rect.h - r))
+        .max(0.0);
     if dy > r {
         return (0, 0);
     }
     let dx_max = (r * r - dy * dy).sqrt();
     let span0 = (rect.x + r - dx_max).floor().max(0.0) as i64;
-    let span1 = (rect.x + rect.w - r + dx_max).ceil().clamp(0.0, i64::MAX as f32) as i64;
+    let span1 = (rect.x + rect.w - r + dx_max)
+        .ceil()
+        .clamp(0.0, i64::MAX as f32) as i64;
     (span0, span1)
 }
 
@@ -1282,17 +1330,7 @@ fn span_coverage(px: f32, lo: f32, hi: f32) -> f32 {
 /// Signed distance to a uniform-radius rounded-rectangle boundary:
 /// negative inside, positive outside. Pure `f32` (one `sqrt`), so the
 /// classification is bit-identical across runs (ADR 0026). `sd ≤ 0` is
-/// equivalent to [`point_in_rounded_rect`].
-/// Half-extent minus radius on the x axis (the SDF's inset rectangle).
-fn outer_hw(radius: f32, rect: &Rect) -> f32 {
-    (rect.w / 2.0 - radius.min(rect.w / 2.0).min(rect.h / 2.0)).max(0.0)
-}
-
-/// Half-extent minus radius on the y axis.
-fn outer_hh(radius: f32, rect: &Rect) -> f32 {
-    (rect.h / 2.0 - radius.min(rect.w / 2.0).min(rect.h / 2.0)).max(0.0)
-}
-
+/// equivalent to [`point_in_rounded_rect`] away from half-open ties.
 fn rounded_rect_sdf(x: f32, y: f32, rect: &Rect, radius: f32) -> f32 {
     let r = radius.min(rect.w / 2.0).min(rect.h / 2.0).max(0.0);
     let hw = rect.w / 2.0 - r;
@@ -1360,10 +1398,7 @@ fn pixel_deep_inside_inner(cx: f32, cy: f32, rect: &Rect, radii: &[f32; 4]) -> b
     let y0 = rect.y;
     let x1 = rect.x + rect.w;
     let y1 = rect.y + rect.h;
-    if cx < x0 + SDF_MARGIN
-        || cx > x1 - SDF_MARGIN
-        || cy < y0 + SDF_MARGIN
-        || cy > y1 - SDF_MARGIN
+    if cx < x0 + SDF_MARGIN || cx > x1 - SDF_MARGIN || cy < y0 + SDF_MARGIN || cy > y1 - SDF_MARGIN
     {
         return false;
     }
@@ -1386,12 +1421,7 @@ fn pixel_deep_inside_inner(cx: f32, cy: f32, rect: &Rect, radii: &[f32; 4]) -> b
 /// Coverage of a shape (tested in local space through `inv`) over the
 /// fixed `SUBGRID²` samples of device pixel `(px, py)` — the rotated /
 /// transformed counterpart of the direct subsample functions.
-fn subsample_coverage(
-    inv: &Affine2D,
-    px: f32,
-    py: f32,
-    inside: impl Fn(f32, f32) -> bool,
-) -> f32 {
+fn subsample_coverage(inv: &Affine2D, px: f32, py: f32, inside: impl Fn(f32, f32) -> bool) -> f32 {
     let mut hits = 0usize;
     for sy in SUB_OFFSETS {
         for sx in SUB_OFFSETS {
@@ -1462,17 +1492,381 @@ fn transform_bounds(
     viewport_w: u32,
     viewport_h: u32,
 ) -> (u32, u32, u32, u32) {
-    let p0 = transform.apply_point(rect.x, rect.y);
-    let p1 = transform.apply_point(rect.x + rect.w, rect.y);
-    let p2 = transform.apply_point(rect.x + rect.w, rect.y + rect.h);
-    let p3 = transform.apply_point(rect.x, rect.y + rect.h);
-    let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
-    let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
-    let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
-    let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
+    let (min_x, min_y, max_x, max_y) = transform.rect_aabb(rect);
     let x0 = min_x.floor().max(0.0) as u32;
     let y0 = min_y.floor().max(0.0) as u32;
     let x1 = max_x.ceil().clamp(0.0, viewport_w as f32) as u32;
     let y1 = max_y.ceil().clamp(0.0, viewport_h as f32) as u32;
     (x0, y0, x1, y1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    fn paint(items: Vec<DisplayItem>, fonts: &mut FontStore) -> Frame {
+        paint_document(
+            &DisplayList { items },
+            Color::TRANSPARENT,
+            Viewport::try_new(96, 64, 1.0).unwrap(),
+            fonts,
+            None,
+        )
+        .unwrap()
+        .0
+    }
+
+    fn assert_covers_painted_pixels(bound: Rect, frame: &Frame) {
+        let mut painted = 0;
+        for y in 0..frame.height() {
+            for x in 0..frame.width() {
+                if frame.pixel(x, y).unwrap().a == 0 {
+                    continue;
+                }
+                painted += 1;
+                assert!(
+                    (x as f32) >= bound.x.floor()
+                        && (x as f32) < (bound.x + bound.w).ceil()
+                        && (y as f32) >= bound.y.floor()
+                        && (y as f32) < (bound.y + bound.h).ceil(),
+                    "painted pixel ({x}, {y}) outside {bound:?}"
+                );
+            }
+        }
+        assert!(painted > 0);
+    }
+
+    #[test]
+    fn damage_bounds_cover_translated_text_bitmaps() {
+        let mut fonts = FontStore::bundled();
+        let items = vec![
+            DisplayItem::PushTransform {
+                matrix: Affine2D::translation(31.0, 7.0),
+            },
+            DisplayItem::TextRun {
+                x: 7.7,
+                y: 42.1,
+                text: "WWW".to_owned(),
+                px: 16,
+                bold: false,
+                color: Color::WHITE,
+                family: None,
+            },
+            DisplayItem::PopTransform,
+        ];
+        let bound = display_list_bounds(&items, &mut fonts)[1];
+        assert_covers_painted_pixels(bound, &paint(items, &mut fonts));
+    }
+
+    #[test]
+    fn damage_bounds_cover_glyphs_wider_than_one_em() {
+        let mut fonts = FontStore::bundled();
+        let items = vec![DisplayItem::TextRun {
+            x: 7.7,
+            y: 42.1,
+            text: "‱‱‱".to_owned(),
+            px: 16,
+            bold: false,
+            color: Color::WHITE,
+            family: None,
+        }];
+        let bound = display_list_bounds(&items, &mut fonts)[0];
+        assert_covers_painted_pixels(bound, &paint(items, &mut fonts));
+    }
+
+    #[test]
+    fn damage_bounds_cover_all_four_corners_of_rotated_draws() {
+        let mut fonts = FontStore::bundled();
+        let items = vec![
+            DisplayItem::PushTransform {
+                matrix: Affine2D::translate_scale_rotate(1.0, 1.0, 45.0, 32.0, 32.0, 0.0, 0.0),
+            },
+            DisplayItem::FillRect {
+                rect: rect(22.0, 22.0, 20.0, 20.0),
+                color: Color::WHITE,
+            },
+            DisplayItem::PopTransform,
+        ];
+        let bound = display_list_bounds(&items, &mut fonts)[1];
+        assert_covers_painted_pixels(bound, &paint(items, &mut fonts));
+    }
+
+    #[test]
+    fn nested_scope_bounds_match_the_painters_binary_clip() {
+        let mut fonts = FontStore::bundled();
+        let items = vec![
+            DisplayItem::PushTransform {
+                matrix: Affine2D {
+                    a: 1.0,
+                    b: 1.0,
+                    c: -1.0,
+                    d: 1.0,
+                    e: 32.75,
+                    f: 5.25,
+                },
+            },
+            DisplayItem::PushOpacity(0.5),
+            DisplayItem::PushClip(rect(1.25, 1.25, 20.0, 10.0)),
+            DisplayItem::FillRect {
+                rect: rect(-25.0, -25.0, 60.0, 60.0),
+                color: Color::WHITE,
+            },
+            DisplayItem::PopClip,
+            DisplayItem::PopOpacity,
+            DisplayItem::PopTransform,
+        ];
+        // The rotated clip retains the painter's opposite-corner mapping
+        // and truncates its fractional origin independently of its size.
+        let expected = rect(32.0, 7.0, 10.0, 30.0);
+        let bounds = display_list_bounds(&items, &mut fonts);
+        assert_eq!(bounds, vec![expected; items.len()]);
+        let frame = paint(items, &mut fonts);
+        assert_covers_painted_pixels(expected, &frame);
+        assert_eq!(frame.pixel(32, 7).unwrap().a, 128);
+        assert_eq!(frame.pixel(41, 36).unwrap().a, 128);
+    }
+
+    fn solid_gradient(rect: Rect, radius: f32) -> DisplayItem {
+        DisplayItem::GradientFill {
+            rect,
+            radius,
+            gradient: ResolvedGradient {
+                kind: ResolvedGradientKind::Linear {
+                    start: (rect.x, rect.y),
+                    end: (rect.x + rect.w, rect.y),
+                },
+                stops: vec![(0.0, Color::WHITE), (1.0, Color::WHITE)],
+            },
+        }
+    }
+
+    #[test]
+    fn rotated_gradient_uses_the_rounded_fill_coverage() {
+        let mut fonts = FontStore::bundled();
+        let rect = rect(16.0, 14.0, 32.0, 32.0);
+        let radius = 12.0;
+        let transform = DisplayItem::PushTransform {
+            matrix: Affine2D::translate_scale_rotate(1.0, 1.0, 31.0, 32.0, 30.0, 0.0, 0.0),
+        };
+        let paint_rotated = |item, fonts: &mut FontStore| {
+            paint(
+                vec![transform.clone(), item, DisplayItem::PopTransform],
+                fonts,
+            )
+        };
+        let fill = paint_rotated(
+            DisplayItem::RoundedFill {
+                rect,
+                radius,
+                color: Color::WHITE,
+            },
+            &mut fonts,
+        );
+        let gradient = paint_rotated(solid_gradient(rect, radius), &mut fonts);
+        assert!(
+            fill == gradient,
+            "solid gradient and solid fill must mask identical pixels"
+        );
+    }
+
+    #[test]
+    fn fractional_top_and_bottom_rows_keep_partial_coverage() {
+        let mut fonts = FontStore::bundled();
+        let outer = rect(4.0, 6.75, 40.0, 10.5);
+        let radius = 3.0;
+        let items = [
+            DisplayItem::RoundedFill {
+                rect: outer,
+                radius,
+                color: Color::WHITE,
+            },
+            solid_gradient(outer, radius),
+            DisplayItem::RoundedBorder {
+                outer,
+                inner: rect(5.0, 7.75, 38.0, 8.5),
+                radius,
+                inner_radii: [2.0; 4],
+                color: Color::WHITE,
+            },
+        ];
+        for item in items {
+            let frame = paint(vec![item.clone()], &mut fonts);
+            for y in [6, 17] {
+                assert_eq!(frame.pixel(24, y).unwrap().a, 64, "row {y}: {item:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rounded_border_fast_paths_match_the_full_sample_grid() {
+        let mut fonts = FontStore::bundled();
+        let color = Color::from_rgba8(255, 255, 255, 160);
+        for (outer, inner, radius, inner_radii) in [
+            (
+                rect(8.25, 8.25, 40.5, 30.5),
+                rect(10.25, 10.25, 36.5, 26.5),
+                5.0,
+                [3.0; 4],
+            ),
+            (
+                rect(8.25, 9.25, 12.0, 16.0),
+                rect(9.25, 10.25, 10.0, 14.0),
+                6.0,
+                [5.0; 4],
+            ),
+        ] {
+            let frame = paint(
+                vec![DisplayItem::RoundedBorder {
+                    outer,
+                    inner,
+                    radius,
+                    inner_radii,
+                    color,
+                }],
+                &mut fonts,
+            );
+            for y in 0..frame.height() {
+                for x in 0..frame.width() {
+                    let cov = ring_subsample_coverage(
+                        &outer,
+                        radius,
+                        &inner,
+                        &inner_radii,
+                        x as f32,
+                        y as f32,
+                    );
+                    let expected = scale_u8((cov * 255.0).round() as u8, color.a);
+                    assert_eq!(
+                        frame.pixel(x, y).unwrap().a,
+                        expected,
+                        "ring {outer:?} at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_rotated_shadows_paint_the_full_blur() {
+        let mut fonts = FontStore::bundled();
+        let frame = paint(
+            vec![
+                DisplayItem::PushTransform {
+                    matrix: Affine2D {
+                        a: 0.0,
+                        b: 2.0,
+                        c: -2.0,
+                        d: 0.0,
+                        e: 64.0,
+                        f: 0.0,
+                    },
+                },
+                DisplayItem::OuterShadow {
+                    bounds: rect(10.0, 10.0, 10.0, 10.0),
+                    radius: 0.0,
+                    inner: rect(10.0, 10.0, 10.0, 10.0),
+                    inner_radius: 0.0,
+                    blur: 4.0,
+                    color: Color::BLACK,
+                },
+                DisplayItem::PopTransform,
+            ],
+            &mut fonts,
+        );
+        // The left edge transforms to x=24, with eight device pixels of blur.
+        assert!(frame.pixel(18, 30).unwrap().a > 0);
+        assert_eq!(frame.pixel(15, 30).unwrap().a, 0);
+    }
+
+    #[test]
+    fn scaled_shadows_keep_their_rounded_corners() {
+        let mut fonts = FontStore::bundled();
+        let scaled = paint(
+            vec![
+                DisplayItem::PushTransform {
+                    matrix: Affine2D::translate_scale_rotate(2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                },
+                DisplayItem::OuterShadow {
+                    bounds: rect(10.0, 10.0, 10.0, 10.0),
+                    radius: 3.0,
+                    inner: rect(12.0, 12.0, 6.0, 6.0),
+                    inner_radius: 2.0,
+                    blur: 2.0,
+                    color: Color::BLACK,
+                },
+                DisplayItem::PopTransform,
+            ],
+            &mut fonts,
+        );
+        let expected = paint(
+            vec![DisplayItem::OuterShadow {
+                bounds: rect(20.0, 20.0, 20.0, 20.0),
+                radius: 6.0,
+                inner: rect(24.0, 24.0, 12.0, 12.0),
+                inner_radius: 4.0,
+                blur: 4.0,
+                color: Color::BLACK,
+            }],
+            &mut fonts,
+        );
+        assert!(
+            scaled == expected,
+            "scaling must also scale the shadow radius"
+        );
+    }
+
+    #[test]
+    fn blurred_shadows_respect_nested_opacity() {
+        let mut fonts = FontStore::bundled();
+        let shadow = DisplayItem::OuterShadow {
+            bounds: rect(14.0, 14.0, 20.0, 20.0),
+            radius: 0.0,
+            inner: rect(18.0, 18.0, 12.0, 12.0),
+            inner_radius: 0.0,
+            blur: 4.0,
+            color: Color::BLACK,
+        };
+        for matrix in [
+            Affine2D::IDENTITY,
+            Affine2D::translate_scale_rotate(1.0, 1.0, 31.0, 24.0, 24.0, 0.0, 0.0),
+        ] {
+            let push_transform = DisplayItem::PushTransform { matrix };
+            let full = paint(
+                vec![
+                    push_transform.clone(),
+                    shadow.clone(),
+                    DisplayItem::PopTransform,
+                ],
+                &mut fonts,
+            );
+            let faded = paint(
+                vec![
+                    push_transform,
+                    DisplayItem::PushOpacity(0.5),
+                    DisplayItem::PushOpacity(0.5),
+                    shadow.clone(),
+                    DisplayItem::PopOpacity,
+                    DisplayItem::PopOpacity,
+                    DisplayItem::PopTransform,
+                ],
+                &mut fonts,
+            );
+            assert!(full.pixels().chunks_exact(4).any(|px| px[3] > 0));
+            for (opaque, translucent) in full
+                .pixels()
+                .chunks_exact(4)
+                .zip(faded.pixels().chunks_exact(4))
+            {
+                assert_eq!(
+                    translucent[3],
+                    scale_u8(opaque[3], 64),
+                    "transform {matrix:?}"
+                );
+            }
+        }
+    }
 }

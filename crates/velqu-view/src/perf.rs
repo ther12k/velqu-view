@@ -86,9 +86,9 @@ impl FramePerf {
     pub(crate) fn enabled_from_env() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| {
-            ["LEKUVO_PERF", "VV_PERF"].iter().any(|key| {
-                std::env::var_os(key).is_some_and(|value| value != "0")
-            })
+            ["LEKUVO_PERF", "VV_PERF"]
+                .iter()
+                .any(|key| std::env::var_os(key).is_some_and(|value| value != "0"))
         })
     }
 

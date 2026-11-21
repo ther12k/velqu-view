@@ -317,6 +317,37 @@ mod tests {
     }
 
     #[test]
+    fn positioning_insets_and_stacking_are_reported_unsupported() {
+        let items = check_css(
+            ".overlay {\n  position: absolute;\n  inset: 0;\n  top: 0;\n  right: 0;\n  bottom: 0;\n  left: 0;\n  z-index: 10;\n  display: grid;\n}",
+        );
+        let properties = [
+            "position", "inset", "top", "right", "bottom", "left", "z-index",
+        ];
+        assert_eq!(items.len(), properties.len() + 1);
+        for (index, (item, expected)) in items.iter().zip(properties).enumerate() {
+            let CheckKind::Declaration { property, .. } = &item.kind else {
+                panic!("expected a declaration, got {item:?}");
+            };
+            assert_eq!(item.line, index + 2);
+            assert_eq!(property, expected);
+            assert_eq!(
+                item.classification.compatibility,
+                Compatibility::Unsupported
+            );
+            assert!(item.classification.replacement.is_some());
+        }
+        assert_eq!(
+            summarize(&items),
+            CheckSummary {
+                supported: 1,
+                normalized: 0,
+                unsupported: properties.len(),
+            }
+        );
+    }
+
+    #[test]
     fn interaction_rules_report_paint_only() {
         let items = check_css(".card:hover {\n  background-color: #112233;\n  width: 500px;\n}");
         assert_eq!(items.len(), 2, "{items:?}");

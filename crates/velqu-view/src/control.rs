@@ -69,6 +69,8 @@ pub(crate) struct ControlState {
     pub(crate) readonly: bool,
     pub(crate) disabled: bool,
     pub(crate) dirty: bool,
+    /// True until a programmatic value change replaces the last user edit.
+    pub(crate) live_user_value: bool,
     pub(crate) scroll_offset: (f32, f32),
     pub(crate) composition: Option<CompositionState>,
 }
@@ -81,6 +83,7 @@ impl ControlState {
             readonly,
             disabled,
             dirty: false,
+            live_user_value: false,
             scroll_offset: (0.0, 0.0),
             composition: None,
         }

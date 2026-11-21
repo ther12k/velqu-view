@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use velqu_view::{Color, LayoutCacheState, VelquView, Viewport};
+use velqu_view::{Color, LayoutCacheState, ReactiveValue, VelquView, Viewport};
 
 fn viewport() -> Viewport {
     Viewport::try_new(400, 300, 1.0).unwrap()
@@ -505,4 +505,85 @@ fn spring_width_transition_settles_with_momentum_and_is_deterministic() {
         first, second,
         "identical tick schedules produce identical width vectors"
     );
+}
+
+fn spring_width_fixture(vp: Viewport, extra_css: &str) -> VelquView {
+    let mut view = VelquView::new();
+    view.enable_reactive();
+    view.load_html(
+        r#"<html><body>
+            <div vx-state="{ phase: 'rest' }">
+                <div id="panel" data-vv-test="panel" :class="phase"></div>
+            </div>
+        </body></html>"#,
+    )
+    .unwrap();
+    view.load_css(&format!(
+        "#panel {{ width: 100px; height: 40px; transition: width spring(120, 14); }} \
+         #panel.expanded {{ width: 300px; }} {extra_css}"
+    ))
+    .unwrap();
+    settle(&mut view, vp);
+    view
+}
+
+fn set_panel_phase(view: &mut VelquView, phase: &str) {
+    view.write_state("phase", ReactiveValue::String(phase.into()))
+        .unwrap();
+    view.pump_reactive(&[]);
+}
+
+#[test]
+fn spring_width_tick_straddling_delay_integrates_only_post_delay_time() {
+    let vp = viewport();
+    let width_after_tick = |delay_ms, tick_ms| {
+        let mut view =
+            spring_width_fixture(vp, &format!("#panel {{ transition-delay: {delay_ms}ms; }}"));
+        set_panel_phase(&mut view, "expanded");
+        view.render(vp).unwrap();
+        assert!(view.has_active_animations());
+        assert_eq!(width_of(&mut view, vp, "panel"), 100.0);
+        step_and_render(&mut view, vp, tick_ms);
+        width_of(&mut view, vp, "panel")
+    };
+
+    let undelayed = width_after_tick(0, 16);
+    assert!(undelayed > 100.0, "the undelayed spring must move");
+    assert_eq!(width_after_tick(100, 116), undelayed);
+}
+
+#[test]
+fn spring_width_retarget_without_transition_applies_immediately() {
+    let vp = viewport();
+    for (declaration, facts_first) in [
+        ("transition-timing-function: spring(0, 14)", false),
+        ("transition: width 0ms linear", false),
+        ("transition: none", false),
+        ("transition: none", true),
+        ("transition-property: opacity", false),
+    ] {
+        let mut view = spring_width_fixture(
+            vp,
+            &format!("#panel.instant {{ width: 200px; {declaration}; }}"),
+        );
+        set_panel_phase(&mut view, "expanded");
+        view.render(vp).unwrap();
+        step_and_render(&mut view, vp, 16);
+        let mid = width_of(&mut view, vp, "panel");
+        assert!(mid > 100.0 && mid < 300.0, "mid-flight width: {mid}");
+        assert!(view.has_active_animations());
+
+        set_panel_phase(&mut view, "instant");
+        if facts_first {
+            assert_eq!(width_of(&mut view, vp, "panel"), 200.0, "before render");
+            assert!(!view.has_active_animations(), "before render");
+        }
+        view.render(vp).unwrap();
+        let immediate = width_of(&mut view, vp, "panel");
+        let stayed_active = view.has_active_animations();
+        step_and_render(&mut view, vp, 10_000);
+        let later = width_of(&mut view, vp, "panel");
+        assert_eq!([immediate, later], [200.0, 200.0], "{declaration}");
+        assert!(!stayed_active, "{declaration} must cancel the old spring");
+    }
 }

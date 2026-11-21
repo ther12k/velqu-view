@@ -121,3 +121,43 @@ perf stream's benchmarks live in lekuvo (`LEKUVO_BENCH_MORPH`,
 `LEKUVO_BENCH_DRAG`, `LEKUVO_PERF`) and were validated against a snapshot
 of this tree with the gradient WIP minimally brace/type-fixed (see the
 lekuvo commit message for the measured numbers).
+
+---
+
+## Final state (session close)
+
+The user's commits absorbed the perf work directly:
+- `8699042 feat(renderer): coverage rasterization, gradients, springs, damage
+  painting` — carried the perf stream (style cache, facts cache, damage
+  painting, painter row spans, perf instrumentation) together with the
+  visual-quality work, "verified green as one tree".
+- `ff495f3 perf(painter): single-pass shadow falloff + scoped morph damage` —
+  folded the late band-ring/damage fixes (prefix-tolerant diff,
+  clip-aware bounds, animated reach, ring exclusion) plus a single-pass
+  shadow falloff replacing the 8-ring stack.
+
+Lint follow-ups: `5d07311` added the `walk_styles` argument-count
+allowance; the branch review picked up the `CompiledRule` and
+`sort_by_key` cleanup in `crates/velqu-tailwind/src/compile.rs`.
+
+### Verified final numbers (lekuvo @ 88f4731 against this tree)
+
+- Morph (24 expand/collapse, 62.5fps host cadence): render p50 10.0ms /
+  p95 15.5ms / max 31.3ms; frame interval p50=p95 16.0ms (cadence-bound);
+  **gate met** (>=45fps sustained, interval p95 <= 22ms). Baseline before
+  the session: render p50 30.6ms / p95 42.8ms, interval p95 64.6ms
+  (~15fps), and the morph itself never ran (cascade-order bug) until the
+  tailwind rule-order fix.
+- layout_facts x3/frame: 17.5ms -> 0.05ms. Style compute per morph frame:
+  4.5ms -> 0.3ms. Damage during the morph: the animated card region
+  (~100-320k px), never the full 425,600-px surface.
+- Drag (180 moves at 60Hz, Xvfb): move_window 21us/event (reply round
+  trip removed); the loop performs **zero** renders/presents during a
+  drag (`LEKUVO_PERF renders (during drag 0)`); the old echo-coupled
+  shape cost 5.6-7ms render + present per move. Gate met.
+- Idle: 0% of one core over 8s (12 frames total, zero renders/presents
+  per second). Gate met (<=2%).
+
+Note: an untracked scratch test `morph_check.rs` that existed briefly in
+this tree was removed during scratch cleanup; it was a small repro and
+its coverage is superseded by `tests/damage_paint.rs`.

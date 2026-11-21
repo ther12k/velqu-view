@@ -51,14 +51,18 @@ phases exactly as a click-driven flip would. Turn zero remains exempt
 (ADR 0024): the pending initial batch, when a write arrives before the
 first pump, applies first without transitions so a write's outputs are
 never clobbered by a stale initial batch (and an initially hidden
-element never flashes a leave animation).
+element never flashes a leave animation). The initial batch belongs to
+turn zero and can publish even if the later host turn rolls back.
 
 ### 3. No events out: the no-feedback-loop contract holds
 
-A write applies mutations silently. `SetControlValue` updates control
-runtime state without synthesizing a `ValueChanged`; nothing a write
-does is observable in `take_events()`. Hosts poll `reactive_state()`
-for echo purposes and never risk re-entrancy from their own writes.
+A write neither drains the event queue nor synthesizes events.
+`SetControlValue` updates the editor silently and cancels any composition
+on the value it replaces. A later `ValueChanged` turn still updates its
+originating editor if a programmatic mutation replaced the live edit;
+without such a replacement, echo screening continues to protect newer
+typing and caret state. Hosts that want an outstanding event batch to
+precede a write pump it first (ADR 0019).
 
 ### 4. `NoReactiveDocument` mirrors `reactive_state`
 

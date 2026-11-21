@@ -28,19 +28,16 @@ pub(crate) struct Rect {
 }
 
 /// A 2D affine transform in CSS `matrix(a, b, c, d, e, f)` layout:
-/// `x' = a·x + c·y + e`, `y' = b·x + d·y + f` (ADR 0024). Layout emits
-/// only translate + positive scale (never rotation or skew), so rects
-/// map to rects and pixel-edge snapping survives; the painter still
-/// treats it as a general affine so later slices stay source-compatible.
+/// `x' = a·x + c·y + e`, `y' = b·x + d·y + f` (ADR 0024).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Affine2D {
-    /// x-scale.
+    /// x contribution to transformed x.
     pub a: f32,
-    /// y-shear (always 0 today).
+    /// x contribution to transformed y.
     pub b: f32,
-    /// x-shear (always 0 today).
+    /// y contribution to transformed x.
     pub c: f32,
-    /// y-scale.
+    /// y contribution to transformed y.
     pub d: f32,
     /// x-translation.
     pub e: f32,
@@ -168,8 +165,8 @@ impl Affine2D {
         )
     }
 
-    /// Maps a rect through opposite corners, normalizing the result to
-    /// positive extents (exact for translate+scale: `w·1.0` is `w`).
+    /// Maps opposite corners and normalizes the extents. Exact for axis-
+    /// aligned transforms; rotated clips deliberately keep this approximation.
     pub(crate) fn apply_rect(&self, rect: &Rect) -> Rect {
         let (x0, y0) = self.apply_point(rect.x, rect.y);
         let (x1, y1) = self.apply_point(rect.x + rect.w, rect.y + rect.h);
@@ -179,6 +176,21 @@ impl Affine2D {
             w: (x1 - x0).abs(),
             h: (y1 - y0).abs(),
         }
+    }
+
+    /// The exact axis-aligned extents `(min_x, min_y, max_x, max_y)` of a
+    /// transformed draw rectangle, including all four corners.
+    pub(crate) fn rect_aabb(&self, rect: &Rect) -> (f32, f32, f32, f32) {
+        let p0 = self.apply_point(rect.x, rect.y);
+        let p1 = self.apply_point(rect.x + rect.w, rect.y);
+        let p2 = self.apply_point(rect.x + rect.w, rect.y + rect.h);
+        let p3 = self.apply_point(rect.x, rect.y + rect.h);
+        (
+            p0.0.min(p1.0).min(p2.0).min(p3.0),
+            p0.1.min(p1.1).min(p2.1).min(p3.1),
+            p0.0.max(p1.0).max(p2.0).max(p3.0),
+            p0.1.max(p1.1).max(p2.1).max(p3.1),
+        )
     }
 
     /// The uniform-ish scale factor (radii and text sizes scale by it).
@@ -223,7 +235,7 @@ pub(crate) enum DisplayItem {
     DrawImage { rect: Rect, image: Rc<DecodedImage> },
     /// Filled rectangle with rounded corners (M3: `background-color` +
     /// `border-radius`). The rect edges are the shape's bounds; coverage
-    /// is a deterministic per-pixel test, no anti-aliasing.
+    /// follows the deterministic subsampling in ADR 0026.
     RoundedFill {
         rect: Rect,
         radius: f32,
@@ -257,9 +269,8 @@ pub(crate) enum DisplayItem {
     /// (`bounds`, offset and spread already applied, corner `radius`)
     /// painted **outside** the element's border box (`inner`, corner
     /// `inner_radius`) — the CSS rule that a shadow never shows through a
-    /// transparent element. `blur` feathers the outer edge; the painter
-    /// approximates it with stepped ring fills (deterministic, no
-    /// anti-aliasing). Zero-blur shadows paint as a single solid ring.
+    /// transparent element. `blur` feathers the outer edge with a
+    /// distance falloff. Zero-blur shadows use rounded ring coverage.
     OuterShadow {
         bounds: Rect,
         radius: f32,
@@ -279,6 +290,22 @@ pub(crate) enum DisplayItem {
     },
 }
 
+impl DisplayItem {
+    /// Whether this command starts or ends a paint scope rather than drawing.
+    pub(crate) fn is_scope(&self) -> bool {
+        matches!(
+            self,
+            Self::PushClip(_)
+                | Self::PushClipRounded { .. }
+                | Self::PopClip
+                | Self::PushTransform { .. }
+                | Self::PopTransform
+                | Self::PushOpacity(_)
+                | Self::PopOpacity
+        )
+    }
+}
+
 /// A gradient resolved against a concrete box: paint-ready device-px
 /// geometry plus stop fractions. Produced by `gradient::Gradient::resolve`
 /// at display-list emission; the painter evaluates it per pixel.
@@ -294,10 +321,7 @@ pub(crate) struct ResolvedGradient {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ResolvedGradientKind {
     /// Start/end points of the gradient line, device px.
-    Linear {
-        start: (f32, f32),
-        end: (f32, f32),
-    },
+    Linear { start: (f32, f32), end: (f32, f32) },
     /// Center and radii, device px (a circle has `rx == ry`).
     Radial {
         center: (f32, f32),

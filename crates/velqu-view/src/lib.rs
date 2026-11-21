@@ -177,8 +177,8 @@ pub enum VelquError {
     DocumentNotLoaded,
     /// A viewport violated its invariants.
     InvalidViewport(InvalidViewport),
-    /// A font registration failed (invalid or unsupported font data).
-    /// The string names the family and the underlying fontdue error.
+    /// A font registration failed (blank family name or invalid font data).
+    /// The string describes the failure.
     FontRegister(String),
     /// The frame buffer could not be allocated (allocation refused by the
     /// allocator). Viewports are pixel-bounded at construction
@@ -229,7 +229,7 @@ impl fmt::Display for VelquError {
 impl std::error::Error for VelquError {}
 
 /// Why a host-initiated state write ([`VelquView::write_state`]) did not
-/// commit. Neither case touches state or UI: a failed write is a no-op.
+/// commit. A failed host turn does not publish its candidate state or UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostWriteError {
     /// Reactive is disabled, no document is loaded, the document has no
@@ -376,8 +376,8 @@ pub struct RenderStats {
 /// milestones, before anyone optimizes anything.
 #[derive(Debug, Clone, Copy)]
 pub struct LayoutStats {
-    /// Layout passes run by this instance (every render and facts call is
-    /// one pass).
+    /// Layout passes run by this instance. Cache hits and presentation-only
+    /// changes do not run a pass.
     pub passes: u64,
     /// Boxes laid out by the most recent pass.
     pub nodes_last_pass: usize,
@@ -448,7 +448,7 @@ pub struct VelquView {
     style_diagnostics_list: Vec<String>,
     /// Tailwind utility pipeline (ADR 0009): when enabled, the `class`
     /// attributes of the loaded document are compiled into a generated
-    /// stylesheet appended after the author sheets in cascade order.
+    /// stylesheet before other author sheets in cascade order.
     tailwind_enabled: bool,
     tailwind_css: Option<String>,
     tailwind_diagnostics_list: Vec<String>,
@@ -688,6 +688,10 @@ impl VelquView {
     /// Creates an empty view with bundled fonts loaded and no asset
     /// resolution (the null host: every asset request resolves to nothing).
     pub fn new() -> Self {
+        Self::with_fonts(FontStore::bundled())
+    }
+
+    fn with_fonts(fonts: FontStore) -> Self {
         Self {
             document: None,
             dom: dom::Dom::empty(),
@@ -695,7 +699,7 @@ impl VelquView {
             parsed_css: Vec::new(),
             next_auto_sheet: 0,
             frame_index: 0,
-            fonts: FontStore::bundled(),
+            fonts,
             assets: Rc::new(NullAssetResolver),
             custom_assets: false,
             clipboard: Rc::new(clipboard::NullClipboardProvider),
@@ -793,16 +797,19 @@ impl VelquView {
     /// under old limits must not survive them.
     pub fn set_image_limits(&mut self, limits: ImageLimits) {
         self.image_limits = limits;
-        self.images.clear();
+        self.clear_images();
     }
 
     /// Clears the decoded-image cache. Call after replacing an image
     /// file that an `<img>` references by an unchanged `src` (e.g. a
-    /// host-generated album-art slot): the next render re-resolves and
-    /// re-decodes every image. Paint-only; no layout pass.
+    /// host-generated album-art slot). The next layout or render
+    /// re-resolves the images and lays them out with their new sizes.
     pub fn clear_images(&mut self) {
         self.images.clear();
-        self.presentation_dirty = true;
+        // The laid-out boxes still own the previous decoded images and
+        // their intrinsic dimensions.
+        self.mark_structure_dirty();
+        self.note_structural_cause("image cache cleared");
     }
 
     /// Deterministic diagnostics about `<img>` assets from the last render
@@ -816,33 +823,29 @@ impl VelquView {
     /// Registers a TTF/OTF face under `family`, selectable with the CSS
     /// `font-family` property (matched case-insensitively; the first
     /// family in a comma list wins). `bold` supplies the face used when
-    /// the computed `font-weight` is >= 600; when absent, bold text in
-    /// that family renders with the regular face. Re-registering the
-    /// same family/weight slot replaces the face in place.
+    /// the computed `font-weight` is >= 600. Bold text renders with the
+    /// regular face if no bold face has been registered for that family.
+    /// Re-registering a family replaces only the supplied faces. If any
+    /// supplied face is invalid, the registry is left unchanged.
     ///
-    /// Registration invalidates layout: the next render re-measures all
-    /// text. Unregistered or unknown families fall back to the bundled
-    /// DejaVu Sans, so a missing registration can never panic.
+    /// Successful registration invalidates layout: the next render
+    /// re-measures all text. Unknown families fall back to the bundled
+    /// DejaVu Sans.
     pub fn register_font(
         &mut self,
         family: &str,
         regular: Vec<u8>,
         bold: Option<Vec<u8>>,
     ) -> Result<(), VelquError> {
-        if family.trim().is_empty() {
-            return Err(VelquError::EmptySource {
-                kind: SourceKind::Css,
-            });
+        let family = family.trim();
+        if family.is_empty() {
+            return Err(VelquError::FontRegister("family name is empty".to_owned()));
         }
         self.fonts
-            .register(family, &regular, false)
+            .register_family(family, &regular, bold.as_deref())
             .map_err(VelquError::FontRegister)?;
-        if let Some(bold_data) = bold {
-            self.fonts
-                .register(family, &bold_data, true)
-                .map_err(VelquError::FontRegister)?;
-        }
-        // Fonts change text measurement, not just paint.
+        // Glyph pixels can change even when the TextRun items are equal.
+        self.prev_paint = None;
         self.mark_structure_dirty();
         if self.recording() {
             self.note_structural_cause(&format!("register_font {family}"));
@@ -852,9 +855,9 @@ impl VelquView {
 
     /// Enables the Tailwind utility pipeline (ADR 0009): the document's
     /// `class` attributes are compiled by [`velqu_tailwind`] into a
-    /// generated stylesheet that participates in the cascade after every
-    /// author sheet (utilities beat element styles; inline styles and later
-    /// sheets still win as CSS specifies). Unsupported classes are reported
+    /// generated sheet that participates before other author sheets.
+    /// Utilities beat element styles by specificity, but later class
+    /// rules and inline styles still win. Unsupported classes are reported
     /// through [`VelquView::tailwind_diagnostics`] — never dropped
     /// silently.
     pub fn enable_tailwind(&mut self) {
@@ -1177,6 +1180,7 @@ impl VelquView {
         self.control_diagnostics_list = control_diagnostics;
         self.last_laid = None;
         self.last_viewport = None;
+        self.prev_paint = None;
         self.mark_structure_dirty();
         self.presentation_dirty = false;
         // The inspector trace survives generations (records carry
@@ -1389,26 +1393,6 @@ impl VelquView {
         self.perf.css_parse = css_started.elapsed();
 
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        // Pending style diffs (ADR 0024): structural class/style changes
-        // (reactive mutations and vx-transition phase swaps) captured
-        // their pre-change state; diff the fresh cascade against it
-        // *before* the layout pass below applies the change, so
-        // animations spawn with correct from-values and the first frame
-        // shows the start state, never a jump to the target.
-        if !self.pending_style_diffs.is_empty() {
-            let style_started = std::time::Instant::now();
-            let interaction = self.interaction_state();
-            let root_element = layout::layout_root(&self.dom);
-            let styles = layout::compute_all_styles(
-                &self.dom,
-                root_element,
-                &mut cascade,
-                Some(&interaction),
-                &mut self.style_cache,
-            );
-            self.spawn_pending_transition_diffs(&styles);
-            self.perf.style += style_started.elapsed();
-        }
         let passes_before = self.layout_passes;
         let repaints_before = self.repaint_passes;
         let mut settled: Vec<u64> = Vec::new();
@@ -1423,22 +1407,7 @@ impl VelquView {
             if self.cached_layout(viewport).is_none() {
                 causes.push("viewport".to_owned());
             }
-            let interaction = self.interaction_state();
-            let root_element = layout::layout_root(&self.dom);
-            let styles = layout::compute_all_styles(
-                &self.dom,
-                root_element,
-                &mut cascade,
-                Some(&interaction),
-                &mut self.style_cache,
-            );
-            self.sync_looping_animations(&styles, false);
-            self.run_layout(viewport, &mut cascade, Some(&interaction));
-            // Post-layout re-sync: the pre-layout pass cannot know which
-            // nodes ended up box-less (transitive hides inside a hidden
-            // subtree). start is guarded by has_active_for, so this is
-            // idempotent for visible loops; it stops the invisible ones.
-            self.sync_looping_animations(&styles, true);
+            self.run_layout(viewport, &mut cascade);
             self.layout_revision += 1;
             if let Some(seq) =
                 self.trace_invalidation(InvalidationClass::Structural, causes, dropped)
@@ -1477,7 +1446,9 @@ impl VelquView {
         self.record_style_diagnostics(&cascade);
         if self.last_laid.is_none() {
             // Nothing visible (e.g. an all-hidden document): paint the
-            // author background only.
+            // author background only. An older nonempty frame is no longer
+            // a valid baseline for the next damage diff.
+            self.prev_paint = None;
             let background = document_background(&parsed_author);
             let paint_started = std::time::Instant::now();
             let (frame, items, glyphs) = painter::paint_document(
@@ -1492,8 +1463,7 @@ impl VelquView {
             self.perf.glyphs = glyphs;
             self.perf.viewport = (viewport.width(), viewport.height());
             self.perf.damage_rects = 1;
-            self.perf.damage_area =
-                u64::from(viewport.width()) * u64::from(viewport.height());
+            self.perf.damage_area = u64::from(viewport.width()) * u64::from(viewport.height());
             self.display_items_last = items;
             self.perf.log(self.frame_index);
             return Ok(FrameResult {
@@ -1517,11 +1487,10 @@ impl VelquView {
         // moves content while items stay equal); the union of divergent
         // items' bounds is the repaint window. Everything outside it keeps
         // the previous frame's pixels.
-        let bounds_now = painter::display_list_bounds(&display_list.items);
+        let bounds_now = painter::display_list_bounds(&display_list.items, &mut self.fonts);
         let previous_state = self.prev_paint.take();
         let usable = previous_state.filter(|state| {
-            state.viewport
-                == (viewport.width(), viewport.height(), viewport.scale_factor())
+            state.viewport == (viewport.width(), viewport.height(), viewport.scale_factor())
                 && state.background == background
         });
         // Paint reach of the currently animating nodes (border box + own
@@ -1574,8 +1543,8 @@ impl VelquView {
             for rect in state.animated.iter().chain(animated_now.iter()) {
                 animated_union = grow_union(animated_union, *rect);
             }
-            let inside_animated = |rect: &display_list::Rect, union: Option<(i64, i64, i64, i64)>| {
-                match union {
+            let inside_animated =
+                |rect: &display_list::Rect, union: Option<(i64, i64, i64, i64)>| match union {
                     None => false,
                     Some((x0, y0, x1, y1)) => {
                         rect.w > 0.0
@@ -1585,8 +1554,7 @@ impl VelquView {
                             && (rect.x + rect.w).ceil() as i64 <= x1
                             && (rect.y + rect.h).ceil() as i64 <= y1
                     }
-                }
-            };
+                };
             let common = state.items.len().min(display_list.items.len());
             let mut union: Option<(i64, i64, i64, i64)> = None;
             for ((item, bound), (prev_item, prev_bound)) in display_list
@@ -1596,7 +1564,10 @@ impl VelquView {
                 .zip(state.items.iter().zip(&state.bounds))
                 .take(common)
             {
-                if (*item != *prev_item || *bound != *prev_bound)
+                // Scope bounds cover their enclosed draws when the command
+                // changes. An unchanged scope with a changed extent is
+                // already accounted for by the drawable items themselves.
+                if (*item != *prev_item || (!item.is_scope() && *bound != *prev_bound))
                     && (!inside_animated(bound, animated_union)
                         || !inside_animated(prev_bound, animated_union))
                 {
@@ -1620,14 +1591,7 @@ impl VelquView {
                     union = grow_union(union, *rect);
                 }
             }
-            union.map(|(x0, y0, x1, y1)| {
-                (
-                    x0.clamp(0, i64::from(viewport.width())) as u16,
-                    y0.clamp(0, i64::from(viewport.height())) as u16,
-                    (x1 - x0).clamp(0, i64::from(viewport.width())) as u16,
-                    (y1 - y0).clamp(0, i64::from(viewport.height())) as u16,
-                )
-            })
+            union.and_then(|bounds| damage_window(bounds, viewport))
         });
         let previous_pixels = usable.as_ref().zip(damage).map(|(state, (x, y, w, h))| {
             (
@@ -1652,7 +1616,8 @@ impl VelquView {
         self.perf.items = items;
         self.perf.glyphs = glyphs;
         self.perf.viewport = (viewport.width(), viewport.height());
-        self.perf.damage_rect = damage.map(|(x, y, w, h)| (i64::from(x), i64::from(y), i64::from(w), i64::from(h)));
+        self.perf.damage_rect =
+            damage.map(|(x, y, w, h)| (i64::from(x), i64::from(y), i64::from(w), i64::from(h)));
         match damage {
             Some((_, _, w, h)) => {
                 self.perf.damage_rects = 1;
@@ -1660,8 +1625,7 @@ impl VelquView {
             }
             None => {
                 self.perf.damage_rects = 1;
-                self.perf.damage_area =
-                    u64::from(viewport.width()) * u64::from(viewport.height());
+                self.perf.damage_area = u64::from(viewport.width()) * u64::from(viewport.height());
             }
         }
         self.display_items_last = items;
@@ -1671,15 +1635,10 @@ impl VelquView {
             items: display_list.items.clone(),
             bounds: bounds_now,
             background,
-            frame: Frame::from_parts(
-                frame.width(),
-                frame.height(),
-                frame.pixels().to_vec(),
-            ),
+            frame: Frame::from_parts(frame.width(), frame.height(), frame.pixels().to_vec()),
             viewport: (viewport.width(), viewport.height(), viewport.scale_factor()),
             animated: animated_now,
         });
-        let damage_out = damage.filter(|&(_, _, w, h)| w > 0 && h > 0);
         self.perf.log(self.frame_index);
         Ok(FrameResult {
             frame,
@@ -1688,7 +1647,7 @@ impl VelquView {
                 viewport,
                 items,
                 glyphs,
-                damage: damage_out,
+                damage,
             },
         })
     }
@@ -1743,16 +1702,26 @@ impl VelquView {
     }
 
     /// Shared cascade+layout pass behind [`VelquView::render`] and
-    /// [`VelquView::layout_facts`]; records layout instrumentation.
-    /// `interaction` feeds stateful-selector matching (M4b): layout facts
-    /// always pass `None` — facts are the structural truth, state only
-    /// ever reaches pixels.
-    fn run_layout(
-        &mut self,
-        viewport: Viewport,
-        cascade: &mut style::Cascade<'_>,
-        interaction: Option<&style::InteractionState>,
-    ) {
+    /// [`VelquView::layout_facts`]; records layout instrumentation. Both
+    /// callers publish the shared display list, so both match the current
+    /// interaction state. Those selectors can only change paint fields.
+    fn run_layout(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
+        let interaction = self.interaction_state();
+        let style_started = std::time::Instant::now();
+        let styles = layout::compute_all_styles(
+            &self.dom,
+            layout::layout_root(&self.dom),
+            cascade,
+            Some(&interaction),
+            &mut self.style_cache,
+        );
+        self.perf.style += style_started.elapsed();
+        // Diff captured pre-change styles before laying out, so the
+        // first frame of a transition holds its start value (ADR 0024).
+        self.spawn_pending_transition_diffs(&styles);
+        self.discard_stale_transitions(&styles);
+        self.sync_looping_animations(&styles, false);
+
         let started = std::time::Instant::now();
         let mut timings = perf::PassTimings::default();
         let laid = layout::layout_document(
@@ -1762,7 +1731,7 @@ impl VelquView {
             &mut self.fonts,
             &self.images,
             &self.scroll_offsets,
-            interaction,
+            Some(&interaction),
             &self.reactive_hidden,
             self.anim.overrides(),
             &mut timings,
@@ -1784,6 +1753,9 @@ impl VelquView {
         // clone-free).
         self.last_viewport = Some(viewport);
         self.last_laid = laid;
+        // The new tree reveals transitively hidden nodes. Stop their
+        // loops after layout; visible presets keep their start times.
+        self.sync_looping_animations(&styles, true);
         self.rebuild_control_presentation();
         // A full pass re-emits everything, presentation included.
         self.presentation_dirty = false;
@@ -1812,6 +1784,7 @@ impl VelquView {
         // animated properties, so this frame shows the from-state — not a
         // jump to the target.
         self.spawn_transition_diffs(&styles);
+        self.discard_stale_transitions(&styles);
         self.sync_looping_animations(&styles, true);
         layout::apply_animation_overrides(&mut styles, self.anim.overrides());
         if let Some(laid) = self.last_laid.as_mut() {
@@ -1891,9 +1864,10 @@ impl VelquView {
         // ADR 0027: a `spring(...)` timing function starts the physical
         // driver (duration is emergent); otherwise the timed curve path.
         match spawn.spec.spring {
-            Some(spring) => self
-                .anim
-                .start_spring(spawn.node, spawn.property, spawn.spec.delay, spring),
+            Some(spring) => {
+                self.anim
+                    .start_spring(spawn.node, spawn.property, spawn.spec.delay, spring)
+            }
             None => self.anim.start(
                 spawn.node,
                 spawn.property,
@@ -2156,31 +2130,94 @@ impl VelquView {
         }
     }
 
-    /// Whether the node produced a box in the last layout pass (hidden
-    /// nodes and hidden subtrees produce none).
-    fn node_has_box(&self, node: dom::NodeId) -> bool {
-        self.last_laid
-            .as_ref()
-            .is_some_and(|laid| layout::find_box(&laid.root, node).is_some())
+    /// Drops samples which would mask the current cascade even after
+    /// the differ has had a chance to retarget. A transition can become
+    /// instant or unsupported without a replacement ever being spawned.
+    fn discard_stale_transitions(&mut self, styles: &layout::StyleMap) {
+        use anim::{AnimValue, PropKind};
+
+        const KINDS: [PropKind; 9] = [
+            PropKind::Width,
+            PropKind::Height,
+            PropKind::Opacity,
+            PropKind::BorderRadius,
+            PropKind::BackgroundColor,
+            PropKind::BorderColor,
+            PropKind::Color,
+            PropKind::Transform,
+            PropKind::BoxShadow,
+        ];
+        let px = |length| match length {
+            Some(style::Length::Px(value)) => Some(AnimValue::Num(value)),
+            _ => None,
+        };
+        let mut stopped = Vec::new();
+        for (&node, overrides) in self.anim.overrides() {
+            let fresh = styles.get(&node);
+            let transition = fresh
+                .and_then(style::ComputedStyle::transition)
+                .filter(|spec| !spec.spring.is_some_and(|spring| spring.is_instant()));
+            for kind in KINDS {
+                let Some(sample) = overrides.value_for(kind) else {
+                    continue;
+                };
+                let target = fresh.and_then(|style| match kind {
+                    PropKind::Width => px(style.width),
+                    PropKind::Height => px(style.height),
+                    PropKind::Opacity => Some(AnimValue::Num(style.opacity)),
+                    PropKind::BorderRadius => Some(AnimValue::Num(style.border_radius)),
+                    PropKind::BackgroundColor => Some(AnimValue::Col(style.background_color)),
+                    PropKind::BorderColor => Some(AnimValue::Col(style.border_color)),
+                    PropKind::Color => Some(AnimValue::Col(style.color)),
+                    PropKind::Transform => Some(AnimValue::Xf(style.transform)),
+                    PropKind::BoxShadow => Some(AnimValue::Shadow(
+                        style
+                            .box_shadows
+                            .first()
+                            .copied()
+                            .unwrap_or(crate::style::BoxShadow::NONE),
+                    )),
+                });
+                if !transition.is_some_and(|spec| spec.properties.covers(kind))
+                    || target != Some(self.anim.active_target(node, kind).unwrap_or(sample))
+                {
+                    stopped.push((node, kind));
+                }
+            }
+        }
+        for (node, kind) in stopped {
+            self.anim.stop_transition_for(node, kind);
+        }
     }
 
-    /// Synchronizes preset looping animations (`animate-spin`, `animate-pulse`, `animate-bounce`)
-    /// with the animation engine (ADR 0024).
-    /// `boxes_current`: whether `last_laid` reflects the layout these
-    /// styles will paint with. The structural path runs before
-    /// `run_layout` (the box tree is about to be rebuilt — the cached
-    /// boxes are stale/absent), so only the presentation path, which
-    /// syncs against the cached tree, may consult box existence.
+    /// Synchronizes looping presets with the animation engine (ADR 0024).
+    /// `boxes_current` is false before structural layout, when the cached
+    /// tree does not describe the current styles yet.
     fn sync_looping_animations(&mut self, styles: &layout::StyleMap, boxes_current: bool) {
+        // Skip the tree walk on ordinary repaints with no looping presets;
+        // otherwise index visibility once instead of searching per node.
+        let visible = (boxes_current
+            && styles
+                .values()
+                .any(|style| style.animation != style::AnimationKind::None))
+        .then(|| {
+            fn collect(node: &layout::BoxNode, ids: &mut std::collections::HashSet<dom::NodeId>) {
+                ids.insert(node.node);
+                for child in &node.children {
+                    collect(child, ids);
+                }
+            }
+            let mut ids = std::collections::HashSet::new();
+            if let Some(laid) = &self.last_laid {
+                collect(&laid.root, &mut ids);
+            }
+            ids
+        });
         for (&node, style) in styles {
-            // Nodes that never paint (vx-show false directly, or hidden
-            // transitively inside a hidden subtree) must not keep the
-            // frame pump awake at 60fps with an invisible infinite
-            // animation. Stop it; sync restarts it when the node paints
-            // again.
-            let hidden =
-                self.reactive_hidden.contains(&node) || (boxes_current && !self.node_has_box(node));
-            if hidden {
+            // Stop loops in hidden subtrees so the frame pump can idle.
+            if self.reactive_hidden.contains(&node)
+                || visible.as_ref().is_some_and(|ids| !ids.contains(&node))
+            {
                 self.anim.stop_infinite_for(node);
                 continue;
             }
@@ -2655,7 +2692,8 @@ impl VelquView {
             parsed_author.push(parsed);
         }
         let mut cascade = style::Cascade::new(&ua_parsed.rules, &parsed_author);
-        self.run_layout(viewport, &mut cascade, None);
+        self.run_layout(viewport, &mut cascade);
+        self.record_style_diagnostics(&cascade);
         Ok(())
     }
 
@@ -3612,6 +3650,7 @@ impl VelquView {
         let selection_changed = after_selection != before_selection;
         if value_changed {
             state.dirty = true;
+            state.live_user_value = true;
             self.events.push(Event::ValueChanged {
                 target: self.node_target(node),
                 value: after_value,
@@ -3794,14 +3833,19 @@ impl VelquView {
                     // drained into one batch, each earlier snapshot clamped
                     // the caret down and the control ended with the caret
                     // left of the value, corrupting subsequent typing.
-                    // The editor's live value is the newest truth for user
-                    // input; the model still converges through the ordered
-                    // model writes. A binding output that DIFFERS from the
-                    // event's value (a handler changed the model) is a real
-                    // programmatic update and still applies.
+                    // The editor's live user value leads unless it was
+                    // replaced programmatically (e.g. by a host turn between
+                    // the edit and this pump). In that case the committed
+                    // value must reach the editor. Non-echo outputs from
+                    // handlers are also real programmatic updates.
                     let echo_origin = match event {
                         Event::ValueChanged { target, value } => self
                             .resolve_handle(target.handle)
+                            .filter(|node| {
+                                self.controls
+                                    .get(node)
+                                    .is_some_and(|state| state.live_user_value)
+                            })
                             .map(|node| (node, value.clone())),
                         _ => None,
                     };
@@ -3891,18 +3935,17 @@ impl VelquView {
     /// readings. A write before the first [`VelquView::pump_reactive`]
     /// first applies the document's pending initial binding outputs
     /// (turn zero), so the write's outputs are never clobbered by a
-    /// stale initial batch.
+    /// stale initial batch. Turn zero can publish even if the host
+    /// turn itself rolls back.
     ///
-    /// A write can also make a turn the *host* observes: mutations are
-    /// applied, but no events are synthesized (a `SetControlValue`
-    /// never fabricates a `ValueChanged`), preserving the no-feedback
-    /// loop contract of ADR 0017.
+    /// This does not drain, pump, or synthesize events. If pending user
+    /// edits should precede the write, pump their batch first. An actual
+    /// replacement of an editor's value cancels its IME composition.
     ///
-    /// Errors leave state and UI untouched
-    /// ([`HostWriteError`]); the rolled-back diagnostic is also visible
-    /// in [`VelquView::reactive_diagnostics`]. Documents without
-    /// reactive markup are `NoReactiveDocument`, mirroring
-    /// [`VelquView::reactive_state`].
+    /// Errors do not publish the host turn's state or mutations. The
+    /// rollback diagnostic is visible in [`VelquView::reactive_diagnostics`].
+    /// Documents without reactive markup are `NoReactiveDocument`,
+    /// mirroring [`VelquView::reactive_state`].
     pub fn write_state(
         &mut self,
         path: &str,
@@ -4146,7 +4189,7 @@ impl VelquView {
 
         // One candidate at a time, under the host's existing budgets.
         // Host services transfer in; document-owned state is fresh.
-        let mut candidate = VelquView::new();
+        let mut candidate = VelquView::with_fonts(self.fonts.fork());
         candidate.assets = self.assets.clone();
         candidate.tailwind_enabled = self.tailwind_enabled;
         candidate.reactive_enabled = self.reactive_enabled;
@@ -4324,6 +4367,8 @@ impl VelquView {
         self.repaint_passes += prepared_repaints;
         self.frame_index += 1; // the prepared first frame
         self.display_items_last = prepared_items;
+        self.style_cache.invalidate();
+        self.prev_paint = None;
     }
 
     /// Replaces a set of stylesheets **transactionally** (M6b, ADR
@@ -4388,6 +4433,7 @@ impl VelquView {
         let presentation_causes_before = self.presentation_causes.clone();
         let structural_dropped_before = self.structural_causes_dropped;
         let presentation_dropped_before = self.presentation_causes_dropped;
+        let paint_before = self.prev_paint.take();
         let trace_checkpoint = self.inspector.as_mut().map(|trace| trace.checkpoint());
 
         // Stage: in-place upserts (order preserved), recascade, and the
@@ -4410,8 +4456,9 @@ impl VelquView {
 
         match self.render(viewport) {
             Ok(_frame) => {
-                // Publish: the staged frame is the live one. Reconcile
-                // interaction state with the new layout.
+                // The host has not received the staged frame. Its next
+                // render must not report damage relative to that frame.
+                self.prev_paint = None;
                 self.reconcile_after_restyle(viewport);
                 let generation = self.document_generation;
                 self.record_reload_publication(ReloadKind::Stylesheets, generation, generation);
@@ -4424,6 +4471,8 @@ impl VelquView {
                 self.stylesheets = sheets_before;
                 self.parsed_css = parsed_before;
                 self.style_diagnostics_list = style_diagnostics_before;
+                self.style_cache.invalidate();
+                self.prev_paint = paint_before;
                 self.layout_passes = passes_before;
                 self.repaint_passes = repaints_before;
                 self.frame_index = frame_before;
@@ -5015,10 +5064,21 @@ impl VelquView {
                 MutationKind::SetControlValue(value) => {
                     // Silent: control runtime state only, no ValueChanged,
                     // no focus change — no feedback loops (ADR 0017).
-                    if let Some(state) = self.controls.get_mut(&node) {
+                    if let Some(state) = self
+                        .controls
+                        .get_mut(&node)
+                        .filter(|state| state.value() != value.as_str())
+                    {
+                        // The composition's byte range describes the old
+                        // value and may be invalid after replacement.
+                        state.composition = None;
+                        if self.ime_session == Some((node, self.document_generation)) {
+                            self.ime_session = None;
+                        }
                         state.editor.set_value(value);
+                        state.live_user_value = false;
+                        presentation = true;
                     }
-                    presentation = true;
                 }
                 MutationKind::SetControlDisabled(disabled) => {
                     if let Some(state) = self.controls.get_mut(&node) {
@@ -5192,6 +5252,29 @@ struct PaintedFrame {
     animated: Vec<display_list::Rect>,
 }
 
+/// Clips the repaint bounds to the viewport. No intersection, a full
+/// intersection, or coordinates too large for the host-facing rect all
+/// fall back to a full paint.
+fn damage_window(
+    (x0, y0, x1, y1): (i64, i64, i64, i64),
+    viewport: Viewport,
+) -> Option<(u16, u16, u16, u16)> {
+    let width = i64::from(viewport.width());
+    let height = i64::from(viewport.height());
+    let (x0, x1) = (x0.clamp(0, width), x1.clamp(0, width));
+    let (y0, y1) = (y0.clamp(0, height), y1.clamp(0, height));
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w <= 0 || h <= 0 || (w == width && h == height) {
+        return None;
+    }
+    Some((
+        u16::try_from(x0).ok()?,
+        u16::try_from(y0).ok()?,
+        u16::try_from(w).ok()?,
+        u16::try_from(h).ok()?,
+    ))
+}
+
 /// Grows a half-open integer rect union with one bound.
 fn grow_union(
     union: Option<(i64, i64, i64, i64)>,
@@ -5208,12 +5291,7 @@ fn grow_union(
     );
     Some(match union {
         None => (x0, y0, x1, y1),
-        Some((ux0, uy0, ux1, uy1)) => (
-            ux0.min(x0),
-            uy0.min(y0),
-            ux1.max(x1),
-            uy1.max(y1),
-        ),
+        Some((ux0, uy0, ux1, uy1)) => (ux0.min(x0), uy0.min(y0), ux1.max(x1), uy1.max(y1)),
     })
 }
 
@@ -5427,6 +5505,44 @@ mod tests {
     }
 
     #[test]
+    fn damage_window_clips_both_edges_without_wrapping() {
+        let vp = Viewport::try_new(100, 60, 1.0).unwrap();
+        assert_eq!(damage_window((-20, 20, 40, 90), vp), Some((0, 20, 40, 40)));
+        assert_eq!(damage_window((0, 80, 40, 100), vp), None);
+        let wide = Viewport::try_new(67_000, 10, 1.0).unwrap();
+        assert_eq!(damage_window((66_000, 0, 66_020, 10), wide), None);
+    }
+
+    #[test]
+    fn cold_layout_facts_preserve_focus_paint_and_diagnostics() {
+        let mut view = VelquView::new();
+        view.load_html("<body style='margin:0'><button id=a></button></body>")
+            .unwrap();
+        view.load_css("#a { display: block; width: 24px; height: 24px; test-unsupported: 1; } #a:focus { background-color: #f00; }")
+            .unwrap();
+        let vp = Viewport::try_new(40, 40, 1.0).unwrap();
+        view.set_focus(Some("a"));
+        view.layout_facts(vp).unwrap();
+        assert_eq!(
+            view.render(vp).unwrap().frame.pixel(10, 10),
+            Some(Color::from_rgb8(255, 0, 0))
+        );
+        assert!(
+            view.style_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.contains("test-unsupported"))
+        );
+
+        // A viewport-only miss can feed the cached render path directly.
+        let wider = Viewport::try_new(50, 40, 1.0).unwrap();
+        view.layout_facts(wider).unwrap();
+        assert_eq!(
+            view.render(wider).unwrap().frame.pixel(10, 10),
+            Some(Color::from_rgb8(255, 0, 0))
+        );
+    }
+
+    #[test]
     fn viewport_drives_buffer_dimensions() {
         let mut view = tiny_view();
         let f = view
@@ -5626,10 +5742,10 @@ mod tests {
 
     // -- M2c images (ADR 0008) -------------------------------------------
 
-    /// Serves a deterministic 40×20 red PNG to every request, recording it.
+    /// Serves the current PNG to every request, recording it.
     struct ImageRecordingResolver {
         seen: RefCell<Vec<(Option<String>, String)>>,
-        bytes: Vec<u8>,
+        bytes: RefCell<Vec<u8>>,
     }
 
     impl AssetResolver for ImageRecordingResolver {
@@ -5639,7 +5755,7 @@ mod tests {
                 .push((request.base.map(str::to_owned), request.path.to_owned()));
             Some(Asset {
                 id: SourceId::new(request.path),
-                bytes: self.bytes.clone(),
+                bytes: self.bytes.borrow().clone(),
             })
         }
     }
@@ -5674,7 +5790,7 @@ mod tests {
     fn img_resolves_through_the_host_and_lays_out_intrinsically() {
         let resolver = ImageRecordingResolver {
             seen: RefCell::new(Vec::new()),
-            bytes: red_png(),
+            bytes: RefCell::new(red_png()),
         };
         let mut view = img_view(resolver);
         let vp = Viewport::try_new(400, 300, 1.0).unwrap();
@@ -5688,7 +5804,7 @@ mod tests {
     fn img_requests_carry_the_document_base() {
         let resolver = ImageRecordingResolver {
             seen: RefCell::new(Vec::new()),
-            bytes: red_png(),
+            bytes: RefCell::new(red_png()),
         };
         let mut view = VelquView::new();
         view.load_document(
@@ -5707,6 +5823,30 @@ mod tests {
             r.seen.borrow().as_slice(),
             [(Some("apps/demo".into()), "img/logo.png".into())]
         );
+    }
+
+    #[test]
+    fn clearing_images_refreshes_pixels_and_intrinsic_size() {
+        let resolver = Rc::new(ImageRecordingResolver {
+            seen: RefCell::new(Vec::new()),
+            bytes: RefCell::new(red_png()),
+        });
+        let mut view = VelquView::new();
+        view.load_html("<body style='margin:0'><img data-vv-test=i src=pic.png></body>")
+            .unwrap();
+        view.set_asset_resolver(resolver.clone());
+        let vp = Viewport::try_new(100, 60, 1.0).unwrap();
+        let before = view.render(vp).unwrap().frame;
+        assert_eq!(before.pixel(5, 5), Some(Color::from_rgb8(0xef, 0x44, 0x44)));
+        assert_eq!(fact_of(&view.layout_facts(vp).unwrap(), "i").width, 40.0);
+
+        *resolver.bytes.borrow_mut() = crate::image::test_png(60, 20, [0, 0, 255, 255]);
+        assert_eq!(view.render(vp).unwrap().frame, before);
+        view.clear_images();
+        let refreshed = view.render(vp).unwrap().frame;
+        assert_eq!(refreshed.pixel(5, 5), Some(Color::from_rgb8(0, 0, 255)));
+        assert_eq!(fact_of(&view.layout_facts(vp).unwrap(), "i").width, 60.0);
+        assert_eq!(resolver.seen.borrow().len(), 2);
     }
 
     #[test]
@@ -5739,7 +5879,7 @@ mod tests {
             .unwrap();
         view.set_asset_resolver(Rc::new(ImageRecordingResolver {
             seen: RefCell::new(Vec::new()),
-            bytes: bytes.clone(),
+            bytes: RefCell::new(bytes.clone()),
         }));
         // Width cap below the intrinsic 40px: decode refuses, image breaks.
         view.set_image_limits(ImageLimits::try_new(bytes.len(), 10, 4096, 1 << 20).unwrap());
@@ -5765,7 +5905,7 @@ mod tests {
             bytes: {
                 let mut bytes = red_png();
                 bytes.truncate(20); // valid magic, broken body
-                bytes
+                RefCell::new(bytes)
             },
         }));
         let vp = Viewport::try_new(400, 300, 1.0).unwrap();
