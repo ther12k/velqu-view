@@ -13,8 +13,9 @@
 //! Input is forwarded to the renderer's input gate (M4a/M4b, ADR
 //! 0010/0011): pointer move/press/release, wheel scrolling, and Tab focus
 //! cycling are handed to [`VelquView`], which answers from the cached
-//! layout with zero additional layout passes. Interaction styling is real
-//! now: when hover/active/focus state changes pixels the view says so and
+//! layout with zero additional layout passes. Enter and Space activate a
+//! focused button without taking those keys away from editors. When
+//! hover/active/focus state changes pixels the view says so and
 //! the shell schedules a repaint (presentation-only, no relayout); the
 //! CSS `cursor` maps onto the platform cursor. Escape still closes.
 //! M4c1 adds keyboard editing: named keys become backend-independent
@@ -269,6 +270,7 @@ fn run_inner(
         watch_wake: false,
         watch_hook,
         last_anim_tick: None,
+        frame_pacer: FramePacer::default(),
         occluded: false,
     };
     if let Some(spawn_watcher) = spawn_watcher {
@@ -320,14 +322,61 @@ struct ShellApp<'a> {
     /// shell owns real time, the renderer's engine runs on the virtual
     /// clock this delta feeds. `None` until the first redraw.
     last_anim_tick: Option<Instant>,
-    /// Whether the window is occluded/minimized (ADR 0024): frame pumping pauses
-    /// to guarantee 0% CPU consumption while hidden.
+    frame_pacer: FramePacer,
+    /// Whether the window is occluded (ADR 0024): frame pumping pauses while hidden.
     occluded: bool,
 }
 
 /// The animation frame pacing (ADR 0024): ~60 FPS deadlines while any
-/// animation is active; pure `Wait` (0% idle CPU) otherwise.
+/// animation is active; no animation wakeups otherwise.
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Default)]
+struct FramePacer {
+    next_animation_frame: Option<Instant>,
+    redraw_pending: bool,
+}
+
+impl FramePacer {
+    /// Returns true once per outstanding redraw request, even when multiple
+    /// input events and the animation timer ask for one in the same turn.
+    fn queue_redraw(&mut self) -> bool {
+        !std::mem::replace(&mut self.redraw_pending, true)
+    }
+
+    fn redraw_received(&mut self) {
+        self.redraw_pending = false;
+    }
+
+    fn presented(&mut self, frame_started: Instant) {
+        // Pace from the start of the actual frame, not from the request or
+        // an old timer slot. This excludes delivery delay from the baseline,
+        // counts rendering time toward the interval, and skips missed slots.
+        self.next_animation_frame = Some(frame_started + ANIMATION_FRAME_INTERVAL);
+    }
+
+    fn schedule(
+        &self,
+        now: Instant,
+        dirty: bool,
+        animate: bool,
+        exit_at: Option<Instant>,
+    ) -> (bool, ControlFlow) {
+        let animation_at = animate.then(|| self.next_animation_frame.unwrap_or(now));
+        let request = !self.redraw_pending && (dirty || animation_at.is_some_and(|at| at <= now));
+        // An outstanding request will wake the loop when its event arrives;
+        // keeping an expired timer armed here would instead busy-loop.
+        let wake_at = if request || self.redraw_pending {
+            exit_at
+        } else {
+            exit_at.into_iter().chain(animation_at).min()
+        };
+        (
+            request,
+            wake_at.map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+        )
+    }
+}
 
 impl ShellApp<'_> {
     fn take_result(self) -> Result<ShellStats, ShellError> {
@@ -356,17 +405,24 @@ impl ShellApp<'_> {
             .with_resizable(self.config.resizable);
         let window = std::rc::Rc::new(event_loop.create_window(attrs)?);
         let surface = softbuffer::Surface::new(&self.context, window.clone())?;
-        window.request_redraw();
         self.window = Some(window);
         self.surface = Some(surface);
-        self.dirty = true;
+        self.frame_pacer = FramePacer::default();
+        self.invalidate();
         Ok(())
     }
 
-    fn request_redraw(&self) {
+    fn request_redraw(&mut self) {
         if let Some(window) = &self.window {
-            window.request_redraw();
+            if self.frame_pacer.queue_redraw() {
+                window.request_redraw();
+            }
         }
+    }
+
+    fn invalidate(&mut self) {
+        self.dirty = true;
+        self.request_redraw();
     }
 
     /// The viewport matching the current window size, for input calls.
@@ -458,8 +514,7 @@ impl ShellApp<'_> {
             Ime::Enabled => false,
         };
         if changed {
-            self.dirty = true;
-            self.request_redraw();
+            self.invalidate();
         }
         self.update_ime();
     }
@@ -473,12 +528,26 @@ impl ShellApp<'_> {
         }
     }
 
-    fn keyboard_input(&mut self, event_loop: &ActiveEventLoop, event: &winit::event::KeyEvent) {
+    fn keyboard_input(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: &winit::event::KeyEvent,
+        is_synthetic: bool,
+    ) {
         if event.state != ElementState::Pressed {
             return;
         }
 
         let modifiers = self.key_modifiers();
+        if !is_synthetic
+            && is_button_activation(&event.logical_key, modifiers, event.repeat)
+            && self.view.activate_focused_button()
+        {
+            // Activation queues a Click even if it doesn't directly change
+            // pixels. Redraw to drain it through the reactive pump.
+            self.invalidate();
+            return;
+        }
         match route_keyboard_input(
             &event.logical_key,
             event.physical_key,
@@ -490,21 +559,22 @@ impl ShellApp<'_> {
                 if !event.repeat {
                     // Focus is runtime presentation state; if focus styling
                     // exists the pixels change: presentation-only repaint.
-                    self.view.focus_next();
-                    self.dirty = true;
-                    self.request_redraw();
+                    if modifiers.shift {
+                        self.view.focus_previous();
+                    } else {
+                        self.view.focus_next();
+                    }
+                    self.invalidate();
                 }
             }
             KeyboardRoute::Command(command) => {
                 if self.view.key_command(command, modifiers) {
-                    self.dirty = true;
-                    self.request_redraw();
+                    self.invalidate();
                 }
             }
             KeyboardRoute::InsertText(text) => {
                 if self.view.insert_text(text) {
-                    self.dirty = true;
-                    self.request_redraw();
+                    self.invalidate();
                 }
             }
             KeyboardRoute::Ignored => {}
@@ -520,6 +590,7 @@ impl ShellApp<'_> {
     }
 
     fn redraw_inner(&mut self) -> Result<(), ShellError> {
+        let frame_started = Instant::now();
         // Reactive turns run before the frame (M5c, ADR 0017), under
         // the M6a ownership model (ADR 0019): drain the queue into a
         // batch, hand the batch to the pump. The shell observes no
@@ -569,6 +640,7 @@ impl ShellApp<'_> {
             *dst = u32::from_be_bytes([0, rgba[0], rgba[1], rgba[2]]);
         }
         buffer.present()?;
+        self.frame_pacer.presented(frame_started);
         self.frames += 1;
         Ok(())
     }
@@ -584,24 +656,25 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _id: WindowId,
+        id: WindowId,
         event: winit::event::WindowEvent,
     ) {
+        if self.window.as_ref().is_none_or(|window| window.id() != id) {
+            return;
+        }
         match event {
             winit::event::WindowEvent::CloseRequested => event_loop.exit(),
-            winit::event::WindowEvent::Resized(_) => {
-                self.dirty = true;
-                self.request_redraw();
-            }
-            winit::event::WindowEvent::ScaleFactorChanged { .. } => {
-                self.dirty = true;
-                self.request_redraw();
-            }
+            winit::event::WindowEvent::Resized(_)
+            | winit::event::WindowEvent::ScaleFactorChanged { .. } => self.invalidate(),
             winit::event::WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                self.keyboard_input(event_loop, &event);
+            winit::event::WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } => {
+                self.keyboard_input(event_loop, &event, is_synthetic);
                 self.update_ime();
             }
             winit::event::WindowEvent::Ime(event) => {
@@ -635,8 +708,7 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
                 };
                 if changed {
                     // :active / focus styling may have changed pixels.
-                    self.dirty = true;
-                    self.request_redraw();
+                    self.invalidate();
                 }
                 self.update_ime();
             }
@@ -657,19 +729,18 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
                 self.view.wheel(viewport, px, py, dx, dy);
                 // The new offset changes pixels: schedule the paint, which
                 // re-renders from the baked offsets with zero relayout.
-                self.dirty = true;
-                self.request_redraw();
+                self.invalidate();
                 // Ancestor scrolling moves the candidate anchor (M4c3).
                 self.update_ime();
             }
             winit::event::WindowEvent::Occluded(occluded) => {
                 self.occluded = occluded;
                 if !occluded && self.view.has_active_animations() {
-                    self.dirty = true;
-                    self.request_redraw();
+                    self.invalidate();
                 }
             }
             winit::event::WindowEvent::RedrawRequested => {
+                self.frame_pacer.redraw_received();
                 self.redraw(event_loop);
                 self.dirty = false;
                 // Caret geometry may have moved (scroll-to-caret etc.).
@@ -680,10 +751,13 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(exit_after) = self.config.exit_after {
-            if self.started.elapsed() >= exit_after {
-                event_loop.exit();
-            }
+        if event_loop.exiting() {
+            return;
+        }
+        let exit_at = self.config.exit_after.map(|exit| self.started + exit);
+        if exit_at.is_some_and(|at| Instant::now() >= at) {
+            event_loop.exit();
+            return;
         }
         // A watch wakeup (M6c): the host's hook runs here, on the main
         // thread, with the view — watcher threads never touch it.
@@ -697,35 +771,18 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
                 }
             }
         }
-        // The animation frame pump (ADR 0024): while any animation runs,
-        // pace redraws at ~60 FPS via `WaitUntil` deadlines — never
-        // `Poll`, so the CPU stays quiet between frames — and fall back
-        // to pure `Wait` (0% idle CPU) the moment the engine goes idle.
-        // If the window is occluded/minimized, pause frame pumping in Wait
-        // to guarantee 0% background CPU consumption while hidden.
-        // An `exit_after` deadline keeps priority over frame pacing.
-        let is_visible = !self.occluded
+        // Dirty updates can redraw immediately. Animation-only redraws get
+        // a timer only when the window can present and no redraw is pending.
+        let animate = self.view.has_active_animations()
+            && !self.occluded
             && self.window.as_ref().is_some_and(|w| {
                 let size = w.inner_size();
                 size.width > 0 && size.height > 0
             });
-        if self.view.has_active_animations() && is_visible {
-            self.dirty = true;
-            self.request_redraw();
-        }
-        let flow = if self.view.has_active_animations() && is_visible {
-            let next_frame = Instant::now() + ANIMATION_FRAME_INTERVAL;
-            ControlFlow::WaitUntil(match self.config.exit_after {
-                Some(exit) => next_frame.min(self.started + exit),
-                None => next_frame,
-            })
-        } else if let Some(exit) = self.config.exit_after {
-            ControlFlow::WaitUntil(self.started + exit)
-        } else {
-            ControlFlow::Wait
-        };
+        let now = Instant::now();
+        let (request, flow) = self.frame_pacer.schedule(now, self.dirty, animate, exit_at);
         event_loop.set_control_flow(flow);
-        if self.dirty {
+        if request {
             self.request_redraw();
         }
     }
@@ -735,6 +792,18 @@ impl ApplicationHandler<ShellUserEvent> for ShellApp<'_> {
             ShellUserEvent::Watch => self.watch_wake = true,
         }
     }
+}
+
+/// Detect the logical activation key, not its physical position: layouts
+/// can put other characters on Space. Modified and repeated presses keep
+/// their existing command/text routes but never click a button.
+fn is_button_activation(logical_key: &Key, modifiers: KeyModifiers, repeat: bool) -> bool {
+    !(repeat || modifiers.ctrl || modifiers.command || modifiers.alt || modifiers.shift)
+        && match logical_key {
+            Key::Named(NamedKey::Enter | NamedKey::Space) => true,
+            Key::Character(text) => text == " ",
+            _ => false,
+        }
 }
 
 /// The routing decision for one keyboard input (pure, testable).
@@ -902,6 +971,176 @@ mod cursor_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_deadline_survives_early_wakes_and_queues_once() {
+        let start = Instant::now();
+        let next = start + ANIMATION_FRAME_INTERVAL;
+        let mut pacer = FramePacer::default();
+        pacer.presented(start);
+        for early in [start, start + Duration::from_millis(7)] {
+            assert_eq!(
+                pacer.schedule(early, false, true, None),
+                (false, ControlFlow::WaitUntil(next))
+            );
+        }
+        assert_eq!(
+            pacer.schedule(next, false, true, None),
+            (true, ControlFlow::Wait)
+        );
+        assert!(pacer.queue_redraw());
+        assert!(!pacer.queue_redraw());
+        // Even dirty input can ride the outstanding request.
+        assert_eq!(
+            pacer.schedule(next, true, true, None),
+            (false, ControlFlow::Wait)
+        );
+    }
+
+    #[test]
+    fn delayed_delivery_and_slow_render_skip_missed_slots() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::default();
+        assert_eq!(
+            pacer.schedule(start, false, true, None),
+            (true, ControlFlow::Wait)
+        );
+        assert!(pacer.queue_redraw());
+        let delivered = start + Duration::from_millis(80);
+        pacer.redraw_received();
+        pacer.presented(delivered);
+        assert_eq!(
+            pacer.schedule(delivered, false, true, None),
+            (
+                false,
+                ControlFlow::WaitUntil(delivered + ANIMATION_FRAME_INTERVAL)
+            )
+        );
+
+        // If that frame took >16ms, go straight to one fresh frame.
+        let finished = delivered + Duration::from_millis(50);
+        assert_eq!(
+            pacer.schedule(finished, false, true, None),
+            (true, ControlFlow::Wait)
+        );
+        assert!(pacer.queue_redraw());
+        pacer.redraw_received();
+        pacer.presented(finished);
+        assert_eq!(
+            pacer.schedule(finished, false, true, None),
+            (
+                false,
+                ControlFlow::WaitUntil(finished + ANIMATION_FRAME_INTERVAL)
+            )
+        );
+    }
+
+    #[test]
+    fn dirty_updates_bypass_animation_wait_but_exit_can_wake_first() {
+        let start = Instant::now();
+        let early = start + Duration::from_millis(3);
+        let exit_at = start + Duration::from_millis(8);
+        let mut pacer = FramePacer::default();
+        pacer.presented(start);
+        assert_eq!(
+            pacer.schedule(early, false, true, Some(exit_at)),
+            (false, ControlFlow::WaitUntil(exit_at))
+        );
+        assert_eq!(
+            pacer.schedule(early, true, true, Some(exit_at)),
+            (true, ControlFlow::WaitUntil(exit_at))
+        );
+        assert!(pacer.queue_redraw());
+        assert_eq!(
+            pacer.schedule(early, true, true, Some(exit_at)),
+            (false, ControlFlow::WaitUntil(exit_at))
+        );
+        pacer.redraw_received();
+        pacer.presented(early);
+        assert_eq!(
+            pacer.schedule(early, false, true, None),
+            (
+                false,
+                ControlFlow::WaitUntil(early + ANIMATION_FRAME_INTERVAL)
+            )
+        );
+        // Idle, occluded and zero-size windows all disable the animation timer.
+        assert_eq!(
+            pacer.schedule(early, false, false, None),
+            (false, ControlFlow::Wait)
+        );
+        assert_eq!(
+            pacer.schedule(early, true, false, None),
+            (true, ControlFlow::Wait)
+        );
+    }
+
+    #[test]
+    fn only_unmodified_nonrepeating_enter_or_space_can_activate_buttons() {
+        for key in [
+            Key::Named(NamedKey::Enter),
+            Key::Named(NamedKey::Space),
+            Key::Character(" ".into()),
+        ] {
+            assert!(is_button_activation(&key, KeyModifiers::default(), false));
+            assert!(!is_button_activation(&key, KeyModifiers::default(), true));
+            for modifiers in [
+                KeyModifiers {
+                    ctrl: true,
+                    ..KeyModifiers::default()
+                },
+                KeyModifiers {
+                    command: true,
+                    ..KeyModifiers::default()
+                },
+                KeyModifiers {
+                    shift: true,
+                    ..KeyModifiers::default()
+                },
+                KeyModifiers {
+                    alt: true,
+                    ..KeyModifiers::default()
+                },
+            ] {
+                assert!(!is_button_activation(&key, modifiers, false));
+            }
+        }
+        assert!(!is_button_activation(
+            &Key::Character("\u{00a0}".into()),
+            KeyModifiers::default(),
+            false
+        ));
+    }
+
+    #[test]
+    fn space_still_routes_produced_text_to_editors() {
+        for key in [Key::Named(NamedKey::Space), Key::Character(" ".into())] {
+            assert_eq!(
+                route_keyboard_input(
+                    &key,
+                    PhysicalKey::Code(KeyCode::Space),
+                    KeyModifiers::default(),
+                    Some(" ")
+                ),
+                KeyboardRoute::InsertText(" ")
+            );
+            let altgr = KeyModifiers {
+                ctrl: true,
+                alt: true,
+                ..KeyModifiers::default()
+            };
+            assert!(!is_button_activation(&key, altgr, false));
+            assert_eq!(
+                route_keyboard_input(
+                    &key,
+                    PhysicalKey::Code(KeyCode::Space),
+                    altgr,
+                    Some("\u{00a0}")
+                ),
+                KeyboardRoute::InsertText("\u{00a0}")
+            );
+        }
+    }
 
     #[test]
     fn named_enter_is_a_command_even_when_winit_supplies_carriage_return() {

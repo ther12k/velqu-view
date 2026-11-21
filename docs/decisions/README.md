@@ -31,6 +31,7 @@ Numbered, immutable once accepted; supersede explicitly.
 | [0025](0025-host-write-api.md) | Host-initiated state writes — the data-in seam (`write_state` reactive turns) | accepted |
 | [0026](0026-coverage-rasterization.md) | Coverage rasterization — the painter anti-aliases at f32 (fixed grids, exact spans, SDF bands); supersedes ADR 0007's snap clause | accepted |
 | [0027](0027-physical-springs.md) | Physical springs — momentum-preserving transitions on the virtual clock (`spring(k, d[, m])`, box-shadow joins the animatable set) | accepted |
+| [0028](0028-native-focus-frame-pacing.md) | Native keyboard focus and animation pacing — skip hidden targets, activate buttons, gate redraw requests on a deadline | accepted |
 
 Future decisions expected: text shaping engine (Parley candidate — see
 [`docs/research/blitz-notes.md`](../research/blitz-notes.md) for how

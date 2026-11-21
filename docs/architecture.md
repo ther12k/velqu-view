@@ -145,6 +145,11 @@ Always-native hot paths (never routed through QuickJS): pointer movement,
 scrolling, caret, selection, IME, focus, hit testing, dragging, resize,
 animation-frame scheduling, layout, paint.
 
+Native keyboard traversal skips hidden and disabled targets, and focused
+buttons produce the same `Click` event as pointer activation. The shell
+requests animation redraws at a deadline; input and reload can still request
+an immediate frame. See [ADR 0028](decisions/0028-native-focus-frame-pacing.md).
+
 Velqu Reactive (M5) gets an isolated frontend QuickJS context that evaluates
 expressions against reactive state only. It receives no `document`, `window`,
 `navigator`, storage, network, or filesystem, and never mutates the DOM

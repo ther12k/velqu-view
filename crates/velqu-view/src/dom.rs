@@ -223,7 +223,9 @@ impl Dom {
     /// Replaces `node`'s children with a single text node carrying
     /// `text` (a `SetText` mutation).
     pub(crate) fn set_text(&mut self, node: NodeId, text: String) {
-        self.nodes[node].children.clear();
+        for child in std::mem::take(&mut self.nodes[node].children) {
+            self.nodes[child].parent = None;
+        }
         let child = self.create_detached(NodeData::Text(text));
         self.nodes[child].parent = Some(node);
         self.nodes[node].children.push(child);

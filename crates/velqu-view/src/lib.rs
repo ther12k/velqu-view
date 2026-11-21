@@ -485,6 +485,11 @@ pub struct VelquView {
     /// every render/layout_facts call; input methods use it read-only.
     last_laid: Option<layout::LaidOutDocument>,
     last_viewport: Option<Viewport>,
+    /// Roots excluded by the latest layout: `display: none` subtrees and
+    /// non-content branches such as `<head>`. Kept apart from hit-test
+    /// geometry (which a reactive turn can discard) and reactive visibility
+    /// (which can change before the next layout).
+    layout_hidden: std::collections::HashSet<dom::NodeId>,
     /// Set when document content or stylesheets changed: the next render
     /// must run a full layout, not the presentation-only path.
     structure_dirty: bool,
@@ -727,6 +732,7 @@ impl VelquView {
             control_geometry: std::collections::HashMap::new(),
             last_laid: None,
             last_viewport: None,
+            layout_hidden: std::collections::HashSet::new(),
             structure_dirty: true,
             interaction_paint: None,
             presentation_dirty: false,
@@ -1180,6 +1186,7 @@ impl VelquView {
         self.control_diagnostics_list = control_diagnostics;
         self.last_laid = None;
         self.last_viewport = None;
+        self.layout_hidden.clear();
         self.prev_paint = None;
         self.mark_structure_dirty();
         self.presentation_dirty = false;
@@ -1706,15 +1713,46 @@ impl VelquView {
     /// callers publish the shared display list, so both match the current
     /// interaction state. Those selectors can only change paint fields.
     fn run_layout(&mut self, viewport: Viewport, cascade: &mut style::Cascade<'_>) {
-        let interaction = self.interaction_state();
+        let mut interaction = self.interaction_state();
         let style_started = std::time::Instant::now();
-        let styles = layout::compute_all_styles(
+        let root = layout::layout_root(&self.dom);
+        let mut styles = layout::compute_all_styles(
             &self.dom,
-            layout::layout_root(&self.dom),
+            root,
             cascade,
             Some(&interaction),
             &mut self.style_cache,
         );
+        self.layout_hidden = styles
+            .iter()
+            .filter_map(|(&node, style)| (style.display == style::Display::None).then_some(node))
+            .collect();
+        // Keep the layout root and its ancestors eligible (e.g. a legacy
+        // `<html id>`), but exclude their non-content sibling branches.
+        let mut branch = root;
+        while let Some(parent) = self.dom.node(branch).parent {
+            self.layout_hidden.extend(
+                self.dom
+                    .node(parent)
+                    .children
+                    .iter()
+                    .copied()
+                    .filter(|&child| child != branch),
+            );
+            branch = parent;
+        }
+        if self.clear_invisible_focus() {
+            // Interaction selectors cannot change display, but the frame
+            // and transition targets must not retain the old focus paint.
+            interaction = self.interaction_state();
+            styles = layout::compute_all_styles(
+                &self.dom,
+                root,
+                cascade,
+                Some(&interaction),
+                &mut self.style_cache,
+            );
+        }
         self.perf.style += style_started.elapsed();
         // Diff captured pre-change styles before laying out, so the
         // first frame of a transition holds its start value (ADR 0024).
@@ -3014,20 +3052,22 @@ impl VelquView {
             .and_then(|laid| input::hit_at(&laid.root, laid.root_offset, scale, x, y))
             .map(|node| node.node);
         if Some(pressed) == released {
-            // HTML semantics: disabled elements do not activate — no
-            // click, no focus transfer (controls track runtime state;
-            // other elements, e.g. `<button disabled>`, the attribute).
-            if !self.node_is_disabled(pressed) {
-                self.events.push(Event::Click {
-                    target: self.node_target(pressed),
-                });
-                if self.node_element_id(pressed).is_some() {
-                    self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
-                }
+            if self.enqueue_click(pressed) && self.node_element_id(pressed).is_some() {
+                self.set_focus_node_with(Some(pressed), input::FocusOrigin::Pointer);
             }
             return true;
         }
         false
+    }
+
+    fn enqueue_click(&mut self, node: dom::NodeId) -> bool {
+        if self.node_is_disabled(node) {
+            return false;
+        }
+        self.events.push(Event::Click {
+            target: self.node_target(node),
+        });
+        true
     }
 
     /// Whether `node` is disabled: runtime control state (`<input>`/
@@ -3046,7 +3086,7 @@ impl VelquView {
     /// `user-select: none` subtree keeps caret placement but never
     /// captures the pointer for drag selection (batch 3).
     fn begin_control_selection(&mut self, viewport: Viewport, node: dom::NodeId, x: f32, y: f32) {
-        if self.controls.get(&node).is_some_and(|state| state.disabled) {
+        if self.node_is_disabled(node) || !self.node_is_visible_for_focus(node) {
             return;
         }
         self.set_focus_node_with(Some(node), input::FocusOrigin::Pointer);
@@ -3224,34 +3264,104 @@ impl VelquView {
         self.refresh_hover(viewport);
     }
 
-    /// Moves focus to the next focusable element in document order, wrapping
-    /// around (Tab semantics). Supported controls participate even when they
-    /// have no HTML `id`; disabled controls are skipped.
+    /// Moves focus forward in document order (Tab), wrapping to the first
+    /// target. Elements with an HTML `id`, supported text controls, and
+    /// native `<button>` elements participate; hidden and disabled targets
+    /// are skipped.
     pub fn focus_next(&mut self) {
-        let nodes = self.focusable_nodes();
-        let next: Option<dom::NodeId> = match self.focus {
-            Some(current) => match nodes.iter().position(|&id| id == current) {
-                Some(index) => nodes.get((index + 1) % nodes.len().max(1)).copied(),
-                None => nodes.first().copied(),
-            },
-            None => nodes.first().copied(),
-        };
-        self.set_focus_node_with(next, input::FocusOrigin::Keyboard);
+        self.traverse_focus(false);
     }
 
-    fn focusable_nodes(&self) -> Vec<dom::NodeId> {
+    /// Moves focus backward in document order (Shift+Tab), wrapping to the
+    /// last target. Without a current target, starts at the last one.
+    pub fn focus_previous(&mut self) {
+        self.traverse_focus(true);
+    }
+
+    fn traverse_focus(&mut self, backwards: bool) {
         let mut nodes = Vec::new();
-        self.dom.walk(|id, node| {
-            let dom::NodeData::Element { attrs, .. } = &node.data else {
-                return;
-            };
-            let has_id = attrs.iter().any(|attribute| attribute.name == "id");
-            let is_control = self.controls.contains_key(&id);
-            if (has_id || is_control) && !self.node_is_disabled(id) {
-                nodes.push(id);
+        let mut current = None;
+        self.dom.walk(|id, _node| {
+            if (self.controls.contains_key(&id)
+                || self.dom.tag_name(id) == Some("button")
+                || self.node_element_id(id).is_some())
+                && self.node_is_visible_for_focus(id)
+            {
+                let enabled = !self.node_is_disabled(id);
+                if self.focus == Some(id) {
+                    // A control can become disabled while it holds focus.
+                    // Continue from its position instead of restarting.
+                    current = Some((nodes.len(), enabled));
+                }
+                if enabled {
+                    nodes.push(id);
+                }
             }
         });
-        nodes
+        let next = if backwards {
+            current
+                .and_then(|(index, _)| index.checked_sub(1))
+                .and_then(|index| nodes.get(index))
+                .or_else(|| nodes.last())
+        } else {
+            current
+                .and_then(|(index, enabled)| nodes.get(index + usize::from(enabled)))
+                .or_else(|| nodes.first())
+        };
+        self.set_focus_node_with(next.copied(), input::FocusOrigin::Keyboard);
+    }
+
+    /// Queues a [`Event::Click`] for the focused, visible, enabled native
+    /// `<button>`. Returns whether a click was queued; the caller drains
+    /// and pumps it just like a pointer click. Does not move focus or
+    /// synthesize pointer events. Text editing remains in `key_command`.
+    pub fn activate_focused_button(&mut self) -> bool {
+        self.clear_invisible_focus();
+        if let Some(node) = self
+            .focus
+            .filter(|&node| self.dom.tag_name(node) == Some("button"))
+        {
+            self.enqueue_click(node)
+        } else {
+            false
+        }
+    }
+
+    fn node_is_visible_for_focus(&self, node: dom::NodeId) -> bool {
+        let mut cursor = Some(node);
+        while let Some(id) = cursor {
+            if self.layout_hidden.contains(&id)
+                || self.reactive_hidden.contains(&id)
+                || self.transition_phases.iter().any(|phase| {
+                    phase.node == id
+                        && matches!(
+                            phase.kind,
+                            TransitionPhaseKind::LeaveStart | TransitionPhaseKind::Leaving
+                        )
+                })
+            {
+                return false;
+            }
+            if id == self.dom.document() {
+                return true;
+            }
+            cursor = self.dom.node(id).parent;
+        }
+        false // Detached subtree (e.g. replaced by vx-text).
+    }
+
+    /// Drops focus, and its IME session, as soon as visibility is known
+    /// to have changed. Disabled state is a separate input gate: already
+    /// focused elements may keep focus when disabled, but cannot activate.
+    fn clear_invisible_focus(&mut self) -> bool {
+        if self
+            .focus
+            .is_some_and(|node| !self.node_is_visible_for_focus(node))
+        {
+            self.set_focus_node_with(None, input::FocusOrigin::Programmatic);
+            return true;
+        }
+        false
     }
 
     /// Sets focus by element `id` (`None` clears it) and emits
@@ -3271,14 +3381,16 @@ impl VelquView {
     }
 
     fn set_focus_node_with(&mut self, to: Option<dom::NodeId>, origin: input::FocusOrigin) {
+        if to.is_some_and(|node| {
+            self.node_is_disabled(node) || !self.node_is_visible_for_focus(node)
+        }) {
+            return;
+        }
         // Focus transfer cancels an active composition without committing
         // (M4c3, ADR 0014): a later Commit for the old owner must be a
         // stale no-op, never an edit of the newly focused control.
         if self.ime_session.is_some() && to != self.focus {
             self.ime_cancel();
-        }
-        if to.is_some_and(|node| self.node_is_disabled(node)) {
-            return;
         }
         if to == self.focus {
             return;
@@ -3317,7 +3429,10 @@ impl VelquView {
     /// Commands are backend-independent; the shell translates platform key
     /// names before calling this method. Returns whether the runtime state
     /// changed. Editing never mutates the DOM or runs document layout.
+    /// Enter inserts a newline in a textarea; button activation is separate
+    /// ([`VelquView::activate_focused_button`]).
     pub fn key_command(&mut self, command: KeyCommand, modifiers: KeyModifiers) -> bool {
+        self.clear_invisible_focus();
         // While an IME composition is active it owns the input: keyboard
         // commands are ignored so a platform that still delivers
         // KeyboardInput during preedit (an open winit/Windows issue)
@@ -3423,6 +3538,7 @@ impl VelquView {
     /// control characters and newlines for single-line inputs (the same
     /// filter paste applies, ADR 0013).
     pub fn insert_text(&mut self, text: &str) -> bool {
+        self.clear_invisible_focus();
         // During an active composition, `Ime::Commit` is the only text
         // insertion source (M4c3, ADR 0014): stray `KeyEvent.text` from a
         // platform that still delivers keyboard input while preediting
@@ -3455,11 +3571,7 @@ impl VelquView {
     /// true exactly when an editable (non-readonly, non-disabled) control
     /// holds focus. The shell polls this and drives `set_ime_allowed`.
     pub fn wants_ime(&self) -> bool {
-        self.focus.is_some_and(|node| {
-            self.controls
-                .get(&node)
-                .is_some_and(|state| !state.disabled && !state.readonly)
-        })
+        self.focus.is_some_and(|node| self.focus_is_editable(node))
     }
 
     /// The rectangle the platform candidate window should anchor to, in
@@ -3506,6 +3618,7 @@ impl VelquView {
     /// commit events apply only to that control of that document.
     /// Readonly or disabled controls never start a session.
     pub fn ime_preedit(&mut self, text: &str, cursor: Option<(usize, usize)>) -> bool {
+        self.clear_invisible_focus();
         let node = match self.ime_session {
             Some((node, generation)) if generation == self.document_generation => node,
             _ => {
@@ -3566,6 +3679,7 @@ impl VelquView {
     /// is no longer the focused editable control (stale commit after
     /// focus transfer, reload, or readonly/disable) is a safe no-op.
     pub fn ime_commit(&mut self, text: &str) -> bool {
+        self.clear_invisible_focus();
         let Some((node, generation)) = self.ime_session.take() else {
             return false;
         };
@@ -3633,6 +3747,7 @@ impl VelquView {
         self.controls
             .get(&node)
             .is_some_and(|state| !state.disabled && !state.readonly)
+            && self.node_is_visible_for_focus(node)
     }
 
     fn finish_control_change(
@@ -4297,6 +4412,7 @@ impl VelquView {
             control_geometry,
             last_laid,
             last_viewport,
+            layout_hidden,
             structure_dirty,
             presentation_dirty,
             interaction_paint,
@@ -4338,6 +4454,7 @@ impl VelquView {
         self.control_geometry = control_geometry;
         self.last_laid = last_laid;
         self.last_viewport = last_viewport;
+        self.layout_hidden = layout_hidden;
         self.structure_dirty = structure_dirty;
         self.presentation_dirty = presentation_dirty;
         self.interaction_paint = interaction_paint;
@@ -4424,6 +4541,16 @@ impl VelquView {
         let sheets_before = self.stylesheets.clone();
         let parsed_before = self.parsed_css.clone();
         let style_diagnostics_before = self.style_diagnostics_list.clone();
+        let layout_hidden_before = self.layout_hidden.clone();
+        let focus_before = self.focus;
+        let focus_origin_before = self.focus_origin;
+        let ime_before = self.ime_session;
+        let composition_before = ime_before.and_then(|(node, _)| {
+            self.controls
+                .get(&node)
+                .and_then(|state| state.composition.clone())
+        });
+        let events_before = self.events.len();
         let passes_before = self.layout_passes;
         let repaints_before = self.repaint_passes;
         let frame_before = self.frame_index;
@@ -4459,7 +4586,7 @@ impl VelquView {
                 // The host has not received the staged frame. Its next
                 // render must not report damage relative to that frame.
                 self.prev_paint = None;
-                self.reconcile_after_restyle(viewport);
+                self.refresh_hover(viewport);
                 let generation = self.document_generation;
                 self.record_reload_publication(ReloadKind::Stylesheets, generation, generation);
                 Ok(())
@@ -4471,6 +4598,16 @@ impl VelquView {
                 self.stylesheets = sheets_before;
                 self.parsed_css = parsed_before;
                 self.style_diagnostics_list = style_diagnostics_before;
+                self.layout_hidden = layout_hidden_before;
+                self.focus = focus_before;
+                self.focus_origin = focus_origin_before;
+                self.ime_session = ime_before;
+                if let Some((node, _)) = ime_before {
+                    if let Some(state) = self.controls.get_mut(&node) {
+                        state.composition = composition_before;
+                    }
+                }
+                self.events.truncate(events_before);
                 self.style_cache.invalidate();
                 self.prev_paint = paint_before;
                 self.layout_passes = passes_before;
@@ -4494,24 +4631,6 @@ impl VelquView {
                 ))
             }
         }
-    }
-
-    /// Post-restyle reconciliation (CSS-only publication): legitimate
-    /// consequences of the new sheets, not state resets — a focus hidden
-    /// by the new CSS clears, hover re-derives under the stationary
-    /// pointer; scroll offsets re-clamp in the next render's apply
-    /// stage.
-    fn reconcile_after_restyle(&mut self, viewport: Viewport) {
-        if let Some(node) = self.focus {
-            let still_laid_out = self
-                .last_laid
-                .as_ref()
-                .is_some_and(|laid| find_box_node(&laid.root, node).is_some());
-            if !still_laid_out {
-                self.set_focus_node_with(None, input::FocusOrigin::Programmatic);
-            }
-        }
-        self.refresh_hover(viewport);
     }
 
     // -- inspector (M6a, ADR 0020) ----------------------------------------
@@ -5114,6 +5233,7 @@ impl VelquView {
         if structural {
             self.mark_structure_dirty();
             self.last_laid = None;
+            self.clear_invisible_focus();
         }
         if presentation {
             self.rebuild_control_presentation();
@@ -6745,6 +6865,250 @@ mod tests {
         assert!(view.take_events().is_empty());
         view.set_focus(None);
         assert_eq!(view.take_events().len(), 1);
+    }
+
+    #[test]
+    fn focus_keyboard_workflow_skips_hidden_and_disabled_targets_and_activates_idless_button() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<div vx-state=\"{ n: 0, bubbled: 0, open: false }\" @click=\"bubbled++\">\
+               <span id=legacy>Legacy target</span>\
+               <input id=hidden vx-show=\"open\">\
+               <div vx-show=\"open\"><input id=hidden-child></div>\
+               <div style=\"display: none\"><input id=css-hidden></div>\
+               <textarea id=editor></textarea>\
+               <button id=disabled disabled @click=\"n += 100\">Disabled</button>\
+               <button :disabled=\"n > 0\" @click=\"n++\">Run</button>\
+               <input id=last>\
+             </div>",
+        )
+        .unwrap();
+        view.pump_reactive(&[]);
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        let passes = view.layout_stats().passes;
+
+        view.focus_next();
+        assert_eq!(view.focused(), Some("legacy"));
+        assert!(!view.activate_focused_button());
+        view.focus_next();
+        assert_eq!(view.focused(), Some("editor"));
+        assert!(!view.activate_focused_button());
+        assert!(view.key_command(KeyCommand::Enter, KeyModifiers::default()));
+        let editor = view.node_handle(view.element_node("editor").unwrap());
+        assert_eq!(view.control_value(editor), Some("\n"));
+
+        view.focus_next();
+        let events = view.take_events();
+        let button = match events.last() {
+            Some(Event::FocusChanged {
+                to: Some(target),
+                origin: FocusOrigin::Keyboard,
+                ..
+            }) if target.id.is_none() => target.clone(),
+            other => panic!("expected idless keyboard focus, got {other:?}"),
+        };
+        view.focus_next();
+        assert_eq!(view.focused(), Some("last"));
+        view.focus_next();
+        assert_eq!(view.focused(), Some("legacy"), "Tab wraps forward");
+        view.focus_previous();
+        assert_eq!(view.focused(), Some("last"), "Shift+Tab wraps backward");
+        view.focus_previous();
+        assert!(matches!(
+            view.take_events().last(),
+            Some(Event::FocusChanged { to: Some(target), origin: FocusOrigin::Keyboard, .. })
+                if *target == button
+        ));
+        assert!(!view.key_command(KeyCommand::Enter, KeyModifiers::default()));
+        assert!(view.activate_focused_button());
+        let clicks = view.take_events();
+        assert_eq!(clicks, vec![Event::Click { target: button }]);
+        view.pump_reactive(&clicks);
+        let state = view.reactive_state().unwrap();
+        assert_eq!(
+            state.get_path("n"),
+            velqu_reactive::ReactiveValue::Number(1.0)
+        );
+        assert_eq!(
+            state.get_path("bubbled"),
+            velqu_reactive::ReactiveValue::Number(1.0),
+            "keyboard Click bubbles along the regular handler chain"
+        );
+        assert!(
+            !view.activate_focused_button(),
+            "the same button is now disabled"
+        );
+        assert!(view.take_events().is_empty());
+        view.focus_next();
+        assert_eq!(
+            view.focused(),
+            Some("last"),
+            "continue from the disabled button"
+        );
+        view.focus_previous();
+        assert_eq!(view.focused(), Some("editor"));
+        view.focus_previous();
+        assert_eq!(
+            view.focused(),
+            Some("legacy"),
+            "CSS exclusion survives the dirty layout"
+        );
+        assert_eq!(view.layout_stats().passes, passes);
+    }
+
+    #[test]
+    fn focus_excludes_non_content_branches_without_losing_root_ids() {
+        let mut view = VelquView::new();
+        view.load_html(
+            "<!doctype html><html id=root><head id=metadata><title id=title>Page</title></head>\
+             <body id=content><span id=visible>Visible</span></body></html>",
+        )
+        .unwrap();
+        let vp = Viewport::try_new(200, 160, 1.0).unwrap();
+        view.render(vp).unwrap();
+        for expected in ["root", "content", "visible", "root"] {
+            view.focus_next();
+            assert_eq!(view.focused(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn focus_reactive_hide_invalidates_text_and_ime_before_the_next_layout() {
+        for markup in [
+            "<input id=field vx-show=\"open\" @input=\"open = false\">",
+            "<div vx-show=\"open\"><input id=field @input=\"open = false\"></div>",
+            "<div vx-show=\"open\" vx-transition><input id=field @input=\"open = false\"></div>",
+        ] {
+            let mut view = VelquView::new();
+            view.enable_reactive();
+            view.enable_tailwind();
+            view.load_html(&format!(
+                "<div vx-state=\"{{ open: true }}\">{markup}<input id=next></div>"
+            ))
+            .unwrap();
+            view.pump_reactive(&[]);
+            let vp = Viewport::try_new(200, 160, 1.0).unwrap();
+            view.render(vp).unwrap();
+            let passes = view.layout_stats().passes;
+            let field = view.node_target(view.element_node("field").unwrap());
+            view.focus_next();
+            assert_eq!(view.focused(), Some("field"));
+            assert!(view.insert_text("x"));
+            assert!(view.ime_preedit("あ", None));
+            let inputs = view.take_events();
+            view.pump_reactive(&inputs);
+
+            assert_eq!(view.focused(), None, "{markup}");
+            assert!(!view.wants_ime());
+            assert!(view.ime_cursor_rect(vp).is_none());
+            assert!(!view.key_command(KeyCommand::Backspace, KeyModifiers::default()));
+            assert!(!view.insert_text("y"));
+            assert!(!view.ime_preedit("い", None));
+            assert_eq!(
+                view.take_events(),
+                vec![Event::FocusChanged {
+                    from: Some(field.clone()),
+                    to: None,
+                    origin: FocusOrigin::Programmatic,
+                }]
+            );
+            view.set_focus_handle(Some(field.handle));
+            assert_eq!(view.focused(), None);
+            view.focus_next();
+            assert_eq!(view.focused(), Some("next"));
+            assert!(
+                !view.ime_commit("あ"),
+                "a late commit cannot target the next control"
+            );
+            assert_eq!(view.control_value(field.handle), Some("x"));
+            assert_eq!(view.layout_stats().passes, passes);
+
+            if markup.contains("vx-transition") {
+                view.render(vp).unwrap();
+                let laid = view.last_laid.as_ref().unwrap();
+                assert!(layout::find_box(&laid.root, field.handle.node()).is_some());
+                view.focus_previous();
+                assert_eq!(
+                    view.focused(),
+                    Some("next"),
+                    "leaving boxes are paint-only for focus"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focus_drops_a_control_detached_by_reactive_text() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<div vx-state=\"{ label: 'replacement' }\" vx-text=\"label\">\
+               <input id=field value=original>\
+             </div>",
+        )
+        .unwrap();
+        view.focus_next();
+        let field = view.node_handle(view.element_node("field").unwrap());
+        assert_eq!(view.focused(), Some("field"));
+        assert!(view.ime_preedit("あ", None));
+        view.pump_reactive(&[]);
+        assert_eq!(view.focused(), None);
+        view.set_focus_handle(Some(field));
+        assert_eq!(view.focused(), None);
+        assert!(!view.ime_commit("あ"));
+        assert!(!view.insert_text("x"));
+        assert_eq!(view.control_value(field), Some("original"));
+        assert_eq!(view.layout_stats().passes, 0);
+    }
+
+    #[test]
+    fn focus_css_hide_from_latest_layout_clears_focus_but_preserves_other_id_targets() {
+        let mut view = VelquView::new();
+        view.enable_reactive();
+        view.load_html(
+            "<style>.hide { display: none; }</style>\
+             <div vx-state=\"{ hidden: false }\">\
+               <div :class=\"hidden ? 'hide' : ''\">\
+                 <input id=field @input=\"hidden = true\">\
+               </div>\
+               <span id=legacy>Focusable even without a separate box</span>\
+             </div>",
+        )
+        .unwrap();
+        view.pump_reactive(&[]);
+        let vp = Viewport::try_new(300, 200, 1.0).unwrap();
+        view.render(vp).unwrap();
+        view.focus_next();
+        let field = view.node_target(view.element_node("field").unwrap());
+        assert_eq!(view.focused(), Some("field"));
+        assert!(view.insert_text("x"));
+        assert!(view.ime_preedit("あ", None));
+        let events = view.take_events();
+        view.pump_reactive(&events);
+        view.layout_facts(vp).unwrap();
+        assert_eq!(view.focused(), None);
+        assert_eq!(
+            view.take_events(),
+            vec![Event::FocusChanged {
+                from: Some(field.clone()),
+                to: None,
+                origin: FocusOrigin::Programmatic,
+            }]
+        );
+        assert!(!view.ime_commit("あ"));
+        assert!(!view.insert_text("y"));
+        assert_eq!(view.control_value(field.handle), Some("x"));
+        view.focus_previous();
+        assert_eq!(view.focused(), Some("legacy"));
+        view.focus_next();
+        assert_eq!(view.focused(), Some("legacy"));
+        assert_eq!(
+            view.take_events().len(),
+            1,
+            "one target wraps without a new event"
+        );
     }
 
     #[test]
